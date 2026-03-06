@@ -139,6 +139,15 @@ def init_db():
         status TEXT, expected_return TEXT,
         captured_at DATETIME
     )""")
+    # V5.10 port: auto-heal de CLVs corruptos al arrancar
+    # selection_keys válidas tienen formato "bid|value" (ej: "1|Home", "5|Over 2.5")
+    # Si el último segmento es un número puro, la key está corrupta
+    c.execute("SELECT id, selection_key FROM picks_log WHERE clv_captured = 1")
+    for pid, skey in c.fetchall():
+        if skey and skey.split('|')[-1].replace('.', '', 1).isdigit():
+            c.execute("DELETE FROM closing_lines WHERE selection_key = ?", (skey,))
+            c.execute("UPDATE picks_log SET clv_captured = -1 WHERE id = ?", (pid,))
+
     conn.commit()
     conn.close()
 
@@ -184,16 +193,29 @@ def track_requests(n=1):
 # URS ENGINE
 # ==========================================
 
-def get_avg_clv(lookback=30):
+def get_avg_clv(lookback=30, market=None):
+    """
+    V5.10 port: kill-switch por mercado cuando se especifica market.
+    Sin market → CLV global (para Sharpe y métricas generales).
+    Con market → CLV específico del mercado (para kill-switch granular).
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
-                     FROM picks_log p JOIN closing_lines c
-                       ON p.fixture_id=c.fixture_id AND p.market=c.market
-                          AND p.selection_key=c.selection_key
-                     WHERE p.clv_captured=1
-                     ORDER BY p.id DESC LIMIT ?""", (lookback,))
+        if market:
+            c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.clv_captured=1 AND p.market=?
+                         ORDER BY p.id DESC LIMIT ?""", (market, lookback))
+        else:
+            c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.clv_captured=1
+                         ORDER BY p.id DESC LIMIT ?""", (lookback,))
         res = c.fetchone()[0]
         conn.close()
         return float(res) if res else 0.0
@@ -255,11 +277,18 @@ def calculate_urs(ev, odd):
 
 
 def get_kelly_and_urs(ev, odd, market):
-    avg_clv = get_avg_clv()
-    if avg_clv < -0.015:
-        return 0.0, 0.0, "KILL_SWITCH_ACTIVE"
+    # V5.10 port: kill-switch granular por mercado
+    avg_clv_market = get_avg_clv(market=market)
+    avg_clv_global = get_avg_clv()
+    # Si el mercado específico tiene CLV muy negativo, pausarlo solo a él
+    if avg_clv_market < -0.015:
+        return 0.0, 0.0, f"KILL_SWITCH_{market}"
+    # Si el CLV global es muy negativo, pausar todo
+    if avg_clv_global < -0.025:
+        return 0.0, 0.0, "KILL_SWITCH_GLOBAL"
     base_kelly = max(0.0, min(ev / (odd - 1), 0.05))
-    if -0.015 <= avg_clv < 0.005:
+    # Reducción de stake si el mercado está en zona gris
+    if -0.015 <= avg_clv_market < 0.005:
         base_kelly *= 0.25
     urs = calculate_urs(ev, odd)
     return base_kelly * urs, urs, None
@@ -598,6 +627,9 @@ def validate_xg(xh, xa, bets):
             return False, f"XG_DEFAULT_DETECTED (ratio={xg_ratio:.2f})"
         if min_odd < 1.65 and xg_ratio < 1.20:
             return False, f"XG_FLAT_ON_FAVOURITE (ratio={xg_ratio:.2f})"
+        # V5.10 port: detección directa del xG default 1.4/1.4 con favorito claro
+        if 1.30 <= xh <= 1.50 and 1.30 <= xa <= 1.50 and min_odd < 1.60:
+            return False, f"XG_LIKELY_DEFAULT (xh={xh:.2f}, xa={xa:.2f}, fav={min_odd:.2f})"
 
     if over_odd and under_odd:
         p_under_mkt = 1 / (under_odd * 1.07)
@@ -1363,13 +1395,23 @@ if __name__ == "__main__":
         c = conn.cursor()
         c.execute("""SELECT ((p.odd_open-c.odd_close)/p.odd_open)*100, p.market
                      FROM picks_log p JOIN closing_lines c
-                       ON p.fixture_id=c.fixture_id AND p.clv_captured=1""")
+                       ON p.fixture_id=c.fixture_id
+                          AND p.market=c.market
+                          AND p.selection_key=c.selection_key
+                     WHERE p.clv_captured=1""")
         picks = c.fetchall()
         conn.close()
         if picks:
             clvs  = [p[0] for p in picks]
             beats = sum(1 for v in clvs if v > 0)
-            print(f"  N={len(picks)} | Beat={beats}/{len(picks)} | CLV_avg={sum(clvs)/len(clvs):.2f}%")
+            print(f"  N={len(picks)} | Beat={beats}/{len(picks)} ({beats/len(picks)*100:.0f}%) | CLV_avg={sum(clvs)/len(clvs):.2f}%")
+            # V5.10 port: desglose por mercado — crítico durante el burn-in
+            mkts = {}
+            for clv, mkt in picks:
+                mkts.setdefault(mkt, []).append(clv)
+            for mkt, vals in sorted(mkts.items()):
+                beat_m = sum(1 for v in vals if v > 0)
+                print(f"    {mkt:<8} N={len(vals)} CLV={sum(vals)/len(vals):.2f}% Beat={beat_m}/{len(vals)}")
         else:
             print("  Sin CLVs aún.")
     except:
