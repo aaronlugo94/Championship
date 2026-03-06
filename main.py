@@ -368,7 +368,8 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
                 if age_hours < XG_CACHE_TTL_HOURS:
                     gf = json.loads(row[0])
                     ga = json.loads(row[1])
-                    return float(row[2]), float(row[3]), row[4], gf, ga
+                    # Retorna 6 valores: el último bool indica cache hit (True = no request gastado)
+                    return float(row[2]), float(row[3]), row[4], gf, ga, True
         except:
             pass  # cache miss → llamar API normalmente
 
@@ -387,7 +388,7 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
         fixtures = r.json().get('response', [])
 
         if not fixtures:
-            return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
+            return 1.2, 1.2, "LOW", [], [], False  # cache_hit=False: se gastó 1 request
 
         gf_series = []
         ga_series = []
@@ -431,7 +432,7 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
         except:
             pass
 
-        return xg_for, xg_against, confidence, gf_series, ga_series
+        return xg_for, xg_against, confidence, gf_series, ga_series, False  # cache_hit=False
 
     except Exception as e:
         return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
@@ -477,14 +478,16 @@ def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers):
     """
     requests_made = 0
 
-    # Llamada home
-    h_xgf, h_xga, h_conf, h_gf, h_ga = fetch_team_xg(home_id, season, headers)
-    requests_made += 1
-    time.sleep(2.0)  # FIX: era 1.2s, insuficiente para rate limit 10 req/min
+    # Llamada home — si viene de cache, cache_hit=True y no se gastó request
+    h_xgf, h_xga, h_conf, h_gf, h_ga, h_cached = fetch_team_xg(home_id, season, headers)
+    if not h_cached:
+        requests_made += 1
+        time.sleep(2.0)  # respetar rate limit 10 req/min solo si llamamos API
 
     # Llamada away
-    a_xgf, a_xga, a_conf, a_gf, a_ga = fetch_team_xg(away_id, season, headers)
-    requests_made += 1
+    a_xgf, a_xga, a_conf, a_gf, a_ga, a_cached = fetch_team_xg(away_id, season, headers)
+    if not a_cached:
+        requests_made += 1
 
     # xG base del partido
     xh = (h_xgf + a_xga) / 2
@@ -854,7 +857,7 @@ class ChampionshipBot:
                         continue
 
                 # Llamar API y cachear (fetch_team_xg guarda automáticamente)
-                fetch_team_xg(team_id, self.season, self.headers, use_cache=False)
+                fetch_team_xg(team_id, self.season, self.headers, use_cache=False)  # retorna 6 valores, ignoramos aquí
                 track_requests(1)
                 cached += 1
                 time.sleep(2.0)
@@ -921,13 +924,14 @@ class ChampionshipBot:
                     time.sleep(2.0)
                     continue
 
+                # FIX v6.2: conexión abierta UNA vez por fixture, no por cada cuota
+                conn = sqlite3.connect(DB_PATH)
+                cc   = conn.cursor()
                 for b in r[0]['bookmakers'][0]['bets']:
                     for v in b['values']:
                         mkt_key = f"{b['id']}|{v['value']}"
                         odd_now = float(v['odd'])
 
-                        conn = sqlite3.connect(DB_PATH)
-                        cc   = conn.cursor()
                         cc.execute(
                             "SELECT odd_open FROM line_snapshots "
                             "WHERE fixture_id=? AND market=? ORDER BY id ASC LIMIT 1",
@@ -946,7 +950,7 @@ class ChampionshipBot:
                                     f"({move*100:+.1f}%)"
                                 )
                         else:
-                            # Primera vez que vemos este fixture — guardar como baseline
+                            # Primera vez — este snapshot ES el baseline
                             cc.execute(
                                 """INSERT INTO line_snapshots
                                    (fixture_id, home_team, away_team, kickoff_time,
@@ -955,6 +959,7 @@ class ChampionshipBot:
                                 (fid, h_n, a_n, ko, mkt_key, v['value'],
                                  odd_now, odd_now, now.isoformat())
                             )
+                        # Siempre guardar snapshot actual para historial de movimiento
                         cc.execute(
                             """INSERT INTO line_snapshots
                                (fixture_id, home_team, away_team, kickoff_time,
@@ -965,8 +970,8 @@ class ChampionshipBot:
                              first[0] if first else odd_now,
                              now.isoformat())
                         )
-                        conn.commit()
-                        conn.close()
+                conn.commit()
+                conn.close()
                 time.sleep(2.0)
 
             if alerts:
@@ -983,66 +988,76 @@ class ChampionshipBot:
         except Exception as e:
             self.send_msg(f"⚠️ line_monitor error: {e}")
 
-    def injury_watch(self):
+    def store_fixture_injuries(self, fid, h_id, h_n, a_id, a_n, inj_res):
         """
-        MIÉRCOLES 08:00 UTC — Lesiones activas de los 24 equipos.
-        Guarda en injury_watch y alerta si hay bajas en equipos
-        con partido en los próximos 5 días.
-        Coste: 1 request (endpoint /injuries por temporada, no por fixture).
+        FIX v6.2: El endpoint /injuries por temporada devuelve vacío en el plan Free.
+        En su lugar, guardamos las lesiones que ya obtenemos en run_daily_scan
+        (endpoint /injuries?fixture=X, que SÍ funciona en Free).
+        Este método se llama desde run_daily_scan — coste 0 requests extra.
         """
         try:
-            r = requests.get(
-                "https://v3.football.api-sports.io/injuries",
-                headers=self.headers,
-                params={"league": CHAMPIONSHIP_ID, "season": self.season}
-            )
-            track_requests(1)
-            injuries = r.json().get('response', [])
-            if not injuries:
-                self.send_msg("✅ <b>Injury Watch:</b> Sin lesiones registradas.")
-                return
-
             conn = sqlite3.connect(DB_PATH)
             cc   = conn.cursor()
             now  = datetime.now(timezone.utc)
-
-            # Limpiar registros anteriores y reescribir
-            cc.execute("DELETE FROM injury_watch")
-            team_counts = {}
-            for inj in injuries:
+            for inj in inj_res:
                 tid   = inj['team']['id']
                 tname = inj['team']['name']
-                pname = inj['player']['name']
+                pname = inj.get('player', {}).get('name', 'Unknown')
                 itype = inj.get('player', {}).get('type', 'Unknown')
                 status = inj.get('player', {}).get('reason', 'Unknown')
-
+                # INSERT OR IGNORE para no duplicar si el scan corre dos veces
                 cc.execute(
-                    """INSERT INTO injury_watch
+                    """INSERT OR IGNORE INTO injury_watch
                        (team_id, team_name, player_name, injury_type, status,
                         expected_return, captured_at)
                        VALUES (?,?,?,?,?,?,?)""",
                     (tid, tname, pname, itype, status, 'N/A', now.isoformat())
                 )
-                team_counts[tname] = team_counts.get(tname, 0) + 1
-
             conn.commit()
             conn.close()
+        except:
+            pass
 
-            # Alertar equipos con 3+ bajas (impacto potencial en xG)
-            heavy = [(t, n) for t, n in team_counts.items() if n >= 3]
-            if heavy:
-                lines = "\n".join(f"  🚑 {t}: {n} bajas" for t, n in
-                                   sorted(heavy, key=lambda x: -x[1]))
+    def injury_watch(self):
+        """
+        MIÉRCOLES 08:00 UTC — Resumen de lesiones acumuladas desde los scans.
+        FIX v6.2: No hace llamada API propia (endpoint por temporada vacío en Free).
+        Lee de injury_watch que se alimenta automáticamente desde run_daily_scan.
+        Coste: 0 requests.
+        """
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cc   = conn.cursor()
+            cc.execute(
+                "SELECT team_name, COUNT(*) as n FROM injury_watch "
+                "GROUP BY team_name ORDER BY n DESC"
+            )
+            rows = cc.fetchall()
+            conn.close()
+
+            if not rows:
                 self.send_msg(
-                    f"🚑 <b>Injury Watch — Equipos con 3+ bajas:</b>\n{lines}\n"
-                    f"Total lesionados: {len(injuries)}\n"
-                    f"📡 Requests: {track_requests(0)}/100"
+                    "✅ <b>Injury Watch:</b> Sin lesiones registradas esta semana.\n"
+                    "(Se alimenta automáticamente del scan diario)"
+                )
+                return
+
+            total = sum(r[1] for r in rows)
+            heavy = [(t, n) for t, n in rows if n >= 3]
+
+            if heavy:
+                injury_lines = "\n".join(f"  🚑 {t}: {n} bajas" for t, n in heavy)
+                self.send_msg(
+                    f"🚑 <b>Injury Watch — Equipos con 3+ bajas:</b>\n"
+                    f"{injury_lines}\n"
+                    f"Total lesionados registrados: {total}\n"
+                    f"(Datos de últimos scans · 0 requests)"
                 )
             else:
                 self.send_msg(
-                    f"✅ <b>Injury Watch:</b> {len(injuries)} lesionados, "
+                    f"✅ <b>Injury Watch:</b> {total} lesionados registrados, "
                     f"ningún equipo con 3+ bajas.\n"
-                    f"📡 Requests: {track_requests(0)}/100"
+                    f"(Datos de últimos scans · 0 requests)"
                 )
         except Exception as e:
             self.send_msg(f"⚠️ injury_watch error: {e}")
@@ -1074,11 +1089,11 @@ class ChampionshipBot:
             teams_saved = 0
             for group in standings:
                 for entry in group.get('league', {}).get('standings', [[]])[0]:
-                    t   = entry['team']
-                    all = entry['all']
-                    played = all['played']
-                    gf     = all['goals']['for']
-                    ga     = all['goals']['against']
+                    t     = entry['team']
+                    stats = entry['all']   # FIX: renombrado de 'all' para no colisionar con builtin
+                    played = stats['played']
+                    gf     = stats['goals']['for']
+                    ga     = stats['goals']['against']
                     cc.execute(
                         """INSERT INTO league_stats
                            (season, team_id, team_name, played, wins, draws, losses,
@@ -1086,7 +1101,7 @@ class ChampionshipBot:
                             captured_at)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (self.season, t['id'], t['name'],
-                         played, all['win'], all['draw'], all['lose'],
+                         played, stats['win'], stats['draw'], stats['lose'],
                          gf, ga,
                          round(gf / played, 3) if played else 0,
                          round(ga / played, 3) if played else 0,
@@ -1185,7 +1200,7 @@ class ChampionshipBot:
                 continue
             bets = odds_res[0]['bookmakers'][0]['bets']
 
-            # Llamada: lesiones
+            # Llamada: lesiones por fixture (funciona en Free; guarda en injury_watch)
             try:
                 inj_res = requests.get(
                     "https://v3.football.api-sports.io/injuries",
@@ -1195,6 +1210,8 @@ class ChampionshipBot:
                 track_requests(1)
                 hinj = sum(1 for i in inj_res if i['team']['id'] == h_id)
                 ainj = sum(1 for i in inj_res if i['team']['id'] == a_id)
+                # FIX v6.2: persistir lesiones para injury_watch semanal (0 requests extra)
+                self.store_fixture_injuries(fid, h_id, h_n, a_id, a_n, inj_res)
             except:
                 hinj = ainj = 0
 
