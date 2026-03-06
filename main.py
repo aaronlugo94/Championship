@@ -9,16 +9,19 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V6.1 CHAMPIONSHIP SPECIALIST
+# V6.2 CHAMPIONSHIP SPECIALIST
 # ==========================================
-# CAMBIOS VS V6.0:
-#   1. BUG FIX: fetch_team_xg ahora retorna SIEMPRE 5 valores (path de error incluido)
-#   2. BUG FIX: track_requests en build_xg_match es condicional según llamadas reales
-#   3. BUG FIX: time.sleep en fetch_team_xg subido a 2.0s (rate limit 10 req/min)
-#   4. BUG FIX: CHAMPIONSHIP_SEASON con fallback automático 2025 → 2024
-#   5. LIMPIEZA: eliminada dependencia google-genai (no se usaba)
-#   6. MEJORA: factor de forma reciente (últimos 3 vs anteriores 3) en xG
-#   7. MEJORA: logging más preciso de requests reales consumidos
+# CAMBIOS VS V6.1 (correcciones de lógica):
+#   1. LÓGICA: candidato elegido por ev*urs (valor ajustado al riesgo)
+#              en lugar de solo EV — el URS ya no se ignora en la selección
+#   2. LÓGICA: std negbinom subido a 1.55 para activar sobredispersión
+#              en el rango real de xG de Championship (era 1.35, inefectivo)
+#   3. LÓGICA: sanity_check gap reducido 0.25→0.18 para filtrar
+#              picks donde el modelo está mal calibrado vs mercado
+#   4. LÓGICA: closing_lines protegido contra duplicados con COUNT previo
+#   5. LÓGICA: stake mínima forzada eliminada — max(0.0) en lugar de
+#              max(0.001) para respetar la lógica Kelly cuando hay poca convicción
+#   6. LÓGICA: picks con final_stake < 0.005 filtrados antes de reportar
 
 LIVE_TRADING = False
 
@@ -30,8 +33,9 @@ DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "quant_v6.db")
 
-RUN_TIME_SCAN   = "02:50"
-RUN_TIME_INGEST = "04:00"
+RUN_TIME_SCAN       = "09:00"   # D-1: cuotas líquidas, mercado abierto
+RUN_TIME_MIDDAY_CLV = "12:30"   # D-0: captura intermedia pre-partido
+RUN_TIME_INGEST     = "04:00"   # mantenido por compatibilidad
 
 CHAMPIONSHIP_ID      = 40
 CHAMPIONSHIP_SEASONS = [2025, 2024]  # FIX v6.1: fallback automático si 2025 sin datos
@@ -242,7 +246,11 @@ def apply_portfolio_engine(picks):
 
     scale = min(1.0, MAX_DAILY_HEAT / total) if total > 0 else 1.0
     for p in picks:
-        p['final_stake'] = max(0.001, min(p['final_stake'] * scale, 0.05))
+        # FIX v6.2: max(0.0) en lugar de max(0.001) — respetar Kelly cuando hay poca convicción
+        p['final_stake'] = max(0.0, min(p['final_stake'] * scale, 0.05))
+
+    # FIX v6.2: filtrar picks con stake tan baja que no tiene sentido reportar
+    picks = [p for p in picks if p['final_stake'] >= 0.005]
 
     return picks, {
         'port_vol': port_vol, 'damper': damper,
@@ -443,7 +451,7 @@ def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     return p_h, p_d, p_a
 
 
-def calc_over_under(xg_total, line=2.5, std=1.35):
+def calc_over_under(xg_total, line=2.5, std=1.55):  # FIX v6.2: 1.35→1.55 activa negbinom en rango real Championship
     var = max(std ** 2, xg_total)
     mu  = xg_total
 
@@ -517,7 +525,7 @@ def validate_xg(xh, xa, bets):
 def sanity_check(p_true, mkt, odd):
     VIG = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05, "BTTS": 1.06}
     gap = abs(p_true - 1 / (odd * VIG.get(mkt, 1.06)))
-    if gap > 0.25:
+    if gap > 0.18:  # FIX v6.2: era 0.25, demasiado permisivo — gap de 0.25 indica modelo mal calibrado
         return False, f"XG_SANITY_FAIL (gap={gap:.2f}, p={p_true:.2f})"
     return True, None
 
@@ -599,7 +607,7 @@ class ChampionshipBot:
         self.season = resolve_season(self.headers)
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
         self.send_msg(
-            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.1</b>\n"
+            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.2</b>\n"
             f"Estado: {mode}\n"
             f"Temporada activa: {self.season}/{self.season+1}\n"
             f"xG: últimos 6 partidos + factor de forma\n"
@@ -619,6 +627,82 @@ class ChampionshipBot:
         except:
             pass
 
+    def _fetch_and_store_odds(self, c, fid, mkt, skey, pid, now, mark_captured=True):
+        """
+        Fetches current odds for a pick and stores them.
+        mark_captured=True  → cierre final (clv_captured=1), usado 60min antes del KO
+        mark_captured=False → snapshot intermedio, no marca como capturado (seguirá
+                              siendo sobreescrito por el cierre real)
+        """
+        res = requests.get(
+            f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",
+            headers=self.headers
+        ).json()
+        track_requests(1)
+        found = False
+        if res.get('response'):
+            for b in res['response'][0]['bookmakers'][0]['bets']:
+                for v in b['values']:
+                    if f"{b['id']}|{v['value']}" == skey:
+                        c.execute(
+                            "SELECT COUNT(*) FROM closing_lines WHERE fixture_id=? AND market=? AND selection_key=?",
+                            (fid, mkt, skey)
+                        )
+                        exists = c.fetchone()[0] > 0
+                        if mark_captured:
+                            # Cierre final: INSERT o UPDATE si ya había snapshot intermedio
+                            if exists:
+                                c.execute(
+                                    "UPDATE closing_lines SET odd_close=?, implied_prob_close=?, capture_time=? "
+                                    "WHERE fixture_id=? AND market=? AND selection_key=?",
+                                    (float(v['odd']), 1/float(v['odd']), now.isoformat(),
+                                     fid, mkt, skey)
+                                )
+                            else:
+                                c.execute(
+                                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
+                                    (fid, mkt, skey, float(v['odd']),
+                                     1/float(v['odd']), now.isoformat())
+                                )
+                        else:
+                            # Snapshot intermedio: solo INSERT si aún no existe
+                            if not exists:
+                                c.execute(
+                                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
+                                    (fid, mkt, skey, float(v['odd']),
+                                     1/float(v['odd']), now.isoformat())
+                                )
+                        found = True
+                        break
+        return found
+
+    def capture_midday_lines(self):
+        """
+        V6.3: Captura intermedia a las 12:30 UTC del día del partido.
+        Guarda un snapshot de la cuota actual sin marcar el pick como capturado —
+        el cierre real se sobreescribirá 60 min antes del KO.
+        Útil para observar la magnitud del movimiento de línea D-1 → mediodía → cierre.
+        Solo actúa sobre picks con kick-off en las próximas 6 horas.
+        """
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c    = conn.cursor()
+            now  = datetime.now(timezone.utc)
+            c.execute(
+                "SELECT id, fixture_id, market, selection_key, kickoff_time "
+                "FROM picks_log WHERE clv_captured = 0"
+            )
+            for pid, fid, mkt, skey, ko in c.fetchall():
+                mins = (datetime.fromisoformat(ko) - now).total_seconds() / 60.0
+                # Ventana: entre 6h y 2h antes del KO → snapshot intermedio
+                if 120.0 <= mins <= 360.0:
+                    self._fetch_and_store_odds(c, fid, mkt, skey, pid, now, mark_captured=False)
+                    time.sleep(2.0)
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
     def capture_closing_lines(self):
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -631,23 +715,10 @@ class ChampionshipBot:
             for pid, fid, mkt, skey, ko in c.fetchall():
                 mins = (datetime.fromisoformat(ko) - now).total_seconds() / 60.0
                 if mins <= 60.0:
-                    res = requests.get(
-                        f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",
-                        headers=self.headers
-                    ).json()
-                    track_requests(1)
-                    found = False
-                    if res.get('response'):
-                        for b in res['response'][0]['bookmakers'][0]['bets']:
-                            for v in b['values']:
-                                if f"{b['id']}|{v['value']}" == skey:
-                                    c.execute(
-                                        "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
-                                        (fid, mkt, skey, float(v['odd']),
-                                         1/float(v['odd']), now.isoformat())
-                                    )
-                                    found = True
-                                    break
+                    found = self._fetch_and_store_odds(
+                        c, fid, mkt, skey, pid, now, mark_captured=True
+                    )
+                    time.sleep(2.0)
                     c.execute(
                         "UPDATE picks_log SET clv_captured=? WHERE id=?",
                         (1 if found else -1, pid)
@@ -658,12 +729,16 @@ class ChampionshipBot:
             pass
 
     def run_daily_scan(self):
-        today    = datetime.now().strftime("%Y-%m-%d")
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        # V6.3: scan corre a las 09:00 UTC del día anterior (D-1)
+        # Busca partidos de mañana y pasado mañana para capturar cuotas líquidas
+        # con suficiente antelación. La Championship juega mayoritariamente
+        # a las 15:00 y 19:45 UK, así que D-1 a las 09:00 UTC = ~30h de antelación.
+        tomorrow       = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        day_after      = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
 
-        # Llamada 1+2: fixtures de hoy y mañana
+        # Llamada 1+2: fixtures de mañana y pasado mañana
         matches = []
-        for d in [today, tomorrow]:
+        for d in [tomorrow, day_after]:
             try:
                 r = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
@@ -681,7 +756,7 @@ class ChampionshipBot:
 
         if not matches:
             self.send_msg(
-                f"🔇 <b>Championship V6.1:</b> Sin partidos hoy.\n"
+                f"🔇 <b>Championship V6.2:</b> Sin partidos en los próximos 2 días.\n"
                 f"📡 Temporada activa: {self.season}"
             )
             return
@@ -689,7 +764,7 @@ class ChampionshipBot:
         matches = matches[:MAX_FIXTURES_PER_SCAN]
         requests_used = track_requests(0)
         self.send_msg(
-            f"🔍 Escaneando {len(matches)} partidos Championship\n"
+            f"🔍 Escaneando {len(matches)} partidos Championship (D-1)\n"
             f"📅 Temporada: {self.season}/{self.season+1}\n"
             f"📡 Requests usados hoy: {requests_used}/100"
         )
@@ -781,7 +856,9 @@ class ChampionshipBot:
 
             if not candidates:
                 continue
-            candidates.sort(key=lambda x: x['ev'], reverse=True)
+            # FIX v6.2: ordenar por ev*urs (valor ajustado al riesgo), no solo EV
+            # El URS existe para ser el criterio de selección — ignorarlo aquí lo anulaba
+            candidates.sort(key=lambda x: x['ev'] * x['urs'], reverse=True)
             preliminary.append(candidates[0])
 
         # Portfolio engine
@@ -791,7 +868,7 @@ class ChampionshipBot:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             reports = [
-                f"📊 <b>Championship V6.1 — Portfolio:</b>\n"
+                f"📊 <b>Championship V6.2 — Portfolio:</b>\n"
                 f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
                 f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
@@ -828,7 +905,7 @@ class ChampionshipBot:
             self.send_msg("\n\n".join(reports))
         else:
             self.send_msg(
-                f"🔇 <b>Championship V6.1:</b> Sin picks válidos hoy.\n"
+                f"🔇 <b>Championship V6.2:</b> Sin picks válidos hoy.\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
             )
 
@@ -836,7 +913,11 @@ class ChampionshipBot:
 if __name__ == "__main__":
     bot = ChampionshipBot()
 
+    # Scan D-1 a las 09:00 UTC: captura cuotas de apertura líquidas
     schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
+    # Captura intermedia a las 12:30 UTC del día del partido (2-6h antes del KO)
+    schedule.every().day.at(RUN_TIME_MIDDAY_CLV).do(bot.capture_midday_lines)
+    # Cierre final: polling cada 30min, actúa solo si quedan ≤60min para el KO
     schedule.every(30).minutes.do(bot.capture_closing_lines)
 
     # Burn-in status
