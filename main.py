@@ -9,18 +9,16 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V6.0 CHAMPIONSHIP SPECIALIST
+# V6.1 CHAMPIONSHIP SPECIALIST
 # ==========================================
-# CAMBIOS VS V5.10:
-#   1. Solo Championship (ID 40) — de 10 ligas a 1
-#   2. xG real basado en últimos 6 partidos por equipo
-#      via /fixtures?team=X&last=6 (llamada extra por partido)
-#      En lugar de promedios de temporada completa
-#   3. Budget de requests optimizado: ~40-50 requests diarios
-#      vs los ~120 anteriores que excedían el límite Free
-#   4. Factor de localía calculado dinámicamente por equipo
-#      (home_goals_avg vs away_goals_avg de últimos 6)
-#   5. Todos los mercados: 1X2, Over/Under 2.5, BTTS
+# CAMBIOS VS V6.0:
+#   1. BUG FIX: fetch_team_xg ahora retorna SIEMPRE 5 valores (path de error incluido)
+#   2. BUG FIX: track_requests en build_xg_match es condicional según llamadas reales
+#   3. BUG FIX: time.sleep en fetch_team_xg subido a 2.0s (rate limit 10 req/min)
+#   4. BUG FIX: CHAMPIONSHIP_SEASON con fallback automático 2025 → 2024
+#   5. LIMPIEZA: eliminada dependencia google-genai (no se usaba)
+#   6. MEJORA: factor de forma reciente (últimos 3 vs anteriores 3) en xG
+#   7. MEJORA: logging más preciso de requests reales consumidos
 
 LIVE_TRADING = False
 
@@ -35,13 +33,9 @@ DB_PATH = os.path.join(DB_DIR, "quant_v6.db")
 RUN_TIME_SCAN   = "02:50"
 RUN_TIME_INGEST = "04:00"
 
-# Championship league ID y temporada
-CHAMPIONSHIP_ID     = 40
-CHAMPIONSHIP_SEASON = 2025  # temporada 2025/26
+CHAMPIONSHIP_ID      = 40
+CHAMPIONSHIP_SEASONS = [2025, 2024]  # FIX v6.1: fallback automático si 2025 sin datos
 
-# Budget de requests: máximo partidos a escanear por día
-# 1 partido = 4 llamadas: fixtures + odds + últimos6_home + últimos6_away
-# 10 partidos × 4 = 40 llamadas. Seguro dentro de 100 diarios.
 MAX_FIXTURES_PER_SCAN = 10
 
 MAX_DAILY_HEAT          = 0.10
@@ -55,6 +49,7 @@ VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 
 LEAGUE_NAME = '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
 LIQUIDITY   = 0.85
+
 
 # ==========================================
 # DATABASE
@@ -90,37 +85,45 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, count INTEGER
     )""")
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 
 def log_rejection(fixture_id, match, market, odd, ev, reason):
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute(
             "INSERT INTO decision_log VALUES (NULL,?,?,?,?,?,?,?)",
             (fixture_id, match, market, odd, ev, reason,
              datetime.now(timezone.utc).isoformat())
         )
-        conn.commit(); conn.close()
-    except: pass
+        conn.commit()
+        conn.close()
+    except:
+        pass
 
 
 def track_requests(n=1):
-    """Registra cuántos requests se han usado hoy."""
+    """Registra cuántos requests se han usado hoy. n=0 solo consulta."""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        conn  = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn  = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute("SELECT count FROM request_log WHERE date=?", (today,))
         row = c.fetchone()
         if row:
-            c.execute("UPDATE request_log SET count=count+? WHERE date=?", (n, today))
+            if n > 0:
+                c.execute("UPDATE request_log SET count=count+? WHERE date=?", (n, today))
         else:
-            c.execute("INSERT INTO request_log VALUES (NULL,?,?)", (today, n))
+            c.execute("INSERT INTO request_log VALUES (NULL,?,?)", (today, max(n, 0)))
         conn.commit()
         c.execute("SELECT count FROM request_log WHERE date=?", (today,))
-        total = c.fetchone()[0]; conn.close()
+        total = c.fetchone()[0]
+        conn.close()
         return total
-    except: return 0
+    except:
+        return 0
 
 
 # ==========================================
@@ -129,29 +132,38 @@ def track_requests(n=1):
 
 def get_avg_clv(lookback=30):
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
                      FROM picks_log p JOIN closing_lines c
                        ON p.fixture_id=c.fixture_id AND p.market=c.market
                           AND p.selection_key=c.selection_key
                      WHERE p.clv_captured=1
                      ORDER BY p.id DESC LIMIT ?""", (lookback,))
-        res = c.fetchone()[0]; conn.close()
+        res = c.fetchone()[0]
+        conn.close()
         return float(res) if res else 0.0
-    except: return 0.0
+    except:
+        return 0.0
+
 
 def get_clv_sharpe():
     try:
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute("""SELECT (p.odd_open - c.odd_close)/p.odd_open
                      FROM picks_log p JOIN closing_lines c
                        ON p.fixture_id=c.fixture_id AND p.clv_captured=1
                      ORDER BY p.id DESC LIMIT 50""")
-        clvs = [r[0] for r in c.fetchall()]; conn.close()
-        if len(clvs) < 5: return 0.0
+        clvs = [r[0] for r in c.fetchall()]
+        conn.close()
+        if len(clvs) < 5:
+            return 0.0
         mean, std = np.mean(clvs), np.std(clvs, ddof=1)
         return mean / std if std != 0 else 0.0
-    except: return 0.0
+    except:
+        return 0.0
+
 
 def score_sharpe(s):
     if s < -0.5:   return 0.10
@@ -161,6 +173,7 @@ def score_sharpe(s):
     elif s < 1.5:  return 0.90
     else:          return 1.00
 
+
 def score_ev(ev):
     if ev < 0.03:   return 0.20
     elif ev < 0.05: return 0.40
@@ -168,12 +181,14 @@ def score_ev(ev):
     elif ev < 0.12: return 0.80
     else:           return 1.00
 
+
 def score_odd(odd):
     if odd < 1.20:    return 0.10
     elif odd < 1.40:  return 0.50
     elif odd <= 3.00: return 1.00
     elif odd <= 4.00: return 0.70
     else:             return 0.30
+
 
 def calculate_urs(ev, odd):
     sharpe = get_clv_sharpe()
@@ -183,6 +198,7 @@ def calculate_urs(ev, odd):
            w["liquidity"] * LIQUIDITY +
            w["odd"]       * score_odd(odd))
     return max(0.10, min(urs, 1.00))
+
 
 def get_kelly_and_urs(ev, odd, market):
     avg_clv = get_avg_clv()
@@ -200,13 +216,15 @@ def get_kelly_and_urs(ev, odd, market):
 # ==========================================
 
 def apply_portfolio_engine(picks):
-    if not picks: return [], {}
+    if not picks:
+        return [], {}
 
     port_var = 0.0
     for p in picks:
         if p['odd'] <= 1.01:
-            p['adj_stake'] = 0; p['lcp'] = 0; continue
-        # En Championship solo hay picks de una liga, LCP = 1/sqrt(N_picks)
+            p['adj_stake'] = 0
+            p['lcp'] = 0
+            continue
         lcp       = 1.0 / math.sqrt(len(picks))
         adj_stake = p['base_stake'] * lcp
         beta      = VOLATILITY_BUCKETS.get(p['mkt'], 1.00)
@@ -233,47 +251,70 @@ def apply_portfolio_engine(picks):
 
 
 # ==========================================
-# XG ENGINE V6.0 — ÚLTIMOS 6 PARTIDOS REALES
+# XG ENGINE V6.1
 # ==========================================
 
 def _poisson_pmf(mu, k):
-    if mu <= 0 or k < 0: return 0.0
-    try: return exp(-mu + k * log(mu) - lgamma(k + 1))
-    except: return 0.0
+    if mu <= 0 or k < 0:
+        return 0.0
+    try:
+        return exp(-mu + k * log(mu) - lgamma(k + 1))
+    except:
+        return 0.0
+
 
 def _weighted_avg(values, decay=XG_DECAY_FACTOR):
-    if not values: return 0.0
+    if not values:
+        return 0.0
     w = [decay ** i for i in range(len(values))]
     return sum(v * wi for v, wi in zip(values, w)) / sum(w)
 
 
-def fetch_team_xg(team_id, is_home, headers):
+def _form_factor(gf_series):
     """
-    V6.0: Obtiene xG real de los últimos 6 partidos del equipo.
-    Usa goles reales como proxy de xG (api-football Free no da xG directo).
+    V6.1: Factor de forma reciente.
+    Compara los últimos 3 partidos vs los 3 anteriores.
+    Devuelve un multiplicador entre 0.85 y 1.15.
+    Si hay menos de 6 partidos, devuelve 1.0 (neutro).
+    """
+    if len(gf_series) < 6:
+        return 1.0
+    recent   = _weighted_avg(gf_series[:3])
+    previous = _weighted_avg(gf_series[3:6])
+    if previous < 0.1:
+        return 1.0
+    ratio = recent / previous
+    return max(0.85, min(ratio, 1.15))
+
+
+def fetch_team_xg(team_id, season, headers):
+    """
+    V6.1: Obtiene xG estimado de los últimos 6 partidos del equipo.
+    Usa goles reales como proxy (api-football Free no da xG directo).
     Aplica decay exponencial: partido más reciente pesa más.
 
-    Retorna (xg_estimado, confianza, goles_for_series, goles_against_series)
+    SIEMPRE retorna 5 valores: (xg_for, xg_against, confidence, gf_series, ga_series)
+    FIX v6.1: path de error retornaba 4 valores — corregido.
     """
     try:
         r = requests.get(
             "https://v3.football.api-sports.io/fixtures",
             headers=headers,
             params={
-                "team": team_id,
+                "team":   team_id,
                 "league": CHAMPIONSHIP_ID,
-                "season": CHAMPIONSHIP_SEASON,
-                "last": 6
+                "season": season,
+                "last":   6
             },
             timeout=15
         )
         fixtures = r.json().get('response', [])
 
         if not fixtures:
-            return 1.2, "LOW", [], []
+            return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
 
-        gf_series = []  # goles a favor (más reciente primero)
-        ga_series = []  # goles en contra
+        gf_series = []
+        ga_series = []
 
         for fix in fixtures:
             h_id    = fix['teams']['home']['id']
@@ -291,43 +332,74 @@ def fetch_team_xg(team_id, is_home, headers):
                 ga_series.append(h_goals)
 
         if not gf_series:
-            return 1.2, "LOW", [], []
+            return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
 
-        # xG estimado: promedio ponderado de goles for y against del rival
-        # Para el equipo local usamos su promedio de goles en casa
-        # Para el equipo visitante usamos su promedio de goles fuera
         xg_for     = _weighted_avg(gf_series)
         xg_against = _weighted_avg(ga_series)
-
-        # xG del equipo = promedio de sus goles for y los goles against del rival
-        # La fórmula completa se ensambla en build_xg_match
         confidence = "HIGH" if len(gf_series) >= 4 else "MED"
+
         return xg_for, xg_against, confidence, gf_series, ga_series
 
     except Exception as e:
-        return 1.2, 1.2, "LOW", [], []
+        return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
 
 
-def build_xg_match(home_id, away_id, h_inj, a_inj, headers):
+def resolve_season(headers):
     """
-    V6.0: Construye xG del partido usando últimos 6 partidos de cada equipo.
+    V6.1: Detecta automáticamente qué temporada tiene fixtures activos.
+    Intenta 2025 primero; si no hay datos, cae a 2024.
+    """
+    for season in CHAMPIONSHIP_SEASONS:
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers=headers,
+                params={
+                    "league": CHAMPIONSHIP_ID,
+                    "season": season,
+                    "next":   1
+                },
+                timeout=15
+            )
+            track_requests(1)
+            if r.json().get('response'):
+                return season
+        except:
+            pass
+    return CHAMPIONSHIP_SEASONS[-1]  # fallback último de la lista
+
+
+def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers):
+    """
+    V6.1: Construye xG del partido usando últimos 6 partidos de cada equipo.
 
     xG_home = (goles_for_home_weighted + goles_against_away_weighted) / 2
     xG_away = (goles_for_away_weighted + goles_against_home_weighted) / 2
 
-    Esto captura tanto la capacidad ofensiva del equipo
-    como la vulnerabilidad defensiva del rival.
+    FIX v6.1:
+    - fetch_team_xg siempre devuelve 5 valores (bug path de error corregido)
+    - sleep subido a 2.0s para respetar rate limit de 10 req/min
+    - factor de forma aplicado sobre serie reciente
+    - retorna requests_made para tracking preciso
     """
-    # Llamada 3: últimos 6 del equipo local
-    h_xgf, h_xga, h_conf, h_gf, h_ga = fetch_team_xg(home_id, True, headers)
-    time.sleep(1.2)  # respetar rate limit
+    requests_made = 0
 
-    # Llamada 4: últimos 6 del equipo visitante
-    a_xgf, a_xga, a_conf, a_gf, a_ga = fetch_team_xg(away_id, False, headers)
+    # Llamada home
+    h_xgf, h_xga, h_conf, h_gf, h_ga = fetch_team_xg(home_id, season, headers)
+    requests_made += 1
+    time.sleep(2.0)  # FIX: era 1.2s, insuficiente para rate limit 10 req/min
 
-    # xG del partido
-    xh = (h_xgf + a_xga) / 2  # ofensiva local + defensiva visitante
-    xa = (a_xgf + h_xga) / 2  # ofensiva visitante + defensiva local
+    # Llamada away
+    a_xgf, a_xga, a_conf, a_gf, a_ga = fetch_team_xg(away_id, season, headers)
+    requests_made += 1
+
+    # xG base del partido
+    xh = (h_xgf + a_xga) / 2
+    xa = (a_xgf + h_xga) / 2
+
+    # V6.1: Factor de forma reciente (últimos 3 vs anteriores 3)
+    xh *= _form_factor(h_gf)
+    xa *= _form_factor(a_gf)
 
     # Factor de lesiones
     xh *= (1 - min(h_inj * 0.015, 0.08))
@@ -340,12 +412,12 @@ def build_xg_match(home_id, away_id, h_inj, a_inj, headers):
     xh = max(0.6, min(xh, 3.5))
     xa = max(0.6, min(xa, 3.5))
 
-    # Confianza final: HIGH solo si ambos tienen >= 4 partidos
     conf = "HIGH" if (h_conf == "HIGH" and a_conf == "HIGH") else \
            "MED"  if (h_conf != "LOW"  and a_conf != "LOW")  else "LOW"
 
     xg_source = f"last6 (H:{len(h_gf)}pts, A:{len(a_gf)}pts)"
-    return xh, xa, xh + xa, conf, xg_source
+
+    return xh, xa, xh + xa, conf, xg_source, requests_made
 
 
 # ==========================================
@@ -363,33 +435,41 @@ def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
             elif i == j: p_draw += prob
             else:        p_away += prob
     total = p_home + p_draw + p_away
-    if total < 0.95: return None
+    if total < 0.95:
+        return None
     p_h, p_d, p_a = p_home/total, p_draw/total, p_away/total
-    if not (0.08 <= p_d <= 0.55): return None
+    if not (0.08 <= p_d <= 0.55):
+        return None
     return p_h, p_d, p_a
 
+
 def calc_over_under(xg_total, line=2.5, std=1.35):
-    var     = max(std ** 2, xg_total)
-    mu      = xg_total
+    var = max(std ** 2, xg_total)
+    mu  = xg_total
 
     def negbin(mu, var, k):
-        if mu <= 0: return 0.0
+        if mu <= 0:
+            return 0.0
         if var <= mu * 1.01:
             return _poisson_pmf(mu, k)
-        r = mu**2 / (var - mu); p = r / (r + mu)
+        r = mu**2 / (var - mu)
+        p = r / (r + mu)
         try:
             return exp(lgamma(k+r) - lgamma(r) - lgamma(k+1) + r*log(p) + k*log(1-p))
-        except: return 0.0
+        except:
+            return 0.0
 
     p_under = sum(negbin(mu, var, k) for k in range(int(np.floor(line)) + 1))
     return 1 - p_under, p_under
+
 
 def calc_btts(xg_home, xg_away):
     if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
         return None, None
     p_yes = (1 - exp(-xg_home)) * (1 - exp(-xg_away))
     p_no  = 1 - p_yes
-    if not (0.20 <= p_yes <= 0.90): return None, None
+    if not (0.20 <= p_yes <= 0.90):
+        return None, None
     return round(p_yes, 4), round(p_no, 4)
 
 
@@ -405,13 +485,15 @@ def validate_xg(xh, xa, bets):
                 try:
                     if v['value'] == 'Home': home_odd = float(v['odd'])
                     if v['value'] == 'Away': away_odd = float(v['odd'])
-                except: pass
+                except:
+                    pass
         elif b['id'] == 5:
             for v in b['values']:
                 try:
                     if v['value'] == 'Over 2.5':  over_odd  = float(v['odd'])
                     if v['value'] == 'Under 2.5': under_odd = float(v['odd'])
-                except: pass
+                except:
+                    pass
 
     if home_odd and away_odd:
         min_odd  = min(home_odd, away_odd)
@@ -430,6 +512,7 @@ def validate_xg(xh, xa, bets):
                 return False, f"XG_TOTAL_INCONSISTENT (model={xh+xa:.2f}, mkt={xg_implied:.2f})"
 
     return True, None
+
 
 def sanity_check(p_true, mkt, odd):
     VIG = {"OVER": 1.07, "UNDER": 1.07, "1X2": 1.05, "BTTS": 1.06}
@@ -459,7 +542,8 @@ def build_market_probs(bets, xh, xa, h_n, a_n, conf):
     for b in bets:
         if b['id'] == 1:
             for v in b['values']:
-                if v['value'] not in p_1x2: continue
+                if v['value'] not in p_1x2:
+                    continue
                 odd       = float(v['odd'])
                 p_true    = p_1x2[v['value']]
                 p_implied = 1 / (odd * 1.05)
@@ -472,7 +556,8 @@ def build_market_probs(bets, xh, xa, h_n, a_n, conf):
 
         elif b['id'] == 5:
             for v in b['values']:
-                if v['value'] not in ('Over 2.5', 'Under 2.5'): continue
+                if v['value'] not in ('Over 2.5', 'Under 2.5'):
+                    continue
                 is_over   = 'Over' in v['value']
                 p_true    = po if is_over else pu
                 mkt_type  = "OVER" if is_over else "UNDER"
@@ -487,7 +572,8 @@ def build_market_probs(bets, xh, xa, h_n, a_n, conf):
 
         elif b['id'] == 8 and p_btts_yes is not None:
             for v in b['values']:
-                if v['value'] not in ('Yes', 'No'): continue
+                if v['value'] not in ('Yes', 'No'):
+                    continue
                 p_true    = p_btts_yes if v['value'] == 'Yes' else p_btts_no
                 odd       = float(v['odd'])
                 p_implied = 1 / (odd * 1.06)
@@ -509,28 +595,34 @@ class ChampionshipBot:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
+        # V6.1: detectar temporada activa una sola vez al arrancar
+        self.season = resolve_season(self.headers)
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
         self.send_msg(
-            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.0</b>\n"
+            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.1</b>\n"
             f"Estado: {mode}\n"
-            f"xG: últimos 6 partidos reales\n"
+            f"Temporada activa: {self.season}/{self.season+1}\n"
+            f"xG: últimos 6 partidos + factor de forma\n"
             f"Mercados: 1X2 · O/U 2.5 · BTTS\n"
             f"Budget: ~40 requests/día"
         )
 
     def send_msg(self, text):
-        if not TELEGRAM_TOKEN: return
+        if not TELEGRAM_TOKEN:
+            return
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
                 timeout=10
             )
-        except: pass
+        except:
+            pass
 
     def capture_closing_lines(self):
         try:
-            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
             now  = datetime.now(timezone.utc)
             c.execute(
                 "SELECT id, fixture_id, market, selection_key, kickoff_time "
@@ -554,56 +646,67 @@ class ChampionshipBot:
                                         (fid, mkt, skey, float(v['odd']),
                                          1/float(v['odd']), now.isoformat())
                                     )
-                                    found = True; break
+                                    found = True
+                                    break
                     c.execute(
                         "UPDATE picks_log SET clv_captured=? WHERE id=?",
                         (1 if found else -1, pid)
                     )
-            conn.commit(); conn.close()
-        except: pass
+            conn.commit()
+            conn.close()
+        except:
+            pass
 
     def run_daily_scan(self):
         today    = datetime.now().strftime("%Y-%m-%d")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Llamada 1: fixtures del día
+        # Llamada 1+2: fixtures de hoy y mañana
         matches = []
         for d in [today, tomorrow]:
             try:
                 r = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers=self.headers,
-                    params={"league": CHAMPIONSHIP_ID, "season": CHAMPIONSHIP_SEASON, "date": d}
+                    params={
+                        "league":  CHAMPIONSHIP_ID,
+                        "season":  self.season,
+                        "date":    d
+                    }
                 )
                 track_requests(1)
                 matches.extend(r.json().get('response', []))
-            except: pass
+            except:
+                pass
 
         if not matches:
-            self.send_msg("🔇 <b>Championship V6.0:</b> Sin partidos hoy.")
+            self.send_msg(
+                f"🔇 <b>Championship V6.1:</b> Sin partidos hoy.\n"
+                f"📡 Temporada activa: {self.season}"
+            )
             return
 
-        # Limitar a MAX_FIXTURES_PER_SCAN para respetar budget
         matches = matches[:MAX_FIXTURES_PER_SCAN]
         requests_used = track_requests(0)
         self.send_msg(
             f"🔍 Escaneando {len(matches)} partidos Championship\n"
+            f"📅 Temporada: {self.season}/{self.season+1}\n"
             f"📡 Requests usados hoy: {requests_used}/100"
         )
 
         preliminary = []
 
         for m in matches:
-            fid     = m['fixture']['id']
-            h_n     = m['teams']['home']['name']
-            a_n     = m['teams']['away']['name']
-            h_id    = m['teams']['home']['id']
-            a_id    = m['teams']['away']['id']
-            ko      = m['fixture']['date']
-            label   = f"{h_n} vs {a_n}"
+            fid  = m['fixture']['id']
+            h_n  = m['teams']['home']['name']
+            a_n  = m['teams']['away']['name']
+            h_id = m['teams']['home']['id']
+            a_id = m['teams']['away']['id']
+            ko   = m['fixture']['date']
+            label = f"{h_n} vs {a_n}"
             time.sleep(6.1)
 
-            # Llamada 2: cuotas Bet365
+            # Llamada: cuotas Bet365
             try:
                 odds_res = requests.get(
                     "https://v3.football.api-sports.io/odds",
@@ -611,13 +714,14 @@ class ChampionshipBot:
                     params={"fixture": fid, "bookmaker": 8}
                 ).json().get('response', [])
                 track_requests(1)
-            except: continue
+            except:
+                continue
 
-            if not odds_res: continue
+            if not odds_res:
+                continue
             bets = odds_res[0]['bookmakers'][0]['bets']
 
-            # Llamadas 3 y 4: últimos 6 partidos de cada equipo
-            # Obtener lesiones de predicciones (no llama endpoint separado)
+            # Llamada: lesiones
             try:
                 inj_res = requests.get(
                     "https://v3.football.api-sports.io/injuries",
@@ -630,9 +734,12 @@ class ChampionshipBot:
             except:
                 hinj = ainj = 0
 
-            # xG basado en últimos 6 partidos reales
-            xh, xa, xt, conf, xg_src = build_xg_match(h_id, a_id, hinj, ainj, self.headers)
-            track_requests(2)  # 2 llamadas dentro de build_xg_match
+            # V6.1: xG basado en últimos 6 + factor de forma
+            # retorna requests_made para tracking preciso
+            xh, xa, xt, conf, xg_src, req_made = build_xg_match(
+                h_id, a_id, hinj, ainj, self.season, self.headers
+            )
+            track_requests(req_made)  # FIX: tracking exacto de requests reales
 
             # Validar consistencia xG vs mercado
             ok, reason = validate_xg(xh, xa, bets)
@@ -640,10 +747,8 @@ class ChampionshipBot:
                 log_rejection(fid, label, 'ALL', 0.0, 0.0, reason)
                 continue
 
-            # Construir probabilidades
             probs = build_market_probs(bets, xh, xa, h_n, a_n, conf)
 
-            # Si confianza baja, omitir 1X2 y BTTS
             if conf == "LOW":
                 probs = [p for p in probs if p['mkt'] in ('OVER', 'UNDER')]
 
@@ -674,7 +779,8 @@ class ChampionshipBot:
                     'xh': xh, 'xa': xa, 'xt': xt
                 })
 
-            if not candidates: continue
+            if not candidates:
+                continue
             candidates.sort(key=lambda x: x['ev'], reverse=True)
             preliminary.append(candidates[0])
 
@@ -682,9 +788,10 @@ class ChampionshipBot:
         final, meta = apply_portfolio_engine(preliminary)
 
         if final:
-            conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
             reports = [
-                f"📊 <b>Championship V6.0 — Portfolio:</b>\n"
+                f"📊 <b>Championship V6.1 — Portfolio:</b>\n"
                 f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
                 f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
@@ -716,11 +823,12 @@ class ChampionshipBot:
                     f"📈 xG fuente: {p['xg_src']}\n"
                     f"🎯 Stake: {stake_disp*100:.2f}%"
                 )
-            conn.commit(); conn.close()
+            conn.commit()
+            conn.close()
             self.send_msg("\n\n".join(reports))
         else:
             self.send_msg(
-                f"🔇 <b>Championship V6.0:</b> Sin picks válidos hoy.\n"
+                f"🔇 <b>Championship V6.1:</b> Sin picks válidos hoy.\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
             )
 
@@ -741,27 +849,33 @@ if __name__ == "__main__":
     # Morgue
     try:
         print("\n🕵️  MORGUE:")
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute("SELECT reason, COUNT(*) FROM decision_log GROUP BY reason ORDER BY COUNT(*) DESC LIMIT 10")
-        for r in c.fetchall(): print(f"  ❌ {r[0]}: {r[1]}")
+        for r in c.fetchall():
+            print(f"  ❌ {r[0]}: {r[1]}")
         conn.close()
-    except: pass
+    except:
+        pass
 
     # CLV
     try:
         print("\n⏳ CLV:")
-        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         c.execute("""SELECT ((p.odd_open-c.odd_close)/p.odd_open)*100, p.market
                      FROM picks_log p JOIN closing_lines c
                        ON p.fixture_id=c.fixture_id AND p.clv_captured=1""")
-        picks = c.fetchall(); conn.close()
+        picks = c.fetchall()
+        conn.close()
         if picks:
             clvs  = [p[0] for p in picks]
             beats = sum(1 for v in clvs if v > 0)
             print(f"  N={len(picks)} | Beat={beats}/{len(picks)} | CLV_avg={sum(clvs)/len(clvs):.2f}%")
         else:
             print("  Sin CLVs aún.")
-    except: pass
+    except:
+        pass
 
     bot.run_daily_scan()
 
