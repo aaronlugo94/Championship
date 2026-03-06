@@ -1,0 +1,5 @@
+requests
+schedule
+google-genai
+numpy
+scipy>=1.11.0
