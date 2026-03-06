@@ -54,6 +54,16 @@ VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 LEAGUE_NAME = '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
 LIQUIDITY   = 0.85
 
+# Horarios de tareas semanales (días sin jornada)
+RUN_TIME_XG_CACHE     = "08:00"   # Lunes: pre-caché xG 24 equipos
+RUN_TIME_LINE_MONITOR = "10:00"   # Martes: monitoreo cuotas próxima jornada
+RUN_TIME_INJURY_WATCH = "08:00"   # Miércoles: lesiones activas
+RUN_TIME_LEAGUE_STATS = "08:00"   # Jueves: standings + stats de temporada
+
+# Cache TTL: si el dato tiene menos de N horas, no volver a llamar la API
+XG_CACHE_TTL_HOURS    = 20        # re-cachear si el dato tiene >20h de antigüedad
+LINE_ALERT_MOVE_PCT   = 0.08      # alertar si la cuota se mueve >8% desde apertura
+
 
 # ==========================================
 # DATABASE
@@ -88,6 +98,46 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS request_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, count INTEGER
+    )""")
+    # Cache semanal de xG por equipo
+    c.execute("""CREATE TABLE IF NOT EXISTS team_xg_cache (
+        team_id INTEGER PRIMARY KEY,
+        team_name TEXT,
+        gf_series TEXT,      -- JSON: lista de goles a favor (más reciente primero)
+        ga_series TEXT,      -- JSON: lista de goles en contra
+        xg_for REAL,
+        xg_against REAL,
+        confidence TEXT,
+        updated_at DATETIME
+    )""")
+    # Snapshots de cuotas para monitoreo de movimiento de línea
+    c.execute("""CREATE TABLE IF NOT EXISTS line_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id INTEGER,
+        home_team TEXT, away_team TEXT,
+        kickoff_time TEXT,
+        market TEXT, selection TEXT,
+        odd_snapshot REAL,
+        odd_open REAL,       -- primera cuota registrada para este fixture+market
+        captured_at DATETIME
+    )""")
+    # Resumen semanal de estadísticas de liga
+    c.execute("""CREATE TABLE IF NOT EXISTS league_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        season INTEGER,
+        team_id INTEGER, team_name TEXT,
+        played INTEGER, wins INTEGER, draws INTEGER, losses INTEGER,
+        goals_for INTEGER, goals_against INTEGER,
+        avg_goals_for REAL, avg_goals_against REAL,
+        captured_at DATETIME
+    )""")
+    # Registro de lesiones activas por equipo
+    c.execute("""CREATE TABLE IF NOT EXISTS injury_watch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id INTEGER, team_name TEXT,
+        player_name TEXT, injury_type TEXT,
+        status TEXT, expected_return TEXT,
+        captured_at DATETIME
     )""")
     conn.commit()
     conn.close()
@@ -295,15 +345,33 @@ def _form_factor(gf_series):
     return max(0.85, min(ratio, 1.15))
 
 
-def fetch_team_xg(team_id, season, headers):
+def fetch_team_xg(team_id, season, headers, use_cache=True):
     """
-    V6.1: Obtiene xG estimado de los últimos 6 partidos del equipo.
-    Usa goles reales como proxy (api-football Free no da xG directo).
-    Aplica decay exponencial: partido más reciente pesa más.
+    V6.2: Obtiene xG estimado de los últimos 6 partidos del equipo.
+    Si use_cache=True y hay datos frescos en team_xg_cache (<TTL horas),
+    los usa directamente sin llamar a la API — ahorra requests en días de jornada.
+    """
+    import json
+    if use_cache:
+        try:
+            conn_c = sqlite3.connect(DB_PATH)
+            cc = conn_c.cursor()
+            cc.execute(
+                "SELECT gf_series, ga_series, xg_for, xg_against, confidence, updated_at "
+                "FROM team_xg_cache WHERE team_id=?", (team_id,)
+            )
+            row = cc.fetchone()
+            conn_c.close()
+            if row:
+                updated = datetime.fromisoformat(row[5])
+                age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+                if age_hours < XG_CACHE_TTL_HOURS:
+                    gf = json.loads(row[0])
+                    ga = json.loads(row[1])
+                    return float(row[2]), float(row[3]), row[4], gf, ga
+        except:
+            pass  # cache miss → llamar API normalmente
 
-    SIEMPRE retorna 5 valores: (xg_for, xg_against, confidence, gf_series, ga_series)
-    FIX v6.1: path de error retornaba 4 valores — corregido.
-    """
     try:
         r = requests.get(
             "https://v3.football.api-sports.io/fixtures",
@@ -345,6 +413,23 @@ def fetch_team_xg(team_id, season, headers):
         xg_for     = _weighted_avg(gf_series)
         xg_against = _weighted_avg(ga_series)
         confidence = "HIGH" if len(gf_series) >= 4 else "MED"
+
+        # Guardar en cache para reutilizar en el scan del día de jornada
+        try:
+            import json
+            conn_c = sqlite3.connect(DB_PATH)
+            cc = conn_c.cursor()
+            cc.execute("""INSERT OR REPLACE INTO team_xg_cache
+                (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (team_id, json.dumps(gf_series), json.dumps(ga_series),
+                 xg_for, xg_against, confidence,
+                 datetime.now(timezone.utc).isoformat())
+            )
+            conn_c.commit()
+            conn_c.close()
+        except:
+            pass
 
         return xg_for, xg_against, confidence, gf_series, ga_series
 
@@ -728,6 +813,297 @@ class ChampionshipBot:
         except:
             pass
 
+    def weekly_xg_cache(self):
+        """
+        LUNES 08:00 UTC — Pre-caché xG de los 24 equipos de Championship.
+        Llama a last6 de cada equipo y guarda en team_xg_cache.
+        En días de jornada, fetch_team_xg leerá de aquí y ahorrará ~20 requests.
+        Coste: 24 requests. Si un equipo ya tiene cache fresca (<20h), lo salta.
+        """
+        import json
+        try:
+            # Obtener equipos activos de la temporada
+            r = requests.get(
+                "https://v3.football.api-sports.io/standings",
+                headers=self.headers,
+                params={"league": CHAMPIONSHIP_ID, "season": self.season}
+            )
+            track_requests(1)
+            standings = r.json().get('response', [])
+            if not standings:
+                return
+
+            teams = []
+            for group in standings:
+                for entry in group.get('league', {}).get('standings', [[]])[0]:
+                    teams.append((entry['team']['id'], entry['team']['name']))
+
+            cached = skipped = 0
+            for team_id, team_name in teams:
+                # Comprobar si ya hay cache fresca
+                conn = sqlite3.connect(DB_PATH)
+                cc = conn.cursor()
+                cc.execute("SELECT updated_at FROM team_xg_cache WHERE team_id=?", (team_id,))
+                row = cc.fetchone()
+                conn.close()
+                if row:
+                    age = (datetime.now(timezone.utc) -
+                           datetime.fromisoformat(row[0])).total_seconds() / 3600
+                    if age < XG_CACHE_TTL_HOURS:
+                        skipped += 1
+                        continue
+
+                # Llamar API y cachear (fetch_team_xg guarda automáticamente)
+                fetch_team_xg(team_id, self.season, self.headers, use_cache=False)
+                track_requests(1)
+                cached += 1
+                time.sleep(2.0)
+
+            # Actualizar team_name en cache (no lo guarda fetch_team_xg)
+            conn = sqlite3.connect(DB_PATH)
+            cc = conn.cursor()
+            for team_id, team_name in teams:
+                cc.execute("UPDATE team_xg_cache SET team_name=? WHERE team_id=?",
+                           (team_name, team_id))
+            conn.commit()
+            conn.close()
+
+            self.send_msg(
+                f"🔄 <b>xG Cache actualizada</b>\nEquipos cacheados: {cached} | Saltados (frescos): {skipped}\n📡 Requests usados hoy: {track_requests(0)}/100"
+            )
+        except Exception as e:
+            self.send_msg(f"⚠️ weekly_xg_cache error: {e}")
+
+    def line_monitor(self):
+        """
+        MARTES 10:00 UTC — Monitoreo de movimiento de cuotas para la próxima jornada.
+        Obtiene fixtures de los próximos 7 días y compara cuotas actuales
+        contra la primera cuota registrada (odd_open en line_snapshots).
+        Alerta en Telegram si alguna línea se mueve >LINE_ALERT_MOVE_PCT (8%).
+        Coste: ~10 requests (MAX_FIXTURES_PER_SCAN).
+        """
+        try:
+            from datetime import timedelta
+            target = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+            today  = datetime.now().strftime("%Y-%m-%d")
+
+            matches = []
+            for d_offset in range(7):
+                d = (datetime.now() + timedelta(days=d_offset)).strftime("%Y-%m-%d")
+                r = requests.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    headers=self.headers,
+                    params={"league": CHAMPIONSHIP_ID, "season": self.season, "date": d}
+                )
+                track_requests(1)
+                matches.extend(r.json().get('response', []))
+                if len(matches) >= MAX_FIXTURES_PER_SCAN:
+                    break
+                time.sleep(2.0)
+
+            matches = matches[:MAX_FIXTURES_PER_SCAN]
+            alerts = []
+            now    = datetime.now(timezone.utc)
+
+            for m in matches:
+                fid = m['fixture']['id']
+                h_n = m['teams']['home']['name']
+                a_n = m['teams']['away']['name']
+                ko  = m['fixture']['date']
+
+                r = requests.get(
+                    "https://v3.football.api-sports.io/odds",
+                    headers=self.headers,
+                    params={"fixture": fid, "bookmaker": 8}
+                ).json().get('response', [])
+                track_requests(1)
+                if not r:
+                    time.sleep(2.0)
+                    continue
+
+                for b in r[0]['bookmakers'][0]['bets']:
+                    for v in b['values']:
+                        mkt_key = f"{b['id']}|{v['value']}"
+                        odd_now = float(v['odd'])
+
+                        conn = sqlite3.connect(DB_PATH)
+                        cc   = conn.cursor()
+                        cc.execute(
+                            "SELECT odd_open FROM line_snapshots "
+                            "WHERE fixture_id=? AND market=? ORDER BY id ASC LIMIT 1",
+                            (fid, mkt_key)
+                        )
+                        first = cc.fetchone()
+
+                        if first:
+                            odd_open = first[0]
+                            move = abs(odd_now - odd_open) / odd_open
+                            if move >= LINE_ALERT_MOVE_PCT:
+                                direction = "📉" if odd_now < odd_open else "📈"
+                                alerts.append(
+                                    f"{direction} <b>{h_n} vs {a_n}</b>\n"
+                                    f"   {v['value']}: {odd_open:.2f} → {odd_now:.2f} "
+                                    f"({move*100:+.1f}%)"
+                                )
+                        else:
+                            # Primera vez que vemos este fixture — guardar como baseline
+                            cc.execute(
+                                """INSERT INTO line_snapshots
+                                   (fixture_id, home_team, away_team, kickoff_time,
+                                    market, selection, odd_snapshot, odd_open, captured_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                                (fid, h_n, a_n, ko, mkt_key, v['value'],
+                                 odd_now, odd_now, now.isoformat())
+                            )
+                        cc.execute(
+                            """INSERT INTO line_snapshots
+                               (fixture_id, home_team, away_team, kickoff_time,
+                                market, selection, odd_snapshot, odd_open, captured_at)
+                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (fid, h_n, a_n, ko, mkt_key, v['value'],
+                             odd_now,
+                             first[0] if first else odd_now,
+                             now.isoformat())
+                        )
+                        conn.commit()
+                        conn.close()
+                time.sleep(2.0)
+
+            if alerts:
+                self.send_msg(
+                    "🚨 <b>Line Monitor — Movimientos >8%</b>\n\n" +
+                    "\n\n".join(alerts) +
+                    f"\n\n📡 Requests: {track_requests(0)}/100"
+                )
+            else:
+                self.send_msg(
+                    f"✅ <b>Line Monitor:</b> Sin movimientos significativos.\n"
+                    f"📡 Requests: {track_requests(0)}/100"
+                )
+        except Exception as e:
+            self.send_msg(f"⚠️ line_monitor error: {e}")
+
+    def injury_watch(self):
+        """
+        MIÉRCOLES 08:00 UTC — Lesiones activas de los 24 equipos.
+        Guarda en injury_watch y alerta si hay bajas en equipos
+        con partido en los próximos 5 días.
+        Coste: 1 request (endpoint /injuries por temporada, no por fixture).
+        """
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/injuries",
+                headers=self.headers,
+                params={"league": CHAMPIONSHIP_ID, "season": self.season}
+            )
+            track_requests(1)
+            injuries = r.json().get('response', [])
+            if not injuries:
+                self.send_msg("✅ <b>Injury Watch:</b> Sin lesiones registradas.")
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            cc   = conn.cursor()
+            now  = datetime.now(timezone.utc)
+
+            # Limpiar registros anteriores y reescribir
+            cc.execute("DELETE FROM injury_watch")
+            team_counts = {}
+            for inj in injuries:
+                tid   = inj['team']['id']
+                tname = inj['team']['name']
+                pname = inj['player']['name']
+                itype = inj.get('player', {}).get('type', 'Unknown')
+                status = inj.get('player', {}).get('reason', 'Unknown')
+
+                cc.execute(
+                    """INSERT INTO injury_watch
+                       (team_id, team_name, player_name, injury_type, status,
+                        expected_return, captured_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (tid, tname, pname, itype, status, 'N/A', now.isoformat())
+                )
+                team_counts[tname] = team_counts.get(tname, 0) + 1
+
+            conn.commit()
+            conn.close()
+
+            # Alertar equipos con 3+ bajas (impacto potencial en xG)
+            heavy = [(t, n) for t, n in team_counts.items() if n >= 3]
+            if heavy:
+                lines = "\n".join(f"  🚑 {t}: {n} bajas" for t, n in
+                                   sorted(heavy, key=lambda x: -x[1]))
+                self.send_msg(
+                    f"🚑 <b>Injury Watch — Equipos con 3+ bajas:</b>\n{lines}\n"
+                    f"Total lesionados: {len(injuries)}\n"
+                    f"📡 Requests: {track_requests(0)}/100"
+                )
+            else:
+                self.send_msg(
+                    f"✅ <b>Injury Watch:</b> {len(injuries)} lesionados, "
+                    f"ningún equipo con 3+ bajas.\n"
+                    f"📡 Requests: {track_requests(0)}/100"
+                )
+        except Exception as e:
+            self.send_msg(f"⚠️ injury_watch error: {e}")
+
+    def league_stats_ingest(self):
+        """
+        JUEVES 08:00 UTC — Standings + estadísticas de goles de la temporada.
+        Guarda promedios de goles for/against por equipo en league_stats.
+        Útil para calibrar si el modelo xG (basado en last6) diverge
+        de la media de temporada completa — señal de equipo en racha atípica.
+        Coste: 1 request.
+        """
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/standings",
+                headers=self.headers,
+                params={"league": CHAMPIONSHIP_ID, "season": self.season}
+            )
+            track_requests(1)
+            standings = r.json().get('response', [])
+            if not standings:
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            cc   = conn.cursor()
+            now  = datetime.now(timezone.utc)
+            cc.execute("DELETE FROM league_stats WHERE season=?", (self.season,))
+
+            teams_saved = 0
+            for group in standings:
+                for entry in group.get('league', {}).get('standings', [[]])[0]:
+                    t   = entry['team']
+                    all = entry['all']
+                    played = all['played']
+                    gf     = all['goals']['for']
+                    ga     = all['goals']['against']
+                    cc.execute(
+                        """INSERT INTO league_stats
+                           (season, team_id, team_name, played, wins, draws, losses,
+                            goals_for, goals_against, avg_goals_for, avg_goals_against,
+                            captured_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (self.season, t['id'], t['name'],
+                         played, all['win'], all['draw'], all['lose'],
+                         gf, ga,
+                         round(gf / played, 3) if played else 0,
+                         round(ga / played, 3) if played else 0,
+                         now.isoformat())
+                    )
+                    teams_saved += 1
+
+            conn.commit()
+            conn.close()
+            self.send_msg(
+                f"📊 <b>League Stats actualizadas</b>\n"
+                f"Equipos: {teams_saved} | Temporada: {self.season}/{self.season+1}\n"
+                f"📡 Requests: {track_requests(0)}/100"
+            )
+        except Exception as e:
+            self.send_msg(f"⚠️ league_stats_ingest error: {e}")
+
     def run_daily_scan(self):
         # V6.3: scan corre a las 09:00 UTC del día anterior (D-1)
         # Busca partidos de mañana y pasado mañana para capturar cuotas líquidas
@@ -761,6 +1137,19 @@ class ChampionshipBot:
             )
             return
 
+        # V6.2: si hay más partidos que el budget permite, priorizar
+        # los que tienen kick-off más próximo (mercado más maduro y líquido).
+        # Descartar partidos a más de 48h — cuotas aún poco representativas.
+        now_utc = datetime.now(timezone.utc)
+        def fixture_hours_away(m):
+            try:
+                ko = datetime.fromisoformat(m['fixture']['date'].replace('Z', '+00:00'))
+                return (ko - now_utc).total_seconds() / 3600
+            except:
+                return 999
+
+        matches = [m for m in matches if fixture_hours_away(m) <= 48]
+        matches.sort(key=fixture_hours_away)          # más próximos primero
         matches = matches[:MAX_FIXTURES_PER_SCAN]
         requests_used = track_requests(0)
         self.send_msg(
@@ -913,12 +1302,23 @@ class ChampionshipBot:
 if __name__ == "__main__":
     bot = ChampionshipBot()
 
+    # ── TAREAS DIARIAS ──────────────────────────────────────────────
     # Scan D-1 a las 09:00 UTC: captura cuotas de apertura líquidas
     schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
     # Captura intermedia a las 12:30 UTC del día del partido (2-6h antes del KO)
     schedule.every().day.at(RUN_TIME_MIDDAY_CLV).do(bot.capture_midday_lines)
     # Cierre final: polling cada 30min, actúa solo si quedan ≤60min para el KO
     schedule.every(30).minutes.do(bot.capture_closing_lines)
+
+    # ── TAREAS SEMANALES (días sin jornada) ──────────────────────
+    # Lunes 08:00 UTC — pre-caché xG 24 equipos (~24 req, ahorra ~20 en el scan)
+    schedule.every().monday.at(RUN_TIME_XG_CACHE).do(bot.weekly_xg_cache)
+    # Martes 10:00 UTC — monitoreo movimiento de cuotas próxima jornada (~10 req)
+    schedule.every().tuesday.at(RUN_TIME_LINE_MONITOR).do(bot.line_monitor)
+    # Miércoles 08:00 UTC — lesiones activas todos los equipos (~1 req)
+    schedule.every().wednesday.at(RUN_TIME_INJURY_WATCH).do(bot.injury_watch)
+    # Jueves 08:00 UTC — standings + estadísticas de temporada (~1 req)
+    schedule.every().thursday.at(RUN_TIME_LEAGUE_STATS).do(bot.league_stats_ingest)
 
     # Burn-in status
     try:
