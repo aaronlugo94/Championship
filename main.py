@@ -737,15 +737,21 @@ class ChampionshipBot:
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN:
+            print("⚠️  TELEGRAM_TOKEN vacío — mensaje no enviado")
+            return
+        if not TELEGRAM_CHAT_ID:
+            print("⚠️  TELEGRAM_CHAT_ID vacío — mensaje no enviado")
             return
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
                 timeout=10
             )
-        except:
-            pass
+            if not r.ok:
+                print(f"⚠️  Telegram error {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"⚠️  Telegram excepción: {e}")
 
     def _fetch_and_store_odds(self, c, fid, mkt, skey, pid, now, mark_captured=True):
         """
