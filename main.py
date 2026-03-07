@@ -38,7 +38,7 @@ RUN_TIME_MIDDAY_CLV = "12:30"   # D-0: captura intermedia pre-partido
 RUN_TIME_INGEST     = "04:00"   # mantenido por compatibilidad
 
 CHAMPIONSHIP_ID      = 40
-CHAMPIONSHIP_SEASONS = [2025, 2024]  # FIX v6.1: fallback automático si 2025 sin datos
+CHAMPIONSHIP_SEASONS = [2025, 2024]  # 2025 = temporada 2025/26 (activa desde ago 2025)
 
 MAX_FIXTURES_PER_SCAN = 10
 
@@ -469,8 +469,10 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
 
 def resolve_season(headers):
     """
-    V6.1: Detecta automáticamente qué temporada tiene fixtures activos.
-    Intenta 2025 primero; si no hay datos, cae a 2024.
+    V6.2: Detecta temporada activa buscando fixtures FUTUROS.
+    Busca 'next=5' en lugar de 'next=1' para evitar caer a 2024
+    (que tiene datos históricos pero no futuros).
+    La temporada correcta para 2025/26 es season=2025.
     """
     for season in CHAMPIONSHIP_SEASONS:
         try:
@@ -480,16 +482,18 @@ def resolve_season(headers):
                 params={
                     "league": CHAMPIONSHIP_ID,
                     "season": season,
-                    "next":   1
+                    "next":   5        # buscar próximos 5 fixtures, no solo 1
                 },
                 timeout=15
             )
             track_requests(1)
-            if r.json().get('response'):
+            fixtures = r.json().get('response', [])
+            if len(fixtures) >= 1:     # al menos 1 fixture futuro confirma temporada activa
+                print(f"  ✅ Temporada activa detectada: {season} ({len(fixtures)} próximos fixtures)")
                 return season
         except:
             pass
-    return CHAMPIONSHIP_SEASONS[-1]  # fallback último de la lista
+    return CHAMPIONSHIP_SEASONS[-1]
 
 
 def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers):
