@@ -39,6 +39,9 @@ RUN_TIME_INGEST     = "04:00"   # mantenido por compatibilidad
 
 CHAMPIONSHIP_ID      = 40
 CHAMPIONSHIP_SEASONS = [2025, 2024]  # 2025 = temporada 2025/26 (activa desde ago 2025)
+# Override manual: si se define CHAMPIONSHIP_SEASON como variable de entorno en Railway,
+# se usa directamente sin llamar a resolve_season (útil para forzar temporada)
+CHAMPIONSHIP_SEASON_OVERRIDE = int(os.getenv("CHAMPIONSHIP_SEASON", "0")) or None
 
 MAX_FIXTURES_PER_SCAN = 10
 
@@ -470,10 +473,16 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
 def resolve_season(headers):
     """
     V6.2: Detecta temporada activa buscando fixtures FUTUROS.
+    Si CHAMPIONSHIP_SEASON está definida como variable de entorno, la usa directamente.
     Busca 'next=5' en lugar de 'next=1' para evitar caer a 2024
     (que tiene datos históricos pero no futuros).
     La temporada correcta para 2025/26 es season=2025.
     """
+    # Override por variable de entorno — más confiable que auto-detectar
+    if CHAMPIONSHIP_SEASON_OVERRIDE:
+        print(f"  ✅ Temporada forzada por variable de entorno: {CHAMPIONSHIP_SEASON_OVERRIDE}")
+        return CHAMPIONSHIP_SEASON_OVERRIDE
+
     for season in CHAMPIONSHIP_SEASONS:
         try:
             r = requests.get(
@@ -482,13 +491,13 @@ def resolve_season(headers):
                 params={
                     "league": CHAMPIONSHIP_ID,
                     "season": season,
-                    "next":   5        # buscar próximos 5 fixtures, no solo 1
+                    "next":   5
                 },
                 timeout=15
             )
             track_requests(1)
             fixtures = r.json().get('response', [])
-            if len(fixtures) >= 1:     # al menos 1 fixture futuro confirma temporada activa
+            if len(fixtures) >= 1:
                 print(f"  ✅ Temporada activa detectada: {season} ({len(fixtures)} próximos fixtures)")
                 return season
         except:
