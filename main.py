@@ -441,7 +441,7 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
                 ga_series.append(h_goals)
 
         if not gf_series:
-            return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
+            return 1.2, 1.2, "LOW", [], [], False  # FIX: 6 valores consistentes
 
         xg_for     = _weighted_avg(gf_series)
         xg_against = _weighted_avg(ga_series)
@@ -467,7 +467,7 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
         return xg_for, xg_against, confidence, gf_series, ga_series, False  # cache_hit=False
 
     except Exception as e:
-        return 1.2, 1.2, "LOW", [], []  # FIX: 5 valores consistentes
+        return 1.2, 1.2, "LOW", [], [], False  # FIX: 6 valores consistentes
 
 
 def resolve_season(headers):
@@ -736,17 +736,119 @@ class ChampionshipBot:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
-        # V6.1: detectar temporada activa una sola vez al arrancar
-        self.season = resolve_season(self.headers)
+
+        # ── DIAGNÓSTICO DE ARRANQUE ──────────────────────────────────────────
+        # Verifica API key, plan, acceso a Championship y temporada activa.
+        # Todo se imprime en logs de Railway Y se envía a Telegram.
+        api_ok, plan_info, req_info, access_ok, access_detail = self._startup_diagnostics()
+
+        # Detectar temporada solo si la API responde
+        self.season = resolve_season(self.headers) if api_ok else (CHAMPIONSHIP_SEASON_OVERRIDE or 2025)
+
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
-        self.send_msg(
-            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.2</b>\n"
-            f"Estado: {mode}\n"
-            f"Temporada activa: {self.season}/{self.season+1}\n"
-            f"xG: últimos 6 partidos + factor de forma\n"
-            f"Mercados: 1X2 · O/U 2.5 · BTTS\n"
-            f"Budget: ~40 requests/día"
-        )
+
+        status_lines = [
+            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.2</b>",
+            f"Estado: {mode}",
+            f"Temporada: {self.season}/{self.season+1}",
+            f"",
+            f"{'✅' if api_ok else '❌'} API: {plan_info}",
+            f"📡 Requests hoy: {req_info}",
+            f"{'✅' if access_ok else '❌'} Championship: {access_detail}",
+        ]
+        if not api_ok:
+            status_lines.append("⛔ Sin API — el bot no puede escanear partidos")
+        if not access_ok and api_ok:
+            status_lines.append("⛔ Championship bloqueada en este plan — verifica api-football.com")
+
+        self.send_msg("\n".join(status_lines))
+
+    def _startup_diagnostics(self):
+        """
+        Verifica al arrancar:
+        1. API key válida y plan activo
+        2. Requests disponibles hoy
+        3. Si Championship (ID 40) está accesible en el plan Free
+           (algunas ligas están bloqueadas en Free tier)
+        4. Si hay fixtures disponibles para la temporada
+        Retorna: (api_ok, plan_info, req_info, championship_ok, detail)
+        """
+        # ── 1. Estado de la cuenta ───────────────────────────────────────────
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/status",
+                headers=self.headers,
+                timeout=10
+            )
+            track_requests(1)
+            data    = r.json().get('response', {})
+            sub     = data.get('subscription', {})
+            reqs    = data.get('requests', {})
+            plan    = sub.get('plan', 'Unknown')
+            active  = sub.get('active', False)
+            current = reqs.get('current', '?')
+            limit   = reqs.get('limit_day', '?')
+
+            plan_info = f"{plan} ({'activo' if active else '⚠️ INACTIVO'})"
+            req_info  = f"{current}/{limit}"
+
+            print(f"  API plan: {plan_info} | Requests: {req_info}")
+
+            if not active:
+                return False, plan_info, req_info, False, "suscripción inactiva"
+
+        except Exception as e:
+            print(f"  ❌ API status error: {e}")
+            return False, "error de conexión", "?/?", False, str(e)
+
+        # ── 2. Acceso a Championship específicamente ─────────────────────────
+        # En el plan Free, algunas ligas están bloqueadas.
+        # Si Championship está bloqueada, la API devuelve error 499 o lista vacía
+        # incluso con fixtures reales disponibles.
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers=self.headers,
+                params={"league": CHAMPIONSHIP_ID, "season": 2025, "next": 3},
+                timeout=10
+            )
+            track_requests(1)
+            raw      = r.json()
+            errors   = raw.get('errors', {})
+            fixtures = raw.get('response', [])
+
+            # Error 499 = liga no disponible en el plan
+            if errors:
+                err_msg = str(errors)
+                print(f"  ❌ Championship bloqueada: {err_msg}")
+                return True, plan_info, req_info, False, f"bloqueada: {err_msg[:80]}"
+
+            if fixtures:
+                detail = f"{len(fixtures)} próximos fixtures (season=2025)"
+                print(f"  ✅ Championship accesible: {detail}")
+                return True, plan_info, req_info, True, detail
+
+            # Sin fixtures ni error — puede ser parón o temporada incorrecta
+            # Intentar con season=2024
+            r2 = requests.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers=self.headers,
+                params={"league": CHAMPIONSHIP_ID, "season": 2024, "next": 3},
+                timeout=10
+            )
+            track_requests(1)
+            fix2 = r2.json().get('response', [])
+            if fix2:
+                detail = f"{len(fix2)} fixtures (season=2024, puede ser parón en 2025)"
+                print(f"  ⚠️  Championship: {detail}")
+                return True, plan_info, req_info, True, detail
+
+            print(f"  ⚠️  Championship: sin fixtures próximos en ninguna temporada")
+            return True, plan_info, req_info, False, "sin fixtures — posible parón o liga no disponible"
+
+        except Exception as e:
+            print(f"  ❌ Championship check error: {e}")
+            return True, plan_info, req_info, False, str(e)
 
     def send_msg(self, text):
         if not TELEGRAM_TOKEN:
