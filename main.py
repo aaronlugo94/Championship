@@ -1018,10 +1018,11 @@ class TripleLeagueBot:
            para que build_xg_match tenga datos de ambos lados sin gastar requests el día del scan
 
         Budget estimado con 3 ligas:
-          - Standings × 3 ligas:       3 req
-          - last10 × 58 equipos:      ~58 req (20 Champ + 20 Brasil + 18 LigaMX)
-          - Rival pre-cache:           ~8 req
-          Total lunes:                ~69 req — sobran 31 para el día
+          - Discovery día a día (14d × 3 ligas): ~42 req
+          - last10 equipos encontrados (~40 eq):  ~40 req
+          - Rival pre-cache (30d adelante):        ~8 req
+          Total primer warmup:                   ~90 req — scan se difiere
+          Total lunes (cache ya existe):         ~50 req — scan sí corre
         """
         import json
         total_cached = total_skipped = 0
@@ -1030,22 +1031,39 @@ class TripleLeagueBot:
             for league_id, cfg in TARGET_LEAGUES.items():
                 season = self.seasons.get(league_id, cfg['seasons'][-1])
 
-                # Standings para obtener lista de equipos activos
-                r = requests.get(
-                    "https://v3.football.api-sports.io/standings",
-                    headers=self.headers,
-                    params={"league": league_id, "season": season},
-                    timeout=15
-                )
-                track_requests(1)
-                standings = r.json().get('response', [])
-                if not standings:
-                    continue
+                # Obtener equipos activos por fixtures recientes — evita bloqueo Free
+                # standings+league+season está bloqueado igual que fixtures+league+season
+                # Solución: buscar fixtures de los últimos 30 días y extraer equipos únicos
+                # Buscar día a día los últimos 14 días — garantiza capturar
+                # al menos 2 jornadas completas (Championship: sab+mie cada semana)
+                # 14 requests por liga para encontrar todos los equipos
+                teams_seen = {}
+                for days_back in range(0, 15):  # día a día, 14 días atrás
+                    if len(teams_seen) >= 18:   # liga completa encontrada
+                        break
+                    d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                    try:
+                        r = requests.get(
+                            "https://v3.football.api-sports.io/fixtures",
+                            headers=self.headers,
+                            params={"date": d},
+                            timeout=10
+                        )
+                        track_requests(1)
+                        for fix in r.json().get('response', []):
+                            if fix['league']['id'] != league_id:
+                                continue
+                            teams_seen[fix['teams']['home']['id']] = fix['teams']['home']['name']
+                            teams_seen[fix['teams']['away']['id']] = fix['teams']['away']['name']
+                        time.sleep(0.5)
+                    except:
+                        pass
 
-                teams = []
-                for group in standings:
-                    for entry in group.get('league', {}).get('standings', [[]])[0]:
-                        teams.append((entry['team']['id'], entry['team']['name']))
+                teams = list(teams_seen.items())  # [(team_id, team_name), ...]
+                if not teams:
+                    print(f"  ⚠️  {cfg['name']}: sin equipos encontrados por fecha")
+                    continue
+                print(f"  {cfg['name']}: {len(teams)} equipos encontrados por fecha")
 
                 cached = skipped = 0
                 for team_id, team_name in teams:
@@ -1104,8 +1122,14 @@ class TripleLeagueBot:
             # Para cada partido de los próximos 7 días, pre-cachear ambos equipos
             # Esto asegura que el scan tiene datos fresh de TODOS los equipos que van a jugar
             rival_cached = 0
-            for days_ahead in range(7):
+            # Ampliar ventana a 30 días para capturar todos los equipos de la temporada
+            # Cada fecha gasta 1 req; con 20 fechas = 20 req para cubrir toda la liga
+            rival_dates_checked = set()
+            for days_ahead in range(0, 30, 2):  # cada 2 días — cubre jornadas completas
                 d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                if d in rival_dates_checked:
+                    continue
+                rival_dates_checked.add(d)
                 try:
                     r = requests.get(
                         "https://v3.football.api-sports.io/fixtures",
@@ -1121,7 +1145,6 @@ class TripleLeagueBot:
                         season = self.seasons.get(lid, TARGET_LEAGUES[lid]['seasons'][-1])
                         for side in ['home', 'away']:
                             tid = fix['teams'][side]['id']
-                            # Solo cachear si no tiene cache fresca con depth=10
                             try:
                                 conn = sqlite3.connect(DB_PATH)
                                 cc = conn.cursor()
@@ -1363,7 +1386,11 @@ class TripleLeagueBot:
                 params={"league": league_id, "season": season}
               )
               track_requests(1)
-              standings = r.json().get('response', [])
+              raw_resp = r.json()
+              errors   = raw_resp.get('errors', {})
+              standings = raw_resp.get('response', [])
+              if errors:
+                  print(f"  ⚠️  {cfg['name']} standings bloqueado: {str(errors)[:60]}")
               if not standings:
                 continue
 
@@ -1716,15 +1743,33 @@ if __name__ == "__main__":
             bot.send_msg(
                 "⏳ <b>Primera vez detectada</b>\n"
                 "Calentando cache xG (last10 todos los equipos)...\n"
-                "Esto toma ~2 minutos. El scan arranca después."
+                "Esto toma ~3 minutos. El scan arranca después."
             )
             bot.weekly_xg_cache()
+            # Después del warmup esperar al siguiente día para el scan
+            # El warmup puede gastar ~70 req; el scan necesita otros ~26
+            # Si el total > 95, diferir el scan al scheduler de mañana
+            reqs_used = track_requests(0)
+            reqs_left = 100 - reqs_used
+            if reqs_left < 30:  # scan necesita ~26 req mínimo
+                bot.send_msg(
+                    f"✅ <b>Warmup completado</b>\n"
+                    f"📡 Requests usados: {reqs_used}/100\n"
+                    f"⏰ Scan diferido — quedan solo {reqs_left} req hoy.\n"
+                    f"El scan arranca mañana a las 11:00 UTC."
+                )
+                print(f"  ⚠️  Solo {reqs_left} req restantes — scan diferido a mañana")
+            else:
+                print(f"  ✅ Warmup OK ({reqs_used} req usados, {reqs_left} restantes) — arrancando scan")
+                bot.run_daily_scan()
         else:
             print(f"  ✅ Cache xG: {cache_count} equipos en cache — scan directo")
     except Exception as e:
         print(f"  Cache check error: {e}")
 
-    bot.run_daily_scan()
+    # Solo correr scan aquí si no lo corrió el bloque de warmup
+    if cache_count > 0:
+        bot.run_daily_scan()
 
     while True:
         schedule.run_pending()
