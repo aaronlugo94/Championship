@@ -9,17 +9,19 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V6.3 BRASILEIRÃO SPECIALIST
-# Adaptado de V6.2 Championship
+# V6.4 TRIPLE LEAGUE SPECIALIST
 # ==========================================
-# ADAPTADO DE V6.2 CHAMPIONSHIP → BRASILEIRÃO SÉRIE A
-#   - Liga ID: 71 (Brasileirão Série A)
-#   - Temporada: 2025 (calendario ene-dic, libre en Free tier)
-#   - 20 equipos, jornadas principalmente sábado/domingo/miércoles
-#   - Horarios UTC: 20:00-01:00 UTC (17:00-22:00 BRT)
-#   - Características: alta varianza, favoritismos moderados, Over 2.5 frecuente
-#   - std negbinom: 1.60 (mayor sobredispersión que Championship)
-#   - Liquidez Bet365: 0.80 (buena para Série A)
+# CAMBIOS VS V6.1 (correcciones de lógica):
+#   1. LÓGICA: candidato elegido por ev*urs (valor ajustado al riesgo)
+#              en lugar de solo EV — el URS ya no se ignora en la selección
+#   2. LÓGICA: std negbinom subido a 1.55 para activar sobredispersión
+#              en el rango real de xG de Championship (era 1.35, inefectivo)
+#   3. LÓGICA: sanity_check gap reducido 0.25→0.18 para filtrar
+#              picks donde el modelo está mal calibrado vs mercado
+#   4. LÓGICA: closing_lines protegido contra duplicados con COUNT previo
+#   5. LÓGICA: stake mínima forzada eliminada — max(0.0) en lugar de
+#              max(0.001) para respetar la lógica Kelly cuando hay poca convicción
+#   6. LÓGICA: picks con final_stake < 0.005 filtrados antes de reportar
 
 LIVE_TRADING = False
 
@@ -29,18 +31,37 @@ API_SPORTS_KEY   = os.getenv("API_SPORTS_KEY", "")
 
 DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(DB_DIR, "quant_brasileirao.db")
+DB_PATH = os.path.join(DB_DIR, "quant_dual.db")
 
-RUN_TIME_SCAN       = "12:00"   # D-1: 12:00 UTC = 09:00 BRT, cuotas abiertas Bet365
-RUN_TIME_MIDDAY_CLV = "17:00"   # D-0: 17:00 UTC = 14:00 BRT, ~3h antes del KO típico
+RUN_TIME_SCAN       = "11:00"   # D-1: 11:00 UTC — cuotas abiertas Championship (UK) y Brasileirao (BRT)
+RUN_TIME_MIDDAY_CLV = "16:00"   # D-0: 16:00 UTC — antes del KO Championship (15:00 UK) y Brasileirao (20:00 UTC)
 RUN_TIME_INGEST     = "04:00"   # mantenido por compatibilidad
 
-LEAGUE_ID      = 71     # Brasileirão Série A
-LEAGUE_SEASONS = [2025]  # calendario enero-diciembre, libre en Free tier
-# Override manual por variable de entorno en Railway
-LEAGUE_SEASON_OVERRIDE = int(os.getenv("BRASILEIRAO_SEASON", "0")) or None
+# Ligas objetivo — método por fecha evita bloqueo Free tier
+TARGET_LEAGUES = {
+    40: {
+        "name":      "🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP",
+        "liquidity": 0.85,
+        "xg_std":    1.55,
+        "seasons":   [2025, 2024],
+    },
+    71: {
+        "name":      "🇧🇷 BRASILEIRAO",
+        "liquidity": 0.80,
+        "xg_std":    1.60,
+        "seasons":   [2025],
+    },
+    262: {
+        "name":      "🇲🇽 LIGA MX",
+        "liquidity": 0.75,   # Bet365 cubre Liga MX pero con menor volumen que europeas
+        "xg_std":    1.50,   # varianza similar a Championship
+        "seasons":   [2025],
+    },
+}
+MAX_FIXTURES_PER_LEAGUE = 6   # máx por liga — techo global MAX_FIXTURES_TOTAL protege el budget
 
-MAX_FIXTURES_PER_SCAN = 10
+MAX_FIXTURES_PER_SCAN  = 10  # máx por liga (Championship o Brasileirao tienen ~10 c/u)
+MAX_FIXTURES_TOTAL     = 22  # techo global: 22 × 4 + 2 = 90 req — margen de 10 con 3 ligas
 
 MAX_DAILY_HEAT          = 0.10
 TARGET_DAILY_VOLATILITY = 0.05
@@ -51,8 +72,8 @@ XG_DECAY_FACTOR         = 0.85
 
 VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 
-LEAGUE_NAME = '🇧🇷 BRASILEIRÃO'
-LIQUIDITY   = 0.80  # Bet365 cubre bien la Série A
+LEAGUE_NAME = '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
+LIQUIDITY   = 0.85
 
 # Horarios de tareas semanales (días sin jornada)
 RUN_TIME_XG_CACHE     = "08:00"   # Lunes: pre-caché xG 24 equipos
@@ -95,6 +116,12 @@ def init_db():
         fixture_id INTEGER, match TEXT, market TEXT,
         odd REAL, ev REAL, reason TEXT, timestamp DATETIME
     )""")
+    # Migración: añadir depth si no existe en instalaciones anteriores
+    try:
+        c.execute("ALTER TABLE team_xg_cache ADD COLUMN depth INTEGER DEFAULT 6")
+    except:
+        pass
+
     c.execute("""CREATE TABLE IF NOT EXISTS request_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT, count INTEGER
@@ -108,6 +135,7 @@ def init_db():
         xg_for REAL,
         xg_against REAL,
         confidence TEXT,
+        depth INTEGER DEFAULT 6,  -- cuántos partidos se usaron (6=scan, 10=weekly)
         updated_at DATETIME
     )""")
     # Snapshots de cuotas para monitoreo de movimiento de línea
@@ -374,11 +402,12 @@ def _form_factor(gf_series):
     return max(0.85, min(ratio, 1.15))
 
 
-def fetch_team_xg(team_id, season, headers, use_cache=True):
+def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=6):
     """
-    V6.2: Obtiene xG estimado de los últimos 6 partidos del equipo.
+    V6.4: Obtiene xG estimado de los últimos N partidos del equipo (depth=6 en scan, depth=10 en cache semanal).
     Si use_cache=True y hay datos frescos en team_xg_cache (<TTL horas),
     los usa directamente sin llamar a la API — ahorra requests en días de jornada.
+    depth=10 en weekly_xg_cache da más precisión al modelo.
     """
     import json
     if use_cache:
@@ -408,9 +437,9 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
             headers=headers,
             params={
                 "team":   team_id,
-                "league": CHAMPIONSHIP_ID,
+                "league": league_id,  # V6.4: parametrizado por liga
                 "season": season,
-                "last":   6
+                "last":   depth  # 6 en scan diario, 10 en weekly_xg_cache
             },
             timeout=15
         )
@@ -442,7 +471,8 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
 
         xg_for     = _weighted_avg(gf_series)
         xg_against = _weighted_avg(ga_series)
-        confidence = "HIGH" if len(gf_series) >= 4 else "MED"
+        # Con depth=10 exigimos más partidos para HIGH — datos más ricos
+        confidence = "HIGH" if len(gf_series) >= max(4, depth // 2) else "MED"
 
         # Guardar en cache para reutilizar en el scan del día de jornada
         try:
@@ -450,8 +480,8 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
             conn_c = sqlite3.connect(DB_PATH)
             cc = conn_c.cursor()
             cc.execute("""INSERT OR REPLACE INTO team_xg_cache
-                (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at)
-                VALUES (?,?,?,?,?,?,?)""",
+                (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
+                VALUES (?,?,?,?,?,?,?,?)""",
                 (team_id, json.dumps(gf_series), json.dumps(ga_series),
                  xg_for, xg_against, confidence,
                  datetime.now(timezone.utc).isoformat())
@@ -467,42 +497,48 @@ def fetch_team_xg(team_id, season, headers, use_cache=True):
         return 1.2, 1.2, "LOW", [], [], False  # FIX: 6 valores consistentes
 
 
-def resolve_season(headers):
+def resolve_seasons(headers):
     """
-    V6.2: Detecta temporada activa buscando fixtures FUTUROS.
-    Si CHAMPIONSHIP_SEASON está definida como variable de entorno, la usa directamente.
-    Busca 'next=5' en lugar de 'next=1' para evitar caer a 2024
-    (que tiene datos históricos pero no futuros).
-    La temporada correcta para 2025/26 es season=2025.
+    V6.4: Detecta temporada activa para CADA liga en TARGET_LEAGUES.
+    Método por fecha — evita bloqueo Free tier de api-football.
+    Retorna dict: {league_id: season}
     """
-    # Override por variable de entorno — más confiable que auto-detectar
-    if LEAGUE_SEASON_OVERRIDE:
-        print(f"  ✅ Temporada forzada por variable de entorno: {LEAGUE_SEASON_OVERRIDE}")
-        return LEAGUE_SEASON_OVERRIDE
+    seasons = {}
+    # Buscar fixtures de los próximos 10 días para capturar ambas ligas
+    # (Brasileirao puede no tener jornada esta semana si está en inicio de temporada)
+    dates = [(datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(10)]
+    found_leagues = set()
 
-    for season in LEAGUE_SEASONS:
+    for d in dates:
+        if len(found_leagues) == len(TARGET_LEAGUES):
+            break  # ya encontramos todas las ligas
         try:
             r = requests.get(
                 "https://v3.football.api-sports.io/fixtures",
                 headers=headers,
-                params={
-                    "league": LEAGUE_ID,
-                    "season": season,
-                    "next":   5
-                },
+                params={"date": d},
                 timeout=15
             )
             track_requests(1)
-            fixtures = r.json().get('response', [])
-            if len(fixtures) >= 1:
-                print(f"  ✅ Brasileirão temporada activa: {season} ({len(fixtures)} próximos fixtures)")
-                return season
+            for fix in r.json().get('response', []):
+                lid = fix['league']['id']
+                if lid in TARGET_LEAGUES and lid not in found_leagues:
+                    seasons[lid] = fix['league']['season']
+                    found_leagues.add(lid)
+                    print(f"  ✅ {TARGET_LEAGUES[lid]['name']}: season={seasons[lid]} (fixtures el {d})")
         except:
             pass
-    return LEAGUE_SEASONS[-1]
+
+    # Fallback para ligas sin fixtures próximos (parón o inicio de temporada)
+    for lid, cfg in TARGET_LEAGUES.items():
+        if lid not in seasons:
+            seasons[lid] = cfg['seasons'][-1]
+            print(f"  ⚠️  {cfg['name']}: sin fixtures próximos — usando season={seasons[lid]}")
+
+    return seasons
 
 
-def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers):
+def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers, league_id=40):
     """
     V6.1: Construye xG del partido usando últimos 6 partidos de cada equipo.
 
@@ -729,7 +765,7 @@ def build_market_probs(bets, xh, xa, h_n, a_n, conf):
 # MAIN BOT
 # ==========================================
 
-class BrasileiraoBot:
+class TripleLeagueBot:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
@@ -740,23 +776,23 @@ class BrasileiraoBot:
         api_ok, plan_info, req_info, access_ok, access_detail = self._startup_diagnostics()
 
         # Detectar temporada solo si la API responde
-        self.season = resolve_season(self.headers) if api_ok else (CHAMPIONSHIP_SEASON_OVERRIDE or 2025)
+        self.seasons = resolve_seasons(self.headers)  # dict {league_id: season} if api_ok else (CHAMPIONSHIP_SEASON_OVERRIDE or 2025)
 
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
 
         status_lines = [
             f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.2</b>",
             f"Estado: {mode}",
-            f"Temporada: {self.season}/{self.season+1}",
+            f"Ligas: Championship (ID=40) · Brasileirao (ID=71)",
             f"",
             f"{'✅' if api_ok else '❌'} API: {plan_info}",
             f"📡 Requests hoy: {req_info}",
-            f"{'✅' if access_ok else '❌'} Brasileirão: {access_detail}",
+            f"{'✅' if access_ok else '❌'} Championship: {access_detail}",
         ]
         if not api_ok:
             status_lines.append("⛔ Sin API — el bot no puede escanear partidos")
         if not access_ok and api_ok:
-            status_lines.append("⛔ Brasileirão no disponible — verifica api-football.com")
+            status_lines.append("⛔ Championship bloqueada en este plan — verifica api-football.com")
 
         self.send_msg("\n".join(status_lines))
 
@@ -798,36 +834,46 @@ class BrasileiraoBot:
             print(f"  ❌ API status error: {e}")
             return False, "error de conexión", "?/?", False, str(e)
 
-        # ── 2. Acceso a Brasileirão específicamente ──────────────────────────
-        # Brasileirão (ID=71) season=2025 está disponible en Free tier.
-        # El torneio comienza en abril y termina en diciembre.
+        # ── 2. Acceso a Championship específicamente ─────────────────────────
+        # En el plan Free, algunas ligas están bloqueadas.
+        # Si Championship está bloqueada, la API devuelve error 499 o lista vacía
+        # incluso con fixtures reales disponibles.
         try:
-            r = requests.get(
-                "https://v3.football.api-sports.io/fixtures",
-                headers=self.headers,
-                params={"league": LEAGUE_ID, "season": 2025, "next": 3},
-                timeout=10
+            # Verificar AMBAS ligas por fecha — evita bloqueo Free tier
+            league_status = {}
+            for days_ahead in range(5):
+                d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                r = requests.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    headers=self.headers,
+                    params={"date": d},
+                    timeout=10
+                )
+                track_requests(1)
+                for fix in r.json().get('response', []):
+                    lid = fix['league']['id']
+                    if lid in TARGET_LEAGUES and lid not in league_status:
+                        league_status[lid] = fix['league']['season']
+                if len(league_status) == len(TARGET_LEAGUES):
+                    break
+                time.sleep(0.5)
+
+            lines = []
+            for lid, cfg in TARGET_LEAGUES.items():
+                if lid in league_status:
+                    lines.append(f"  ✅ {cfg['name']}: season={league_status[lid]}")
+                else:
+                    lines.append(f"  ⚠️  {cfg['name']}: sin fixtures próximos (parón o bloqueada)")
+            detail = " | ".join(
+                f"{cfg['name'].split()[1]}={'✅' if lid in league_status else '⚠️'}"
+                for lid, cfg in TARGET_LEAGUES.items()
             )
-            track_requests(1)
-            raw      = r.json()
-            errors   = raw.get('errors', {})
-            fixtures = raw.get('response', [])
-
-            if errors:
-                err_msg = str(errors)
-                print(f"  ❌ Brasileirão bloqueada: {err_msg}")
-                return True, plan_info, req_info, False, f"bloqueada: {err_msg[:80]}"
-
-            if fixtures:
-                detail = f"{len(fixtures)} próximos fixtures (season=2025)"
-                print(f"  ✅ Brasileirão accesible: {detail}")
-                return True, plan_info, req_info, True, detail
-
-            print(f"  ⚠️  Brasileirão: sin fixtures próximos — torneio comienza en abril")
-            return True, plan_info, req_info, False, "sin fixtures — Brasileirão 2025 comienza en abril"
+            all_ok = len(league_status) > 0  # basta con que al menos una liga tenga fixtures
+            print("\n".join(lines))
+            return True, plan_info, req_info, all_ok, detail
 
         except Exception as e:
-            print(f"  ❌ Brasileirão check error: {e}")
+            print(f"  ❌ Championship check error: {e}")
             return True, plan_info, req_info, False, str(e)
 
     def send_msg(self, text):
@@ -951,61 +997,153 @@ class BrasileiraoBot:
 
     def weekly_xg_cache(self):
         """
-        LUNES 08:00 UTC — Pre-caché xG de los 20 equipos del Brasileirão.
-        Llama a last6 de cada equipo y guarda en team_xg_cache.
-        En días de jornada, fetch_team_xg leerá de aquí y ahorrará ~20 requests.
-        Coste: 24 requests. Si un equipo ya tiene cache fresca (<20h), lo salta.
+        LUNES 08:00 UTC — Pre-caché xG de TODOS los equipos de ambas ligas.
+
+        MEJORAS V6.4:
+        1. depth=10 en lugar de 6 — más partidos = mejor estimación del xG real
+           (6 partidos es ~6 semanas, 10 partidos es ~10 semanas — captura tendencias)
+        2. Rival depth: también cachea xG_against de los rivales del próximo fixture
+           para que build_xg_match tenga datos de ambos lados sin gastar requests el día del scan
+
+        Budget estimado con 3 ligas:
+          - Standings × 3 ligas:       3 req
+          - last10 × 58 equipos:      ~58 req (20 Champ + 20 Brasil + 18 LigaMX)
+          - Rival pre-cache:           ~8 req
+          Total lunes:                ~69 req — sobran 31 para el día
         """
         import json
+        total_cached = total_skipped = 0
+
         try:
-            # Obtener equipos activos de la temporada
-            r = requests.get(
-                "https://v3.football.api-sports.io/standings",
-                headers=self.headers,
-                params={"league": LEAGUE_ID, "season": self.season}
-            )
-            track_requests(1)
-            standings = r.json().get('response', [])
-            if not standings:
-                return
+            for league_id, cfg in TARGET_LEAGUES.items():
+                season = self.seasons.get(league_id, cfg['seasons'][-1])
 
-            teams = []
-            for group in standings:
-                for entry in group.get('league', {}).get('standings', [[]])[0]:
-                    teams.append((entry['team']['id'], entry['team']['name']))
-
-            cached = skipped = 0
-            for team_id, team_name in teams:
-                # Comprobar si ya hay cache fresca
-                conn = sqlite3.connect(DB_PATH)
-                cc = conn.cursor()
-                cc.execute("SELECT updated_at FROM team_xg_cache WHERE team_id=?", (team_id,))
-                row = cc.fetchone()
-                conn.close()
-                if row:
-                    age = (datetime.now(timezone.utc) -
-                           datetime.fromisoformat(row[0])).total_seconds() / 3600
-                    if age < XG_CACHE_TTL_HOURS:
-                        skipped += 1
-                        continue
-
-                # Llamar API y cachear (fetch_team_xg guarda automáticamente)
-                fetch_team_xg(team_id, self.season, self.headers, use_cache=False)  # retorna 6 valores, ignoramos aquí
+                # Standings para obtener lista de equipos activos
+                r = requests.get(
+                    "https://v3.football.api-sports.io/standings",
+                    headers=self.headers,
+                    params={"league": league_id, "season": season},
+                    timeout=15
+                )
                 track_requests(1)
-                cached += 1
-                time.sleep(2.0)
+                standings = r.json().get('response', [])
+                if not standings:
+                    continue
 
-            # Actualizar team_name en cache (no lo guarda fetch_team_xg)
-            conn = sqlite3.connect(DB_PATH)
-            cc = conn.cursor()
-            for team_id, team_name in teams:
-                cc.execute("UPDATE team_xg_cache SET team_name=? WHERE team_id=?",
-                           (team_name, team_id))
-            conn.commit()
-            conn.close()
+                teams = []
+                for group in standings:
+                    for entry in group.get('league', {}).get('standings', [[]])[0]:
+                        teams.append((entry['team']['id'], entry['team']['name']))
 
+                cached = skipped = 0
+                for team_id, team_name in teams:
+                    # Verificar si la cache ya es fresca (< TTL horas)
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cc = conn.cursor()
+                        cc.execute(
+                            "SELECT updated_at, depth FROM team_xg_cache WHERE team_id=?",
+                            (team_id,)
+                        )
+                        row = cc.fetchone()
+                        conn.close()
+                        if row:
+                            age = (datetime.now(timezone.utc) -
+                                   datetime.fromisoformat(row[0])).total_seconds() / 3600
+                            cached_depth = row[1] if row[1] else 6
+                            # Saltar solo si es fresca Y ya tiene depth=10
+                            if age < XG_CACHE_TTL_HOURS and cached_depth >= 10:
+                                skipped += 1
+                                continue
+                    except:
+                        pass
+
+                    # MEJORA 1: depth=10 en lugar de 6
+                    # Pide los últimos 10 partidos para mejor estimación del xG
+                    fetch_team_xg(
+                        team_id, season, self.headers,
+                        league_id=league_id,
+                        use_cache=False,
+                        depth=10          # <── aquí está la mejora
+                    )
+                    track_requests(1)
+                    cached += 1
+                    time.sleep(2.0)
+
+                # Actualizar team_name en cache
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cc = conn.cursor()
+                    for team_id, team_name in teams:
+                        cc.execute(
+                            "UPDATE team_xg_cache SET team_name=?, depth=10 WHERE team_id=?",
+                            (team_name, team_id)
+                        )
+                    conn.commit()
+                    conn.close()
+                except:
+                    pass
+
+                total_cached  += cached
+                total_skipped += skipped
+                print(f"  {cfg['name']}: {cached} cacheados, {skipped} frescos")
+
+            # MEJORA 2: rival depth — cachear también los rivales del próximo fixture
+            # Para cada partido de los próximos 7 días, pre-cachear ambos equipos
+            # Esto asegura que el scan tiene datos fresh de TODOS los equipos que van a jugar
+            rival_cached = 0
+            for days_ahead in range(7):
+                d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                try:
+                    r = requests.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=self.headers,
+                        params={"date": d},
+                        timeout=10
+                    )
+                    track_requests(1)
+                    for fix in r.json().get('response', []):
+                        lid = fix['league']['id']
+                        if lid not in TARGET_LEAGUES:
+                            continue
+                        season = self.seasons.get(lid, TARGET_LEAGUES[lid]['seasons'][-1])
+                        for side in ['home', 'away']:
+                            tid = fix['teams'][side]['id']
+                            # Solo cachear si no tiene cache fresca con depth=10
+                            try:
+                                conn = sqlite3.connect(DB_PATH)
+                                cc = conn.cursor()
+                                cc.execute(
+                                    "SELECT updated_at, depth FROM team_xg_cache WHERE team_id=?",
+                                    (tid,)
+                                )
+                                row = cc.fetchone()
+                                conn.close()
+                                if row:
+                                    age = (datetime.now(timezone.utc) -
+                                           datetime.fromisoformat(row[0])).total_seconds() / 3600
+                                    if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
+                                        continue
+                            except:
+                                pass
+                            fetch_team_xg(
+                                tid, season, self.headers,
+                                league_id=lid,
+                                use_cache=False,
+                                depth=10
+                            )
+                            track_requests(1)
+                            rival_cached += 1
+                            time.sleep(2.0)
+                except:
+                    pass
+
+            req_today = track_requests(0)
             self.send_msg(
-                f"🔄 <b>xG Cache Brasileirão actualizada</b>\nEquipos: {cached} cacheados | {skipped} saltados\n📡 Requests: {track_requests(0)}/100"
+                f"🔄 <b>xG Cache V6.4 actualizada</b>\n"
+                f"Equipos (last10): {total_cached} | Frescos saltados: {total_skipped}\n"
+                f"Rivales pre-cacheados: {rival_cached}\n"
+                f"📡 Requests hoy: {req_today}/100"
             )
         except Exception as e:
             self.send_msg(f"⚠️ weekly_xg_cache error: {e}")
@@ -1029,10 +1167,11 @@ class BrasileiraoBot:
                 r = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers=self.headers,
-                    params={"league": CHAMPIONSHIP_ID, "season": self.season, "date": d}
+                    params={"date": d}
                 )
                 track_requests(1)
-                matches.extend(r.json().get('response', []))
+                all_fix = r.json().get('response', [])
+                matches.extend([f for f in all_fix if f['league']['id'] in TARGET_LEAGUES])
                 if len(matches) >= MAX_FIXTURES_PER_SCAN:
                     break
                 time.sleep(2.0)
@@ -1204,20 +1343,22 @@ class BrasileiraoBot:
         Coste: 1 request.
         """
         try:
-            r = requests.get(
+            for league_id, cfg in TARGET_LEAGUES.items():
+              season = self.seasons.get(league_id, cfg['seasons'][-1])
+              r = requests.get(
                 "https://v3.football.api-sports.io/standings",
                 headers=self.headers,
-                params={"league": LEAGUE_ID, "season": self.season}
-            )
-            track_requests(1)
-            standings = r.json().get('response', [])
-            if not standings:
-                return
+                params={"league": league_id, "season": season}
+              )
+              track_requests(1)
+              standings = r.json().get('response', [])
+              if not standings:
+                continue
 
             conn = sqlite3.connect(DB_PATH)
             cc   = conn.cursor()
             now  = datetime.now(timezone.utc)
-            cc.execute("DELETE FROM league_stats WHERE season=?", (self.season,))
+            cc.execute("DELETE FROM league_stats WHERE season=?", (season,))
 
             teams_saved = 0
             for group in standings:
@@ -1233,7 +1374,7 @@ class BrasileiraoBot:
                             goals_for, goals_against, avg_goals_for, avg_goals_against,
                             captured_at)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (self.season, t['id'], t['name'],
+                        (season, t['id'], t['name'],
                          played, stats['win'], stats['draw'], stats['lose'],
                          gf, ga,
                          round(gf / played, 3) if played else 0,
@@ -1245,42 +1386,61 @@ class BrasileiraoBot:
             conn.commit()
             conn.close()
             self.send_msg(
-                f"📊 <b>Brasileirão Stats actualizadas</b>\n"
-                f"Equipos: {teams_saved} | Temporada: {self.season}\n"
+                f"📊 <b>League Stats actualizadas</b>\n"
+                f"Equipos: {teams_saved} | Temporada: {season}\n"
                 f"📡 Requests: {track_requests(0)}/100"
             )
         except Exception as e:
             self.send_msg(f"⚠️ league_stats_ingest error: {e}")
 
     def run_daily_scan(self):
-        # V6.3: scan corre a las 12:00 UTC del día anterior (D-1)
-        # Brasileirão juega principalmente sab/dom/mie a partir de las 20:00 UTC.
-        # D-1 a las 12:00 UTC = ~30h de antelación, cuotas Bet365 ya publicadas.
+        # V6.3: scan corre a las 09:00 UTC del día anterior (D-1)
+        # Busca partidos de mañana y pasado mañana para capturar cuotas líquidas
+        # con suficiente antelación. La Championship juega mayoritariamente
+        # a las 15:00 y 19:45 UK, así que D-1 a las 09:00 UTC = ~30h de antelación.
         tomorrow       = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         day_after      = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
 
         # Llamada 1+2: fixtures de mañana y pasado mañana
-        matches = []
+        # V6.4: búsqueda por fecha — captura AMBAS ligas sin bloqueo Free tier
+        matches_by_league = {lid: [] for lid in TARGET_LEAGUES}
         for d in [tomorrow, day_after]:
             try:
                 r = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers=self.headers,
-                    params={
-                        "league":  LEAGUE_ID,
-                        "season":  self.season,
-                        "date":    d
-                    }
+                    params={"date": d}
                 )
                 track_requests(1)
-                matches.extend(r.json().get('response', []))
+                for fix in r.json().get('response', []):
+                    lid = fix['league']['id']
+                    if lid in TARGET_LEAGUES:
+                        matches_by_league[lid].append(fix)
             except:
                 pass
 
+        # Limitar por liga, combinar, y aplicar techo global
+        # Championship y Brasileirao tienen ~10 partidos c/u por jornada
+        # Techo: 22 partidos × 4 req = 88 req + 2 fijos = 90 req (margen de 10)
+        matches = []
+        for lid, league_matches in matches_by_league.items():
+            # Ordenar por proximidad al KO — mercados más maduros primero
+            def _hours(m):
+                try:
+                    ko = datetime.fromisoformat(m['fixture']['date'].replace('Z', '+00:00'))
+                    return (ko - datetime.now(timezone.utc)).total_seconds() / 3600
+                except:
+                    return 999
+            league_matches.sort(key=_hours)
+            matches.extend(league_matches[:MAX_FIXTURES_PER_SCAN])
+
+        # Techo global: protección extra contra jornadas dobles simultáneas
+        matches = matches[:MAX_FIXTURES_TOTAL]
+
         if not matches:
             self.send_msg(
-                f"🔇 <b>Brasileirão V6.3:</b> Sin partidos en los próximos 2 días.\n"
-                f"📡 Temporada activa: {self.season}"
+                f"🔇 <b>Triple League V6.4:</b> Sin partidos en los próximos 2 días.\n"
+                f"📡 Ligas: Championship · Brasileirao"
             )
             return
 
@@ -1299,22 +1459,32 @@ class BrasileiraoBot:
         matches.sort(key=fixture_hours_away)          # más próximos primero
         matches = matches[:MAX_FIXTURES_PER_SCAN]
         requests_used = track_requests(0)
+        champ_count = sum(1 for m in matches if m['league']['id'] == 40)
+        bra_count   = sum(1 for m in matches if m['league']['id'] == 71)
+        mx_count    = sum(1 for m in matches if m['league']['id'] == 262)
+        req_est     = 2 + len(matches) * 4
         self.send_msg(
-            f"🔍 Escaneando {len(matches)} partidos Championship (D-1)\n"
-            f"📅 Temporada: {self.season}/{self.season+1}\n"
-            f"📡 Requests usados hoy: {requests_used}/100"
+            f"🔍 <b>Triple League V6.4 — Scan D-1</b>\n"
+            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship: {champ_count} partidos\n"
+            f"🇧🇷 Brasileirao:  {bra_count} partidos\n"
+            f"🇲🇽 Liga MX:      {mx_count} partidos\n"
+            f"📡 Requests estimados: ~{req_est}/100"
         )
 
         preliminary = []
 
         for m in matches:
-            fid  = m['fixture']['id']
-            h_n  = m['teams']['home']['name']
-            a_n  = m['teams']['away']['name']
-            h_id = m['teams']['home']['id']
-            a_id = m['teams']['away']['id']
-            ko   = m['fixture']['date']
-            label = f"{h_n} vs {a_n}"
+            fid      = m['fixture']['id']
+            h_n      = m['teams']['home']['name']
+            a_n      = m['teams']['away']['name']
+            h_id     = m['teams']['home']['id']
+            a_id     = m['teams']['away']['id']
+            ko       = m['fixture']['date']
+            lid      = m['league']['id']
+            cfg      = TARGET_LEAGUES[lid]
+            l_name   = cfg['name']
+            season   = self.seasons.get(lid, cfg['seasons'][-1])
+            label    = f"{h_n} vs {a_n} ({l_name})"
             time.sleep(6.1)
 
             # Llamada: cuotas Bet365
@@ -1350,7 +1520,7 @@ class BrasileiraoBot:
             # V6.1: xG basado en últimos 6 + factor de forma
             # retorna requests_made para tracking preciso
             xh, xa, xt, conf, xg_src, req_made = build_xg_match(
-                h_id, a_id, hinj, ainj, self.season, self.headers
+                h_id, a_id, hinj, ainj, season, self.headers, league_id=lid
             )
             track_requests(req_made)  # FIX: tracking exacto de requests reales
 
@@ -1406,7 +1576,7 @@ class BrasileiraoBot:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             reports = [
-                f"📊 <b>Championship V6.2 — Portfolio:</b>\n"
+                f"📊 <b>Triple League V6.4 — Portfolio:</b>\n"
                 f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
                 f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
@@ -1443,13 +1613,13 @@ class BrasileiraoBot:
             self.send_msg("\n\n".join(reports))
         else:
             self.send_msg(
-                f"🔇 <b>Brasileirão V6.3:</b> Sin picks válidos hoy.\n"
+                f"🔇 <b>Triple League V6.4:</b> Sin picks válidos hoy.\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
             )
 
 
 if __name__ == "__main__":
-    bot = BrasileiraoBot()
+    bot = TripleLeagueBot()
 
     # ── TAREAS DIARIAS ──────────────────────────────────────────────
     # Scan D-1 a las 09:00 UTC: captura cuotas de apertura líquidas
@@ -1460,7 +1630,7 @@ if __name__ == "__main__":
     schedule.every(30).minutes.do(bot.capture_closing_lines)
 
     # ── TAREAS SEMANALES (días sin jornada) ──────────────────────
-    # Lunes 08:00 UTC — pre-caché xG 20 equipos (~20 req, ahorra ~16 en el scan)
+    # Lunes 08:00 UTC — pre-caché xG 24 equipos (~24 req, ahorra ~20 en el scan)
     schedule.every().monday.at(RUN_TIME_XG_CACHE).do(bot.weekly_xg_cache)
     # Martes 10:00 UTC — monitoreo movimiento de cuotas próxima jornada (~10 req)
     schedule.every().tuesday.at(RUN_TIME_LINE_MONITOR).do(bot.line_monitor)
