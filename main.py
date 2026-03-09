@@ -1009,65 +1009,78 @@ class TripleLeagueBot:
 
     def weekly_xg_cache(self):
         """
-        LUNES 08:00 UTC — Pre-caché xG de TODOS los equipos de ambas ligas.
+        LUNES 08:00 UTC — Pre-caché xG de todos los equipos activos.
 
-        MEJORAS V6.4:
-        1. depth=10 en lugar de 6 — más partidos = mejor estimación del xG real
-           (6 partidos es ~6 semanas, 10 partidos es ~10 semanas — captura tendencias)
-        2. Rival depth: también cachea xG_against de los rivales del próximo fixture
-           para que build_xg_match tenga datos de ambos lados sin gastar requests el día del scan
+        ESTRATEGIA DE BUDGET (máximo 50 req):
+          Fase 1 — Discovery por fecha (compartido entre ligas):
+            Buscar día a día hacia atrás. Una sola llamada por fecha
+            sirve para TODAS las ligas a la vez (no llamar 3 veces la misma fecha).
+            Máximo 14 llamadas de discovery = 14 req.
 
-        Budget estimado con 3 ligas:
-          - Discovery día a día (14d × 3 ligas): ~42 req
-          - last10 equipos encontrados (~40 eq):  ~40 req
-          - Rival pre-cache (30d adelante):        ~8 req
-          Total primer warmup:                   ~90 req — scan se difiere
-          Total lunes (cache ya existe):         ~50 req — scan sí corre
+          Fase 2 — Cache last10 por equipo:
+            Máximo 30 equipos × 1 req = 30 req.
+            Si se acerca al límite, parar y dejar el resto para la siguiente semana.
+
+          Total máximo: 14 + 30 = 44 req ← nunca superar esto
         """
         import json
-        total_cached = total_skipped = 0
+
+        BUDGET_MAX = 44          # nunca gastar más de esto en el warmup
+        req_inicio = track_requests(0)
+
+        def reqs_gastados():
+            return track_requests(0) - req_inicio
 
         try:
-            for league_id, cfg in TARGET_LEAGUES.items():
-                season = self.seasons.get(league_id, cfg['seasons'][-1])
+            # ── FASE 1: Discovery — una sola pasada por fecha para TODAS las ligas ──
+            teams_by_league = {lid: {} for lid in TARGET_LEAGUES}  # {lid: {team_id: name}}
+            ligas_completas  = set()  # ligas con >= 18 equipos encontrados
 
-                # Obtener equipos activos por fixtures recientes — evita bloqueo Free
-                # standings+league+season está bloqueado igual que fixtures+league+season
-                # Solución: buscar fixtures de los últimos 30 días y extraer equipos únicos
-                # Buscar día a día los últimos 14 días — garantiza capturar
-                # al menos 2 jornadas completas (Championship: sab+mie cada semana)
-                # 14 requests por liga para encontrar todos los equipos
-                teams_seen = {}
-                for days_back in range(0, 15):  # día a día, 14 días atrás
-                    if len(teams_seen) >= 18:   # liga completa encontrada
+            for days_back in range(0, 15):   # 14 fechas máximo
+                if reqs_gastados() >= BUDGET_MAX:
+                    break
+                if len(ligas_completas) == len(TARGET_LEAGUES):
+                    break  # todas las ligas completas
+
+                d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                try:
+                    r = requests.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=self.headers,
+                        params={"date": d},
+                        timeout=10
+                    )
+                    track_requests(1)   # 1 sola llamada por fecha sirve para todas las ligas
+                    for fix in r.json().get('response', []):
+                        lid = fix['league']['id']
+                        if lid not in TARGET_LEAGUES:
+                            continue
+                        teams_by_league[lid][fix['teams']['home']['id']] = fix['teams']['home']['name']
+                        teams_by_league[lid][fix['teams']['away']['id']] = fix['teams']['away']['name']
+                        if len(teams_by_league[lid]) >= 18:
+                            ligas_completas.add(lid)
+                    time.sleep(0.5)
+                except:
+                    pass
+
+            for lid, cfg in TARGET_LEAGUES.items():
+                n = len(teams_by_league[lid])
+                if n > 0:
+                    print(f"  {cfg['name']}: {n} equipos encontrados")
+                else:
+                    print(f"  ⚠️  {cfg['name']}: sin equipos en los últimos 14 días")
+
+            # ── FASE 2: Cachear last10 por equipo — con techo de budget ──────────
+            total_cached = total_skipped = 0
+
+            for lid, cfg in TARGET_LEAGUES.items():
+                season = self.seasons.get(lid, cfg['seasons'][-1])
+                for team_id, team_name in teams_by_league[lid].items():
+                    if reqs_gastados() >= BUDGET_MAX:
+                        print(f"  ⚠️  Budget máximo alcanzado — parando cache")
                         break
-                    d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-                    try:
-                        r = requests.get(
-                            "https://v3.football.api-sports.io/fixtures",
-                            headers=self.headers,
-                            params={"date": d},
-                            timeout=10
-                        )
-                        track_requests(1)
-                        for fix in r.json().get('response', []):
-                            if fix['league']['id'] != league_id:
-                                continue
-                            teams_seen[fix['teams']['home']['id']] = fix['teams']['home']['name']
-                            teams_seen[fix['teams']['away']['id']] = fix['teams']['away']['name']
-                        time.sleep(0.5)
-                    except:
-                        pass
 
-                teams = list(teams_seen.items())  # [(team_id, team_name), ...]
-                if not teams:
-                    print(f"  ⚠️  {cfg['name']}: sin equipos encontrados por fecha")
-                    continue
-                print(f"  {cfg['name']}: {len(teams)} equipos encontrados por fecha")
-
-                cached = skipped = 0
-                for team_id, team_name in teams:
-                    # Verificar si la cache ya es fresca (< TTL horas)
+                    # Saltar si ya tiene cache fresca con depth=10
                     try:
                         conn = sqlite3.connect(DB_PATH)
                         cc = conn.cursor()
@@ -1080,106 +1093,41 @@ class TripleLeagueBot:
                         if row:
                             age = (datetime.now(timezone.utc) -
                                    datetime.fromisoformat(row[0])).total_seconds() / 3600
-                            cached_depth = row[1] if row[1] else 6
-                            # Saltar solo si es fresca Y ya tiene depth=10
-                            if age < XG_CACHE_TTL_HOURS and cached_depth >= 10:
-                                skipped += 1
+                            if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
+                                total_skipped += 1
                                 continue
                     except:
                         pass
 
-                    # MEJORA 1: depth=10 en lugar de 6
-                    # Pide los últimos 10 partidos para mejor estimación del xG
+                    # fetch_team_xg hace la llamada API internamente — NO hacer track_requests aquí
                     fetch_team_xg(
                         team_id, season, self.headers,
-                        league_id=league_id,
-                        use_cache=False,
-                        depth=10          # <── aquí está la mejora
+                        league_id=lid, use_cache=False, depth=10
                     )
-                    track_requests(1)
-                    cached += 1
-                    time.sleep(2.0)
+                    # track_requests ya se llama dentro de fetch_team_xg — no duplicar
+                    total_cached += 1
+                    time.sleep(1.5)
 
-                # Actualizar team_name en cache
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    cc = conn.cursor()
-                    for team_id, team_name in teams:
+                    # Actualizar nombre en cache
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cc = conn.cursor()
                         cc.execute(
                             "UPDATE team_xg_cache SET team_name=?, depth=10 WHERE team_id=?",
                             (team_name, team_id)
                         )
-                    conn.commit()
-                    conn.close()
-                except:
-                    pass
+                        conn.commit()
+                        conn.close()
+                    except:
+                        pass
 
-                total_cached  += cached
-                total_skipped += skipped
-                print(f"  {cfg['name']}: {cached} cacheados, {skipped} frescos")
-
-            # MEJORA 2: rival depth — cachear también los rivales del próximo fixture
-            # Para cada partido de los próximos 7 días, pre-cachear ambos equipos
-            # Esto asegura que el scan tiene datos fresh de TODOS los equipos que van a jugar
-            rival_cached = 0
-            # Ampliar ventana a 30 días para capturar todos los equipos de la temporada
-            # Cada fecha gasta 1 req; con 20 fechas = 20 req para cubrir toda la liga
-            rival_dates_checked = set()
-            for days_ahead in range(0, 30, 2):  # cada 2 días — cubre jornadas completas
-                d = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-                if d in rival_dates_checked:
-                    continue
-                rival_dates_checked.add(d)
-                try:
-                    r = requests.get(
-                        "https://v3.football.api-sports.io/fixtures",
-                        headers=self.headers,
-                        params={"date": d},
-                        timeout=10
-                    )
-                    track_requests(1)
-                    for fix in r.json().get('response', []):
-                        lid = fix['league']['id']
-                        if lid not in TARGET_LEAGUES:
-                            continue
-                        season = self.seasons.get(lid, TARGET_LEAGUES[lid]['seasons'][-1])
-                        for side in ['home', 'away']:
-                            tid = fix['teams'][side]['id']
-                            try:
-                                conn = sqlite3.connect(DB_PATH)
-                                cc = conn.cursor()
-                                cc.execute(
-                                    "SELECT updated_at, depth FROM team_xg_cache WHERE team_id=?",
-                                    (tid,)
-                                )
-                                row = cc.fetchone()
-                                conn.close()
-                                if row:
-                                    age = (datetime.now(timezone.utc) -
-                                           datetime.fromisoformat(row[0])).total_seconds() / 3600
-                                    if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
-                                        continue
-                            except:
-                                pass
-                            fetch_team_xg(
-                                tid, season, self.headers,
-                                league_id=lid,
-                                use_cache=False,
-                                depth=10
-                            )
-                            track_requests(1)
-                            rival_cached += 1
-                            time.sleep(2.0)
-                except:
-                    pass
-
-            req_today = track_requests(0)
+            req_total = reqs_gastados()
             self.send_msg(
                 f"🔄 <b>xG Cache V6.4 actualizada</b>\n"
-                f"Equipos (last10): {total_cached} | Frescos saltados: {total_skipped}\n"
-                f"Rivales pre-cacheados: {rival_cached}\n"
-                f"📡 Requests hoy: {req_today}/100"
+                f"Equipos cacheados (last10): {total_cached} | Saltados: {total_skipped}\n"
+                f"📡 Requests del warmup: {req_total}/{BUDGET_MAX} máx"
             )
+
         except Exception as e:
             self.send_msg(f"⚠️ weekly_xg_cache error: {e}")
 
