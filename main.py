@@ -427,6 +427,8 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
                     gf = json.loads(row[0])
                     ga = json.loads(row[1])
                     # Retorna 6 valores: el último bool indica cache hit (True = no request gastado)
+                    age_h = round(age_hours, 1)
+                    print(f"    xG [{team_id}] CACHE HIT age={age_h}h conf={row[4]}")
                     return float(row[2]), float(row[3]), row[4], gf, ga, True
         except:
             pass  # cache miss → llamar API normalmente
@@ -461,6 +463,7 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             except:
                 pass
             if not fixtures:
+                print(f"    xG [{team_id}] FALLBACK también vacío — usando DEFAULT 1.2/1.2 LOW")
                 return 1.2, 1.2, "LOW", [], [], False
 
         gf_series = []
@@ -1066,7 +1069,8 @@ class TripleLeagueBot:
             for lid, cfg in TARGET_LEAGUES.items():
                 n = len(teams_by_league[lid])
                 if n > 0:
-                    print(f"  {cfg['name']}: {n} equipos encontrados")
+                    names = list(teams_by_league[lid].values())
+                    print(f"  {cfg['name']}: {n} equipos → {', '.join(names[:6])}{'...' if n>6 else ''}")
                 else:
                     print(f"  ⚠️  {cfg['name']}: sin equipos en los últimos 14 días")
 
@@ -1472,6 +1476,8 @@ class TripleLeagueBot:
             l_name   = cfg['name']
             season   = self.seasons.get(lid, cfg['seasons'][-1])
             label    = f"{h_n} vs {a_n} ({l_name})"
+            print(f"\n  ── {label} (fid={fid}) ──")
+            print(f"     KO={ko} | liga={lid} | season={season}")
             time.sleep(6.1)
 
             # Llamada: cuotas Bet365
@@ -1499,16 +1505,20 @@ class TripleLeagueBot:
                 track_requests(1)
                 hinj = sum(1 for i in inj_res if i['team']['id'] == h_id)
                 ainj = sum(1 for i in inj_res if i['team']['id'] == a_id)
+                print(f"     Lesionados: {h_n}={hinj} {a_n}={ainj}")
                 # FIX v6.2: persistir lesiones para injury_watch semanal (0 requests extra)
                 self.store_fixture_injuries(fid, h_id, h_n, a_id, a_n, inj_res)
             except:
                 hinj = ainj = 0
+                print(f"     Lesionados: error al obtener — usando 0/0")
 
             # V6.1: xG basado en últimos 6 + factor de forma
             # retorna requests_made para tracking preciso
             xh, xa, xt, conf, xg_src, req_made = build_xg_match(
                 h_id, a_id, hinj, ainj, season, self.headers, league_id=lid
             )
+            print(f"     xG modelo: {h_n}={xh:.2f} {a_n}={xa:.2f} total={xt:.2f} conf={conf} src={xg_src}")
+            print(f"     Requests usados hasta aquí: {track_requests(0)}/100")
             track_requests(req_made)  # FIX: tracking exacto de requests reales
 
             # Validar consistencia xG vs mercado
@@ -1528,12 +1538,15 @@ class TripleLeagueBot:
 
                 ok2, fail = sanity_check(item['prob'], item['mkt'], item['odd'])
                 if not ok2:
+                    print(f"     ❌ {fail}: {item['mkt']} @{item['odd']:.2f} prob={item['prob']:.3f}")
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, fail)
                     continue
                 if ev < MIN_EV_THRESHOLD:
+                    print(f"     ❌ LOW_EV: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}%")
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, "LOW_EV")
                     continue
                 if ev > MAX_EV_THRESHOLD:
+                    print(f"     ❌ EV_ALUCINACION: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}%")
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, "EV_ALUCINATION")
                     continue
 
@@ -1542,7 +1555,8 @@ class TripleLeagueBot:
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, rej)
                     continue
 
-                candidates.append({
+                    print(f"     ✅ CANDIDATO: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.2f}")
+            candidates.append({
                     **item, 'ev': ev, 'base_stake': kelly,
                     'urs': urs, 'conf': conf, 'xg_src': xg_src,
                     'fid': fid, 'h_n': h_n, 'a_n': a_n, 'ko': ko,
