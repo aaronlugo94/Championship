@@ -446,7 +446,22 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
         fixtures = r.json().get('response', [])
 
         if not fixtures:
-            return 1.2, 1.2, "LOW", [], [], False  # cache_hit=False: se gastó 1 request
+            # Fallback: buscar últimos partidos por fecha en lugar de league+season
+            # El endpoint team+last sin season no activa el bloqueo Free tier
+            try:
+                r2 = requests.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    headers=headers,
+                    params={"team": team_id, "last": depth},
+                    timeout=15
+                )
+                fixtures = r2.json().get('response', [])
+                # Filtrar solo partidos de nuestra liga para no mezclar datos
+                fixtures = [f for f in fixtures if f['league']['id'] == league_id]
+            except:
+                pass
+            if not fixtures:
+                return 1.2, 1.2, "LOW", [], [], False
 
         gf_series = []
         ga_series = []
@@ -781,18 +796,15 @@ class TripleLeagueBot:
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
 
         status_lines = [
-            f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 <b>CHAMPIONSHIP SPECIALIST V6.2</b>",
+            f"🌎 <b>TRIPLE LEAGUE BOT V6.4</b>",
             f"Estado: {mode}",
-            f"Ligas: Championship (ID=40) · Brasileirao (ID=71)",
             f"",
             f"{'✅' if api_ok else '❌'} API: {plan_info}",
             f"📡 Requests hoy: {req_info}",
-            f"{'✅' if access_ok else '❌'} Championship: {access_detail}",
+            f"{'✅' if access_ok else '❌'} Ligas: {access_detail}",
         ]
         if not api_ok:
             status_lines.append("⛔ Sin API — el bot no puede escanear partidos")
-        if not access_ok and api_ok:
-            status_lines.append("⛔ Championship bloqueada en este plan — verifica api-football.com")
 
         self.send_msg("\n".join(status_lines))
 
@@ -1686,6 +1698,31 @@ if __name__ == "__main__":
             print("  Sin CLVs aún.")
     except:
         pass
+
+    # ── AUTO-WARMUP DE CACHE ────────────────────────────────────────────────
+    # Si la cache de xG está vacía (primer deploy o DB nueva), ejecutar
+    # weekly_xg_cache antes del scan para que los picks tengan xG real.
+    # Sin cache, fetch_team_xg usa last6 por league+season que puede estar
+    # bloqueado en Free tier — resultando en xG LOW y picks no confiables.
+    try:
+        conn_check = sqlite3.connect(DB_PATH)
+        cc = conn_check.cursor()
+        cc.execute("SELECT COUNT(*) FROM team_xg_cache")
+        cache_count = cc.fetchone()[0]
+        conn_check.close()
+
+        if cache_count == 0:
+            print("  ⚠️  Cache xG vacía — ejecutando warmup antes del primer scan...")
+            bot.send_msg(
+                "⏳ <b>Primera vez detectada</b>\n"
+                "Calentando cache xG (last10 todos los equipos)...\n"
+                "Esto toma ~2 minutos. El scan arranca después."
+            )
+            bot.weekly_xg_cache()
+        else:
+            print(f"  ✅ Cache xG: {cache_count} equipos en cache — scan directo")
+    except Exception as e:
+        print(f"  Cache check error: {e}")
 
     bot.run_daily_scan()
 
