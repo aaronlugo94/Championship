@@ -439,22 +439,26 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             headers=headers,
             params={
                 "team":   team_id,
-                "league": league_id,  # V6.4: parametrizado por liga
-                "season": season,
-                "last":   depth  # 6 en scan diario, 10 en weekly_xg_cache
+                "last":   depth,   # Sin league+season — evita bloqueo Free y temporadas vacías
+                "status": "FT"     # Solo partidos terminados
             },
             timeout=15
         )
         fixtures = r.json().get('response', [])
 
+        if fixtures:
+            leagues_found = list(set(f['league']['id'] for f in fixtures))
+            print(f"    xG [{team_id}] team+last={depth} encontró {len(fixtures)} partidos — ligas: {leagues_found}")
         if not fixtures:
-            # Fallback: buscar últimos partidos por fecha en lugar de league+season
+            # Fallback: sin status por si acaso
             # El endpoint team+last sin season no activa el bloqueo Free tier
             try:
+                # Sin season ni league — obtiene últimos N partidos de cualquier temporada
+                # Funciona aunque el equipo no tenga partidos en la temporada actual aún
                 r2 = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers=headers,
-                    params={"team": team_id, "last": depth},
+                    params={"team": team_id, "last": depth, "status": "FT"},
                     timeout=15
                 )
                 # NO filtrar por liga — team+last devuelve de cualquier liga
@@ -1533,7 +1537,7 @@ class TripleLeagueBot:
             if conf == "LOW":
                 # xG default 1.2/1.2 — modelo sin datos reales, no generar picks
                 print(f"     ⛔ xG LOW — skip completo del partido (sin datos reales)")
-                log_decision(fid, label, 'ALL', 0.0, 0.0, 'XG_LOW_SKIP')
+                log_rejection(fid, label, 'ALL', 0.0, 0.0, 'XG_LOW_SKIP')
                 continue
 
             candidates = []
