@@ -478,19 +478,25 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             "https://v3.football.api-sports.io/fixtures",
             headers=headers,
             params={
-                "team":   team_id,
-                "last":   depth,   # Sin league+season — evita bloqueo Free y temporadas vacías
-                "status": "FT"     # Solo partidos terminados
+                "team": team_id,
+                "last": depth,   # Sin league+season+status — máxima compatibilidad Free tier
             },
             timeout=15
         )
-        fixtures = r.json().get('response', [])
+        raw = r.json()
+        fixtures = raw.get('response', [])
+        errors   = raw.get('errors', {})
 
         if fixtures:
             leagues_found = list(set(f['league']['id'] for f in fixtures))
-            print(f"    xG [{team_id}] team+last={depth} encontró {len(fixtures)} partidos — ligas: {leagues_found}")
+            print(f"    xG [{team_id}] team+last={depth} → {len(fixtures)} partidos ligas={leagues_found}")
+        elif errors:
+            print(f"    xG [{team_id}] API error: {str(errors)[:80]}")
+        else:
+            print(f"    xG [{team_id}] respuesta vacía — results={raw.get('results',0)} paging={raw.get('paging',{})}")
+
         if not fixtures:
-            # Fallback: sin status por si acaso
+            # Fallback: con season explícita de la liga
             # El endpoint team+last sin season no activa el bloqueo Free tier
             try:
                 # Sin season ni league — obtiene últimos N partidos de cualquier temporada
@@ -498,13 +504,14 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
                 r2 = requests.get(
                     "https://v3.football.api-sports.io/fixtures",
                     headers=headers,
-                    params={"team": team_id, "last": depth, "status": "FT"},
+                    params={"team": team_id, "season": season, "last": depth},
                     timeout=15
                 )
-                # NO filtrar por liga — team+last devuelve de cualquier liga
-                # Mezclar ligas es aceptable para xG: el nivel de juego
-                # de Championship y Brasileirao es comparable
-                fixtures = r2.json().get('response', [])
+                raw2 = r2.json()
+                fixtures = raw2.get('response', [])
+                if not fixtures:
+                    err2 = raw2.get('errors', {})
+                    print(f"    xG [{team_id}] fallback season={season} → vacío errors={str(err2)[:60]}")
             except:
                 pass
             if not fixtures:
