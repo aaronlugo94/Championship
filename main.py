@@ -229,6 +229,34 @@ def track_requests(n=1):
         return 0
 
 
+def sync_request_counter(headers):
+    """
+    Sincroniza el contador interno con la API real de api-football.
+    Llama al arrancar para corregir desfases entre deploys.
+    La API devuelve el conteo real del día — más confiable que nuestro contador.
+    """
+    try:
+        r = requests.get(
+            "https://v3.football.api-sports.io/status",
+            headers=headers, timeout=10
+        )
+        data    = r.json().get('response', {})
+        current = data.get('requests', {}).get('current', None)
+        if current is None:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        conn  = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Sobrescribir con el valor real de la API
+        c.execute("DELETE FROM request_log WHERE date=?", (today,))
+        c.execute("INSERT INTO request_log VALUES (NULL,?,?)", (today, int(current)))
+        conn.commit()
+        conn.close()
+        print(f"  📡 Contador sincronizado con API: {current}/100 requests hoy")
+    except Exception as e:
+        print(f"  ⚠️  sync_request_counter error: {e}")
+
+
 # ==========================================
 # URS ENGINE
 # ==========================================
@@ -804,6 +832,10 @@ class TripleLeagueBot:
     def __init__(self):
         init_db()
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
+
+        # Sincronizar contador de requests con la API real antes de cualquier lógica
+        # Evita que deploys repetidos acumulen conteos falsos en request_log
+        sync_request_counter(self.headers)
 
         # ── DIAGNÓSTICO DE ARRANQUE ──────────────────────────────────────────
         # Verifica API key, plan, acceso a Championship y temporada activa.
