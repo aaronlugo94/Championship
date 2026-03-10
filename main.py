@@ -457,9 +457,10 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
                     params={"team": team_id, "last": depth},
                     timeout=15
                 )
+                # NO filtrar por liga — team+last devuelve de cualquier liga
+                # Mezclar ligas es aceptable para xG: el nivel de juego
+                # de Championship y Brasileirao es comparable
                 fixtures = r2.json().get('response', [])
-                # Filtrar solo partidos de nuestra liga para no mezclar datos
-                fixtures = [f for f in fixtures if f['league']['id'] == league_id]
             except:
                 pass
             if not fixtures:
@@ -1530,7 +1531,10 @@ class TripleLeagueBot:
             probs = build_market_probs(bets, xh, xa, h_n, a_n, conf)
 
             if conf == "LOW":
-                probs = [p for p in probs if p['mkt'] in ('OVER', 'UNDER')]
+                # xG default 1.2/1.2 — modelo sin datos reales, no generar picks
+                print(f"     ⛔ xG LOW — skip completo del partido (sin datos reales)")
+                log_decision(fid, label, 'ALL', 0.0, 0.0, 'XG_LOW_SKIP')
+                continue
 
             candidates = []
             for item in probs:
@@ -1693,6 +1697,7 @@ if __name__ == "__main__":
     # weekly_xg_cache antes del scan para que los picks tengan xG real.
     # Sin cache, fetch_team_xg usa last6 por league+season que puede estar
     # bloqueado en Free tier — resultando en xG LOW y picks no confiables.
+    cache_count = 0  # default — si falla el check, fuerza warmup
     try:
         conn_check = sqlite3.connect(DB_PATH)
         cc = conn_check.cursor()
