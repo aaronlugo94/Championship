@@ -1713,45 +1713,54 @@ if __name__ == "__main__":
     # weekly_xg_cache antes del scan para que los picks tengan xG real.
     # Sin cache, fetch_team_xg usa last6 por league+season que puede estar
     # bloqueado en Free tier — resultando en xG LOW y picks no confiables.
-    cache_count = 0  # default — si falla el check, fuerza warmup
+    # ── AUTO-WARMUP: solo si cache vacía Y hay suficiente budget ───────────────
+    cache_count = 0
     try:
         conn_check = sqlite3.connect(DB_PATH)
         cc = conn_check.cursor()
         cc.execute("SELECT COUNT(*) FROM team_xg_cache")
         cache_count = cc.fetchone()[0]
         conn_check.close()
-
-        if cache_count == 0:
-            print("  ⚠️  Cache xG vacía — ejecutando warmup antes del primer scan...")
-            bot.send_msg(
-                "⏳ <b>Primera vez detectada</b>\n"
-                "Calentando cache xG (last10 todos los equipos)...\n"
-                "Esto toma ~3 minutos. El scan arranca después."
-            )
-            bot.weekly_xg_cache()
-            # Después del warmup esperar al siguiente día para el scan
-            # El warmup puede gastar ~70 req; el scan necesita otros ~26
-            # Si el total > 95, diferir el scan al scheduler de mañana
-            reqs_used = track_requests(0)
-            reqs_left = 100 - reqs_used
-            if reqs_left < 30:  # scan necesita ~26 req mínimo
-                bot.send_msg(
-                    f"✅ <b>Warmup completado</b>\n"
-                    f"📡 Requests usados: {reqs_used}/100\n"
-                    f"⏰ Scan diferido — quedan solo {reqs_left} req hoy.\n"
-                    f"El scan arranca mañana a las 11:00 UTC."
-                )
-                print(f"  ⚠️  Solo {reqs_left} req restantes — scan diferido a mañana")
-            else:
-                print(f"  ✅ Warmup OK ({reqs_used} req usados, {reqs_left} restantes) — arrancando scan")
-                bot.run_daily_scan()
-        else:
-            print(f"  ✅ Cache xG: {cache_count} equipos en cache — scan directo")
+        print(f"  📦 Cache xG al arrancar: {cache_count} equipos")
     except Exception as e:
         print(f"  Cache check error: {e}")
 
-    # Solo correr scan aquí si no lo corrió el bloque de warmup
-    if cache_count > 0:
+    reqs_al_arrancar = track_requests(0)
+    reqs_disponibles = 100 - reqs_al_arrancar
+    print(f"  📡 Requests disponibles: {reqs_disponibles}/100")
+
+    if cache_count == 0 and reqs_disponibles >= 50:
+        print("  ⚠️  Cache vacía + budget OK — ejecutando warmup...")
+        bot.send_msg(
+            "⏳ <b>Primera vez detectada</b>\n"
+            "Calentando cache xG (last10 todos los equipos)...\n"
+            "Esto toma ~3 minutos. El scan arranca después."
+        )
+        bot.weekly_xg_cache()
+        reqs_post = 100 - track_requests(0)
+        if reqs_post >= 30:
+            print(f"  ✅ Warmup OK — {reqs_post} req restantes — arrancando scan")
+            bot.run_daily_scan()
+        else:
+            bot.send_msg(
+                f"✅ <b>Warmup completado</b>\n"
+                f"⏰ Scan diferido — quedan solo {reqs_post} req.\n"
+                f"El scan arranca mañana a las 11:00 UTC."
+            )
+            print(f"  ⚠️  Solo {reqs_post} req tras warmup — scan diferido")
+
+    elif cache_count == 0 and reqs_disponibles < 50:
+        bot.send_msg(
+            f"⚠️ <b>Cache vacía, sin budget hoy</b>\n"
+            f"Solo {reqs_disponibles} req disponibles.\n"
+            f"Warmup automático el lunes 08:00 UTC.\n"
+            f"Scan de hoy con xG fallback (picks marcados LOW)."
+        )
+        print(f"  ⚠️  Cache vacía pero solo {reqs_disponibles} req — scan con fallback")
+        bot.run_daily_scan()
+
+    else:
+        print(f"  ✅ Cache OK ({cache_count} equipos) — scan directo")
         bot.run_daily_scan()
 
     while True:
