@@ -444,12 +444,13 @@ def _form_factor(gf_series):
 
 def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=6):
     """
-    V6.4: Obtiene xG estimado de los últimos N partidos del equipo (depth=6 en scan, depth=10 en cache semanal).
-    Si use_cache=True y hay datos frescos en team_xg_cache (<TTL horas),
-    los usa directamente sin llamar a la API — ahorra requests en días de jornada.
-    depth=10 en weekly_xg_cache da más precisión al modelo.
+    V6.4: Obtiene xG estimado buscando partidos del equipo por fecha.
+    El Free tier bloquea team+last y team+league+season.
+    Único método que funciona: /fixtures?date=YYYY-MM-DD (ya probado).
+    Busca hacia atrás día a día hasta encontrar N partidos del equipo.
     """
     import json
+
     if use_cache:
         try:
             conn_c = sqlite3.connect(DB_PATH)
@@ -461,111 +462,73 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             row = cc.fetchone()
             conn_c.close()
             if row:
-                updated = datetime.fromisoformat(row[5])
-                age_hours = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
-                if age_hours < XG_CACHE_TTL_HOURS:
+                updated  = datetime.fromisoformat(row[5])
+                age_h    = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
+                if age_h < XG_CACHE_TTL_HOURS:
                     gf = json.loads(row[0])
                     ga = json.loads(row[1])
-                    # Retorna 6 valores: el último bool indica cache hit (True = no request gastado)
-                    age_h = round(age_hours, 1)
-                    print(f"    xG [{team_id}] CACHE HIT age={age_h}h conf={row[4]}")
+                    print(f"    xG [{team_id}] CACHE HIT age={age_h:.1f}h conf={row[4]}")
                     return float(row[2]), float(row[3]), row[4], gf, ga, True
-        except:
-            pass  # cache miss → llamar API normalmente
-
-    try:
-        r = requests.get(
-            "https://v3.football.api-sports.io/fixtures",
-            headers=headers,
-            params={
-                "team": team_id,
-                "last": depth,   # Sin league+season+status — máxima compatibilidad Free tier
-            },
-            timeout=15
-        )
-        raw = r.json()
-        fixtures = raw.get('response', [])
-        errors   = raw.get('errors', {})
-
-        if fixtures:
-            leagues_found = list(set(f['league']['id'] for f in fixtures))
-            print(f"    xG [{team_id}] team+last={depth} → {len(fixtures)} partidos ligas={leagues_found}")
-        elif errors:
-            print(f"    xG [{team_id}] API error: {str(errors)[:80]}")
-        else:
-            print(f"    xG [{team_id}] respuesta vacía — results={raw.get('results',0)} paging={raw.get('paging',{})}")
-
-        if not fixtures:
-            # Fallback: con season explícita de la liga
-            # El endpoint team+last sin season no activa el bloqueo Free tier
-            try:
-                # Sin season ni league — obtiene últimos N partidos de cualquier temporada
-                # Funciona aunque el equipo no tenga partidos en la temporada actual aún
-                r2 = requests.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers=headers,
-                    params={"team": team_id, "season": season, "last": depth},
-                    timeout=15
-                )
-                raw2 = r2.json()
-                fixtures = raw2.get('response', [])
-                if not fixtures:
-                    err2 = raw2.get('errors', {})
-                    print(f"    xG [{team_id}] fallback season={season} → vacío errors={str(err2)[:60]}")
-            except:
-                pass
-            if not fixtures:
-                print(f"    xG [{team_id}] FALLBACK también vacío — usando DEFAULT 1.2/1.2 LOW")
-                return 1.2, 1.2, "LOW", [], [], False
-
-        gf_series = []
-        ga_series = []
-
-        for fix in fixtures:
-            h_id    = fix['teams']['home']['id']
-            h_goals = fix['goals']['home']
-            a_goals = fix['goals']['away']
-
-            if h_goals is None or a_goals is None:
-                continue
-
-            if h_id == team_id:
-                gf_series.append(h_goals)
-                ga_series.append(a_goals)
-            else:
-                gf_series.append(a_goals)
-                ga_series.append(h_goals)
-
-        if not gf_series:
-            return 1.2, 1.2, "LOW", [], [], False  # FIX: 6 valores consistentes
-
-        xg_for     = _weighted_avg(gf_series)
-        xg_against = _weighted_avg(ga_series)
-        # Con depth=10 exigimos más partidos para HIGH — datos más ricos
-        confidence = "HIGH" if len(gf_series) >= max(4, depth // 2) else "MED"
-
-        # Guardar en cache para reutilizar en el scan del día de jornada
-        try:
-            import json
-            conn_c = sqlite3.connect(DB_PATH)
-            cc = conn_c.cursor()
-            cc.execute("""INSERT OR REPLACE INTO team_xg_cache
-                (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (team_id, json.dumps(gf_series), json.dumps(ga_series),
-                 xg_for, xg_against, confidence,
-                 datetime.now(timezone.utc).isoformat())
-            )
-            conn_c.commit()
-            conn_c.close()
         except:
             pass
 
-        return xg_for, xg_against, confidence, gf_series, ga_series, False  # cache_hit=False
+    # Buscar partidos del equipo fecha a fecha hacia atrás
+    # 1 req por fecha, la misma fecha sirve para ambos equipos del partido
+    gf_series = []
+    ga_series = []
+    days_searched = 0
+    MAX_DAYS_BACK = 70  # ~10 semanas — suficiente para depth=10
 
-    except Exception as e:
-        return 1.2, 1.2, "LOW", [], [], False  # FIX: 6 valores consistentes
+    for days_back in range(1, MAX_DAYS_BACK + 1):
+        if len(gf_series) >= depth:
+            break
+        d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        # Usar cache compartida — si otro equipo ya pidió esta fecha, 0 requests extra
+        already_cached = d in _DATE_FIXTURES_CACHE
+        all_day = _get_fixtures_for_date(d, headers)
+        if not already_cached:
+            days_searched += 1
+        for fix in all_day:
+                if fix['league']['id'] != league_id:
+                    continue
+                if fix['fixture']['status']['short'] != 'FT':
+                    continue
+                h_id    = fix['teams']['home']['id']
+                a_id    = fix['teams']['away']['id']
+                h_goals = fix['goals']['home']
+                a_goals = fix['goals']['away']
+                if h_goals is None or a_goals is None:
+                    continue
+                if h_id == team_id:
+                    gf_series.append(h_goals)
+                    ga_series.append(a_goals)
+                elif a_id == team_id:
+                    gf_series.append(a_goals)
+                    ga_series.append(h_goals)
+    if not gf_series:
+        print(f"    xG [{team_id}] sin partidos en {MAX_DAYS_BACK} días — DEFAULT 1.2/1.2 LOW")
+        return 1.2, 1.2, "LOW", [], [], False
 
+    xg_for     = _weighted_avg(gf_series)
+    xg_against = _weighted_avg(ga_series)
+    confidence = "HIGH" if len(gf_series) >= max(4, depth // 2) else "MED"
+    print(f"    xG [{team_id}] {len(gf_series)} partidos en {days_searched} días — xG={xg_for:.2f}/{xg_against:.2f} {confidence}")
+
+    try:
+        conn_c = sqlite3.connect(DB_PATH)
+        cc = conn_c.cursor()
+        cc.execute("""INSERT OR REPLACE INTO team_xg_cache
+            (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (team_id, json.dumps(gf_series), json.dumps(ga_series),
+             xg_for, xg_against, confidence,
+             datetime.now(timezone.utc).isoformat(), depth))
+        conn_c.commit()
+        conn_c.close()
+    except:
+        pass
+
+    return xg_for, xg_against, confidence, gf_series, ga_series, False
 
 def resolve_seasons(headers):
     """
@@ -608,7 +571,7 @@ def resolve_seasons(headers):
     return seasons
 
 
-def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers, league_id=40):
+def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers, league_id=40, depth=4):
     """
     V6.1: Construye xG del partido usando últimos 6 partidos de cada equipo.
 
@@ -829,6 +792,32 @@ def build_market_probs(bets, xh, xa, h_n, a_n, conf):
                 })
 
     return probs
+
+
+# Cache de respuestas /fixtures?date= compartida durante el scan
+# Evita pedir la misma fecha múltiples veces para distintos equipos
+_DATE_FIXTURES_CACHE = {}  # {date_str: [fixture, ...]}
+
+def _get_fixtures_for_date(d, headers):
+    """Obtiene fixtures de una fecha, usando cache en memoria del scan actual."""
+    if d not in _DATE_FIXTURES_CACHE:
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers=headers,
+                params={"date": d},
+                timeout=10
+            )
+            _DATE_FIXTURES_CACHE[d] = r.json().get('response', [])
+            time.sleep(0.3)
+        except:
+            _DATE_FIXTURES_CACHE[d] = []
+    return _DATE_FIXTURES_CACHE[d]
+
+
+def clear_date_cache():
+    """Limpiar cache de fechas al inicio de cada scan."""
+    _DATE_FIXTURES_CACHE.clear()
 
 
 # ==========================================
@@ -1084,6 +1073,7 @@ class TripleLeagueBot:
         """
         import json
 
+        clear_date_cache()       # fecha cache fresco para el warmup
         BUDGET_MAX = 44          # nunca gastar más de esto en el warmup
         req_inicio = track_requests(0)
 
@@ -1449,6 +1439,8 @@ class TripleLeagueBot:
         day_after      = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
 
         # Llamada 1+2: fixtures de mañana y pasado mañana
+        # Limpiar cache de fechas del scan anterior
+        clear_date_cache()
         # V6.4: búsqueda por fecha — captura AMBAS ligas sin bloqueo Free tier
         matches_by_league = {lid: [] for lid in TARGET_LEAGUES}
         for d in [tomorrow, day_after]:
