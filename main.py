@@ -33,6 +33,18 @@ DB_DIR = os.getenv("DB_DIR", "./data")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "quant_dual.db")
 
+# Diagnóstico de DB al arrancar — imprime en logs Railway
+print(f"  📂 DB_DIR={DB_DIR} | DB_PATH={DB_PATH}")
+print(f"  📂 DB existe: {os.path.exists(DB_PATH)} | Tamaño: {os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0} bytes")
+try:
+    _chk = sqlite3.connect(DB_PATH)
+    _xg  = _chk.execute("SELECT COUNT(*) FROM team_xg_cache").fetchone()[0] if _chk.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='team_xg_cache'").fetchone() else "tabla no existe"
+    _pk  = _chk.execute("SELECT COUNT(*) FROM picks_log").fetchone()[0] if _chk.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='picks_log'").fetchone() else "tabla no existe"
+    _chk.close()
+    print(f"  📂 team_xg_cache={_xg} registros | picks_log={_pk} registros")
+except Exception as _e:
+    print(f"  📂 DB check error: {_e}")
+
 RUN_TIME_SCAN       = "11:00"   # D-1: 11:00 UTC — cuotas abiertas Championship (UK) y Brasileirao (BRT)
 RUN_TIME_MIDDAY_CLV = "16:00"   # D-0: 16:00 UTC — antes del KO Championship (15:00 UK) y Brasileirao (20:00 UTC)
 RUN_TIME_INGEST     = "04:00"   # mantenido por compatibilidad
