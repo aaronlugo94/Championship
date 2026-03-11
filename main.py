@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ==========================================
-# V6.4 TRIPLE LEAGUE SPECIALIST
+# V6.5 TRIPLE LEAGUE SPECIALIST
 # ==========================================
 # CAMBIOS VS V6.1 (correcciones de lógica):
 #   1. LÓGICA: candidato elegido por ev*urs (valor ajustado al riesgo)
@@ -178,6 +178,13 @@ def init_db():
         player_name TEXT, injury_type TEXT,
         status TEXT, expected_return TEXT,
         captured_at DATETIME
+    )""")
+    # V6.5: log de resultados FT ya ingestados en xG cache (evita duplicados)
+    c.execute("""CREATE TABLE IF NOT EXISTS xg_result_log (
+        fixture_id  INTEGER,
+        team_id     INTEGER,
+        ingested_at TEXT,
+        PRIMARY KEY (fixture_id, team_id)
     )""")
     # V5.10 port: auto-heal de CLVs corruptos al arrancar
     # selection_keys válidas tienen formato "bid|value" (ej: "1|Home", "5|Over 2.5")
@@ -974,7 +981,7 @@ class TripleLeagueBot:
         mode = "🔴 LIVE" if LIVE_TRADING else "🟡 DRY-RUN"
 
         status_lines = [
-            f"🌎 <b>TRIPLE LEAGUE BOT V6.4</b>",
+            f"🌎 <b>TRIPLE LEAGUE BOT V6.5</b>",
             f"Estado: {mode}",
             f"",
             f"{'✅' if api_ok else '❌'} API: {plan_info}",
@@ -1285,12 +1292,12 @@ class TripleLeagueBot:
                     except:
                         pass
 
-                    # fetch_team_xg hace la llamada API internamente — NO hacer track_requests aquí
+                    # fetch_team_xg usa _get_fixtures_for_date que ya está en cache — track_requests se gestiona en discovery
                     fetch_team_xg(
                         team_id, season, self.headers,
                         league_id=lid, use_cache=False, depth=10
                     )
-                    # track_requests ya se llama dentro de fetch_team_xg — no duplicar
+                    # fetch_team_xg no llama track_requests — los requests de fecha se trackean en discovery
                     total_cached += 1
                     time.sleep(1.5)
 
@@ -1309,7 +1316,7 @@ class TripleLeagueBot:
 
             req_total = reqs_gastados()
             self.send_msg(
-                f"🔄 <b>xG Cache V6.4 actualizada</b>\n"
+                f"🔄 <b>xG Cache V6.5 actualizada</b>\n"
                 f"Equipos cacheados (last10): {total_cached} | Saltados: {total_skipped}\n"
                 f"📡 Requests del warmup: {req_total}/{BUDGET_MAX} máx"
             )
@@ -1614,7 +1621,7 @@ class TripleLeagueBot:
 
         if not matches:
             self.send_msg(
-                f"🔇 <b>Triple League V6.4:</b> Sin partidos en los próximos 2 días.\n"
+                f"🔇 <b>Triple League V6.5:</b> Sin partidos en los próximos 2 días.\n"
                 f"📡 Ligas: Championship · Brasileirao"
             )
             return
@@ -1639,7 +1646,7 @@ class TripleLeagueBot:
         mx_count    = sum(1 for m in matches if m['league']['id'] == 262)
         req_est     = 2 + len(matches) * 4
         self.send_msg(
-            f"🔍 <b>Triple League V6.4 — Scan D-1</b>\n"
+            f"🔍 <b>Triple League V6.5 — Scan D-1</b>\n"
             f"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship: {champ_count} partidos\n"
             f"🇧🇷 Brasileirao:  {bra_count} partidos\n"
             f"🇲🇽 Liga MX:      {mx_count} partidos\n"
@@ -1742,12 +1749,12 @@ class TripleLeagueBot:
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, rej)
                     continue
 
-                    print(f"     ✅ CANDIDATO: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.2f}")
-            candidates.append({
+                print(f"     ✅ CANDIDATO: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.2f}")
+                candidates.append({
                     **item, 'ev': ev, 'base_stake': kelly,
                     'urs': urs, 'conf': conf, 'xg_src': xg_src,
                     'fid': fid, 'h_n': h_n, 'a_n': a_n, 'ko': ko,
-                    'xh': xh, 'xa': xa, 'xt': xt
+                    'xh': xh, 'xa': xa, 'xt': xt, 'lid': lid
                 })
 
             if not candidates:
@@ -1764,7 +1771,7 @@ class TripleLeagueBot:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             reports = [
-                f"📊 <b>Triple League V6.4 — Portfolio:</b>\n"
+                f"📊 <b>Triple League V6.5 — Portfolio:</b>\n"
                 f"Picks: {len(final)} | Vol: {meta['port_vol']*100:.2f}%\n"
                 f"Heat: {meta['final_heat']*100:.2f}% | Damper: {meta['damper']:.2f}x\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
@@ -1776,7 +1783,7 @@ class TripleLeagueBot:
                      xg_home, xg_away, xg_total, pick_time, kickoff_time, urs,
                      model_gap, xg_source)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (p['fid'], LEAGUE_NAME, p['h_n'], p['a_n'], p['mkt'], p['pick'],
+                    (p['fid'], TARGET_LEAGUES.get(p.get('lid', 40), {}).get('name', LEAGUE_NAME), p['h_n'], p['a_n'], p['mkt'], p['pick'],
                      f"{p['bid']}|{p['val']}", p['odd'], p['prob'], p['ev'],
                      p['final_stake'] if LIVE_TRADING else 0.0,
                      p['xh'], p['xa'], p['xt'],
@@ -1801,7 +1808,7 @@ class TripleLeagueBot:
             self.send_msg("\n\n".join(reports))
         else:
             self.send_msg(
-                f"🔇 <b>Triple League V6.4:</b> Sin picks válidos hoy.\n"
+                f"🔇 <b>Triple League V6.5:</b> Sin picks válidos hoy.\n"
                 f"📡 Requests usados: {track_requests(0)}/100"
             )
 
@@ -1928,31 +1935,6 @@ if __name__ == "__main__":
 
     else:
         print(f"  ✅ Cache OK ({cache_count} equipos) — scan directo")
-        # Diagnóstico puntual: verificar qué devuelve una fecha reciente para Brasileirao
-        try:
-            import requests as _req
-            _h = {'x-apisports-key': API_SPORTS_KEY}
-            # Buscar hace 7 días — debería tener partidos de Brasileirao si la liga es activa
-            _d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            _r = _req.get("https://v3.football.api-sports.io/fixtures",
-                          headers=_h, params={"date": _d}, timeout=10)
-            _resp = _r.json().get('response', [])
-            _bra  = [f for f in _resp if f['league']['id'] == 71]
-            _all_leagues = list(set(f['league']['id'] for f in _resp))
-            print(f"  🔍 DIAG: fecha {_d} → {len(_resp)} fixtures totales | liga71={len(_bra)} | ligas presentes={_all_leagues[:10]}")
-            if _bra:
-                for f in _bra[:3]:
-                    print(f"    liga71: {f['teams']['home']['name']} vs {f['teams']['away']['name']} status={f['fixture']['status']['short']}")
-            else:
-                # Buscar hace 100 días — temporada 2025 de Brasileirao
-                _d2 = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
-                _r2 = _req.get("https://v3.football.api-sports.io/fixtures",
-                               headers=_h, params={"date": _d2}, timeout=10)
-                _resp2 = _r2.json().get('response', [])
-                _bra2  = [f for f in _resp2 if f['league']['id'] == 71]
-                print(f"  🔍 DIAG: fecha {_d2} (100d atrás) → {len(_resp2)} fixtures | liga71={len(_bra2)}")
-        except Exception as _e:
-            print(f"  🔍 DIAG error: {_e}")
         bot.run_daily_scan()
 
     while True:
