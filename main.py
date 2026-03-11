@@ -483,25 +483,13 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
     gf_series = []
     ga_series = []
     days_searched = 0
-    MAX_DAYS_BACK = 70  # ~10 semanas — suficiente para depth=10
+    MAX_DAYS_BACK = 120  # 4 meses — cubre gap entre temporadas (Brasileirao dic→mar)
 
-    for days_back in range(1, MAX_DAYS_BACK + 1):
-        if len(gf_series) >= depth:
-            break
-        d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        already_cached = d in _DATE_FIXTURES_CACHE
-        all_day = _get_fixtures_for_date(d, headers)
-        if not already_cached:
-            days_searched += 1
-            # Log de diagnóstico: mostrar qué ligas hay en esta fecha
-            league_ids_in_date = list(set(f['league']['id'] for f in all_day))
-            team_ids_in_date   = [f['teams']['home']['id'] for f in all_day] + [f['teams']['away']['id'] for f in all_day]
-            if team_id in team_ids_in_date:
-                matching = [f for f in all_day if f['teams']['home']['id'] == team_id or f['teams']['away']['id'] == team_id]
-                for mf in matching:
-                    print(f"    xG [{team_id}] encontrado en {d}: liga={mf['league']['id']} status={mf['fixture']['status']['short']} score={mf['goals']['home']}-{mf['goals']['away']}")
-        for fix in all_day:
-            if fix['league']['id'] != league_id:
+    def _extract_goals(fixtures, tid, strict_league=True):
+        """Extrae goles del equipo de una lista de fixtures."""
+        gf, ga = [], []
+        for fix in fixtures:
+            if strict_league and fix['league']['id'] != league_id:
                 continue
             if fix['fixture']['status']['short'] != 'FT':
                 continue
@@ -511,12 +499,39 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             a_goals = fix['goals']['away']
             if h_goals is None or a_goals is None:
                 continue
-            if h_id == team_id:
-                gf_series.append(h_goals)
-                ga_series.append(a_goals)
-            elif a_id == team_id:
-                gf_series.append(a_goals)
-                ga_series.append(h_goals)
+            if h_id == tid:
+                gf.append(h_goals); ga.append(a_goals)
+            elif a_id == tid:
+                gf.append(a_goals); ga.append(h_goals)
+        return gf, ga
+
+    for days_back in range(1, MAX_DAYS_BACK + 1):
+        if len(gf_series) >= depth:
+            break
+        d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        already_cached = d in _DATE_FIXTURES_CACHE
+        all_day = _get_fixtures_for_date(d, headers)
+        if not already_cached:
+            days_searched += 1
+        gf_day, ga_day = _extract_goals(all_day, team_id, strict_league=True)
+        gf_series.extend(gf_day)
+        ga_series.extend(ga_day)
+
+    # Fallback: si no encontró suficientes partidos en la liga principal,
+    # aceptar cualquier liga (Copa, torneo local) para tener forma del equipo
+    if len(gf_series) < 2:
+        gf_any, ga_any = [], []
+        for days_back in range(1, MAX_DAYS_BACK + 1):
+            if len(gf_any) >= depth:
+                break
+            d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            all_day = _get_fixtures_for_date(d, headers)
+            gf_day, ga_day = _extract_goals(all_day, team_id, strict_league=False)
+            gf_any.extend(gf_day)
+            ga_any.extend(ga_day)
+        if len(gf_any) > len(gf_series):
+            print(f"    xG [{team_id}] fallback sin filtro liga: {len(gf_any)} partidos")
+            gf_series, ga_series = gf_any, ga_any
 
     if not gf_series:
         print(f"    xG [{team_id}] sin partidos en {MAX_DAYS_BACK} días — DEFAULT 1.2/1.2 LOW")
