@@ -848,6 +848,108 @@ def clear_date_cache():
     _DATE_FIXTURES_CACHE.clear()
 
 
+def ingest_results_into_xg_cache(headers):
+    """
+    Descarga resultados FT de ayer y antesdeayer e ingesta en team_xg_cache.
+    Única forma de acumular historial en Free tier (que no permite date= histórico).
+    Corre después de cada scan usando las fechas ya en _DATE_FIXTURES_CACHE (0 req extra).
+    Para fechas no cacheadas, usa 1-2 req adicionales.
+    """
+    import json
+    ingested = 0
+    dates_to_check = []
+
+    # Primero usar fechas ya en memoria (sin requests)
+    for d in sorted(_DATE_FIXTURES_CACHE.keys(), reverse=True)[:7]:
+        dates_to_check.append((d, False))  # (date, needs_fetch)
+
+    # Añadir ayer y anteayer si no están en cache
+    for days_back in range(1, 4):
+        d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        if d not in _DATE_FIXTURES_CACHE:
+            dates_to_check.append((d, True))
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cc = conn.cursor()
+
+        for d, needs_fetch in dates_to_check:
+            if needs_fetch:
+                try:
+                    r = requests.get(
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=headers, params={"date": d}, timeout=10
+                    )
+                    fixtures = r.json().get('response', [])
+                    _DATE_FIXTURES_CACHE[d] = fixtures
+                except:
+                    continue
+            else:
+                fixtures = _DATE_FIXTURES_CACHE.get(d, [])
+
+            for fix in fixtures:
+                if fix['fixture']['status']['short'] != 'FT':
+                    continue
+                lid     = fix['league']['id']
+                if lid not in TARGET_LEAGUES:
+                    continue
+                h_id    = fix['teams']['home']['id']
+                a_id    = fix['teams']['away']['id']
+                h_goals = fix['goals']['home']
+                a_goals = fix['goals']['away']
+                if h_goals is None or a_goals is None:
+                    continue
+                fid     = fix['fixture']['id']
+
+                for team_id, gf, ga in [(h_id, h_goals, a_goals), (a_id, a_goals, h_goals)]:
+                    # Cargar cache existente
+                    cc.execute(
+                        "SELECT gf_series, ga_series FROM team_xg_cache WHERE team_id=?",
+                        (team_id,)
+                    )
+                    row = cc.fetchone()
+                    if row:
+                        gf_series = json.loads(row[0])
+                        ga_series = json.loads(row[1])
+                    else:
+                        gf_series, ga_series = [], []
+
+                    # Añadir resultado solo si no está ya (evitar duplicados)
+                    # Usar fixture_id como clave — guardar en tabla separada
+                    cc.execute(
+                        "SELECT 1 FROM xg_result_log WHERE fixture_id=? AND team_id=?",
+                        (fid, team_id)
+                    )
+                    if cc.fetchone():
+                        continue  # ya ingestado
+
+                    gf_series = [gf] + gf_series[:9]  # prepend más reciente, mantener 10
+                    ga_series = [ga] + ga_series[:9]
+
+                    xg_for     = sum(gf_series) / len(gf_series)
+                    xg_against = sum(ga_series) / len(ga_series)
+                    confidence = "HIGH" if len(gf_series) >= 4 else "MED"
+
+                    cc.execute("""INSERT OR REPLACE INTO team_xg_cache
+                        (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                        (team_id, json.dumps(gf_series), json.dumps(ga_series),
+                         xg_for, xg_against, confidence,
+                         datetime.now(timezone.utc).isoformat(), len(gf_series)))
+                    cc.execute(
+                        "INSERT OR IGNORE INTO xg_result_log (fixture_id, team_id, ingested_at) VALUES (?,?,?)",
+                        (fid, team_id, datetime.now(timezone.utc).isoformat())
+                    )
+                    ingested += 1
+
+        conn.commit()
+        conn.close()
+        if ingested > 0:
+            print(f"  📥 xG ingest: {ingested} resultados FT añadidos a cache")
+    except Exception as e:
+        print(f"  ⚠️  ingest_results error: {e}")
+
+
 # ==========================================
 # MAIN BOT
 # ==========================================
