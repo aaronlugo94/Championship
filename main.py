@@ -489,28 +489,28 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
         if len(gf_series) >= depth:
             break
         d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        # Usar cache compartida — si otro equipo ya pidió esta fecha, 0 requests extra
         already_cached = d in _DATE_FIXTURES_CACHE
         all_day = _get_fixtures_for_date(d, headers)
         if not already_cached:
             days_searched += 1
         for fix in all_day:
-                if fix['league']['id'] != league_id:
-                    continue
-                if fix['fixture']['status']['short'] != 'FT':
-                    continue
-                h_id    = fix['teams']['home']['id']
-                a_id    = fix['teams']['away']['id']
-                h_goals = fix['goals']['home']
-                a_goals = fix['goals']['away']
-                if h_goals is None or a_goals is None:
-                    continue
-                if h_id == team_id:
-                    gf_series.append(h_goals)
-                    ga_series.append(a_goals)
-                elif a_id == team_id:
-                    gf_series.append(a_goals)
-                    ga_series.append(h_goals)
+            if fix['league']['id'] != league_id:
+                continue
+            if fix['fixture']['status']['short'] != 'FT':
+                continue
+            h_id    = fix['teams']['home']['id']
+            a_id    = fix['teams']['away']['id']
+            h_goals = fix['goals']['home']
+            a_goals = fix['goals']['away']
+            if h_goals is None or a_goals is None:
+                continue
+            if h_id == team_id:
+                gf_series.append(h_goals)
+                ga_series.append(a_goals)
+            elif a_id == team_id:
+                gf_series.append(a_goals)
+                ga_series.append(h_goals)
+
     if not gf_series:
         print(f"    xG [{team_id}] sin partidos en {MAX_DAYS_BACK} días — DEFAULT 1.2/1.2 LOW")
         return 1.2, 1.2, "LOW", [], [], False
@@ -1095,11 +1095,11 @@ class TripleLeagueBot:
             teams_by_league = {lid: {} for lid in TARGET_LEAGUES}  # {lid: {team_id: name}}
             ligas_completas  = set()  # ligas con >= 18 equipos encontrados
 
-            for days_back in range(0, 15):   # 14 fechas máximo
+            for days_back in range(1, 16):   # 15 fechas hacia atrás (sin hoy — partidos no terminados)
                 if reqs_gastados() >= BUDGET_MAX:
                     break
                 if len(ligas_completas) == len(TARGET_LEAGUES):
-                    break  # todas las ligas completas
+                    break
 
                 d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
                 try:
@@ -1114,6 +1114,8 @@ class TripleLeagueBot:
                         lid = fix['league']['id']
                         if lid not in TARGET_LEAGUES:
                             continue
+                        if fix['fixture']['status']['short'] != 'FT':
+                            continue  # solo contar equipos con partidos terminados
                         teams_by_league[lid][fix['teams']['home']['id']] = fix['teams']['home']['name']
                         teams_by_league[lid][fix['teams']['away']['id']] = fix['teams']['away']['name']
                         if len(teams_by_league[lid]) >= 18:
