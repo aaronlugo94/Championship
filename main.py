@@ -1826,6 +1826,31 @@ if __name__ == "__main__":
 
     else:
         print(f"  ✅ Cache OK ({cache_count} equipos) — scan directo")
+        # Diagnóstico puntual: verificar qué devuelve una fecha reciente para Brasileirao
+        try:
+            import requests as _req
+            _h = {'x-apisports-key': API_SPORTS_KEY}
+            # Buscar hace 7 días — debería tener partidos de Brasileirao si la liga es activa
+            _d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            _r = _req.get("https://v3.football.api-sports.io/fixtures",
+                          headers=_h, params={"date": _d}, timeout=10)
+            _resp = _r.json().get('response', [])
+            _bra  = [f for f in _resp if f['league']['id'] == 71]
+            _all_leagues = list(set(f['league']['id'] for f in _resp))
+            print(f"  🔍 DIAG: fecha {_d} → {len(_resp)} fixtures totales | liga71={len(_bra)} | ligas presentes={_all_leagues[:10]}")
+            if _bra:
+                for f in _bra[:3]:
+                    print(f"    liga71: {f['teams']['home']['name']} vs {f['teams']['away']['name']} status={f['fixture']['status']['short']}")
+            else:
+                # Buscar hace 100 días — temporada 2025 de Brasileirao
+                _d2 = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
+                _r2 = _req.get("https://v3.football.api-sports.io/fixtures",
+                               headers=_h, params={"date": _d2}, timeout=10)
+                _resp2 = _r2.json().get('response', [])
+                _bra2  = [f for f in _resp2 if f['league']['id'] == 71]
+                print(f"  🔍 DIAG: fecha {_d2} (100d atrás) → {len(_resp2)} fixtures | liga71={len(_bra2)}")
+        except Exception as _e:
+            print(f"  🔍 DIAG error: {_e}")
         bot.run_daily_scan()
 
     while True:
