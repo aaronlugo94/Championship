@@ -8,22 +8,20 @@ import math
 from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
-# ====
-# V6.5 TRIPLE LEAGUE SPECIALIST
-# ====
-# CAMBIOS VS V6.4 (correcciones de bugs críticos):
-#   1. BUG CRÍTICO: indentación rota en run_daily_scan — print y candidates.append
-#                  estaban fuera del for loop. Solo el último item de probs
-#                  se añadía a candidates. CORREGIDO: ambas líneas dentro del loop.
-#   2. BUG: LEAGUE_NAME hardcodeado como global '🏴 CHAMPIONSHIP'.
-#           Todos los picks de Brasileirao y Liga MX se guardaban con liga incorrecta.
-#           CORREGIDO: cada pick usa l_name = TARGET_LEAGUES[lid]['name'].
-#   3. BUG: comentario engañoso en track_requests sugería que fetch_team_xg
-#           llama track_requests internamente (falso). Podía causar doble conteo
-#           si alguien editaba confiando en el comentario. CORREGIDO: comentario aclarado.
-#   4. BUG: tabla xg_result_log usada en ingest_results_into_xg_cache
-#           nunca se creaba en init_db → crash silencioso en el primer ingest.
-#           CORREGIDO: CREATE TABLE IF NOT EXISTS xg_result_log añadida a init_db.
+# ==========================================
+# V6.4 TRIPLE LEAGUE SPECIALIST
+# ==========================================
+# CAMBIOS VS V6.1 (correcciones de lógica):
+#   1. LÓGICA: candidato elegido por ev*urs (valor ajustado al riesgo)
+#              en lugar de solo EV — el URS ya no se ignora en la selección
+#   2. LÓGICA: std negbinom subido a 1.55 para activar sobredispersión
+#              en el rango real de xG de Championship (era 1.35, inefectivo)
+#   3. LÓGICA: sanity_check gap reducido 0.25→0.18 para filtrar
+#              picks donde el modelo está mal calibrado vs mercado
+#   4. LÓGICA: closing_lines protegido contra duplicados con COUNT previo
+#   5. LÓGICA: stake mínima forzada eliminada — max(0.0) en lugar de
+#              max(0.001) para respetar la lógica Kelly cuando hay poca convicción
+#   6. LÓGICA: picks con final_stake < 0.005 filtrados antes de reportar
 
 LIVE_TRADING = False
 
@@ -86,8 +84,7 @@ XG_DECAY_FACTOR         = 0.85
 
 VOLATILITY_BUCKETS = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
 
-# FIX v6.5: LEAGUE_NAME eliminado como global hardcodeado.
-# Cada pick usa l_name = TARGET_LEAGUES[lid]['name'] en run_daily_scan.
+LEAGUE_NAME = '🏴󠁧󠁢󠁥󠁮󠁧󠁿 CHAMPIONSHIP'
 LIQUIDITY   = 0.85
 
 # Horarios de tareas semanales (días sin jornada)
@@ -101,9 +98,9 @@ XG_CACHE_TTL_HOURS    = 20        # re-cachear si el dato tiene >20h de antigüe
 LINE_ALERT_MOVE_PCT   = 0.08      # alertar si la cuota se mueve >8% desde apertura
 
 
-# ====
+# ==========================================
 # DATABASE
-# ====
+# ==========================================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -173,14 +170,6 @@ def init_db():
         goals_for INTEGER, goals_against INTEGER,
         avg_goals_for REAL, avg_goals_against REAL,
         captured_at DATETIME
-    )""")
-    # FIX v6.5: tabla requerida por ingest_results_into_xg_cache — faltaba en init_db
-    c.execute("""CREATE TABLE IF NOT EXISTS xg_result_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fixture_id INTEGER,
-        team_id INTEGER,
-        ingested_at DATETIME,
-        UNIQUE(fixture_id, team_id)
     )""")
     # Registro de lesiones activas por equipo
     c.execute("""CREATE TABLE IF NOT EXISTS injury_watch (
@@ -274,9 +263,9 @@ def sync_request_counter(headers):
         print(f"  ⚠️  sync_request_counter error: {e}")
 
 
-# ====
+# ==========================================
 # URS ENGINE
-# ====
+# ==========================================
 
 def get_avg_clv(lookback=30, market=None):
     """
@@ -289,18 +278,18 @@ def get_avg_clv(lookback=30, market=None):
         c = conn.cursor()
         if market:
             c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
-                    FROM picks_log p JOIN closing_lines c
-                    ON p.fixture_id=c.fixture_id AND p.market=c.market
-                    AND p.selection_key=c.selection_key
-                    WHERE p.clv_captured=1 AND p.market=?
-                    ORDER BY p.id DESC LIMIT ?""", (market, lookback))
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.clv_captured=1 AND p.market=?
+                         ORDER BY p.id DESC LIMIT ?""", (market, lookback))
         else:
             c.execute("""SELECT AVG((p.odd_open - c.odd_close)/p.odd_open)
-                    FROM picks_log p JOIN closing_lines c
-                    ON p.fixture_id=c.fixture_id AND p.market=c.market
-                    AND p.selection_key=c.selection_key
-                    WHERE p.clv_captured=1
-                    ORDER BY p.id DESC LIMIT ?""", (lookback,))
+                         FROM picks_log p JOIN closing_lines c
+                           ON p.fixture_id=c.fixture_id AND p.market=c.market
+                              AND p.selection_key=c.selection_key
+                         WHERE p.clv_captured=1
+                         ORDER BY p.id DESC LIMIT ?""", (lookback,))
         res = c.fetchone()[0]
         conn.close()
         return float(res) if res else 0.0
@@ -313,9 +302,9 @@ def get_clv_sharpe():
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""SELECT (p.odd_open - c.odd_close)/p.odd_open
-                    FROM picks_log p JOIN closing_lines c
-                    ON p.fixture_id=c.fixture_id AND p.clv_captured=1
-                    ORDER BY p.id DESC LIMIT 50""")
+                     FROM picks_log p JOIN closing_lines c
+                       ON p.fixture_id=c.fixture_id AND p.clv_captured=1
+                     ORDER BY p.id DESC LIMIT 50""")
         clvs = [r[0] for r in c.fetchall()]
         conn.close()
         if len(clvs) < 5:
@@ -379,9 +368,9 @@ def get_kelly_and_urs(ev, odd, market):
     return base_kelly * urs, urs, None
 
 
-# ====
+# ==========================================
 # PORTFOLIO ENGINE
-# ====
+# ==========================================
 
 def apply_portfolio_engine(picks):
     if not picks:
@@ -422,9 +411,9 @@ def apply_portfolio_engine(picks):
     }
 
 
-# ====
+# ==========================================
 # XG ENGINE V6.1
-# ====
+# ==========================================
 
 def _poisson_pmf(mu, k):
     if mu <= 0 or k < 0:
@@ -663,9 +652,9 @@ def build_xg_match(home_id, away_id, h_inj, a_inj, season, headers, league_id=40
     return xh, xa, xh + xa, conf, xg_source, requests_made
 
 
-# ====
+# ==========================================
 # PROBABILIDADES
-# ====
+# ==========================================
 
 def bivariate_poisson_1x2(xg_home, xg_away, max_goals=10):
     if not (0.4 <= xg_home <= 4.0) or not (0.4 <= xg_away <= 4.0):
@@ -716,9 +705,9 @@ def calc_btts(xg_home, xg_away):
     return round(p_yes, 4), round(p_no, 4)
 
 
-# ====
+# ==========================================
 # VALIDACIONES
-# ====
+# ==========================================
 
 def validate_xg(xh, xa, bets):
     home_odd = away_odd = over_odd = under_odd = None
@@ -768,9 +757,9 @@ def sanity_check(p_true, mkt, odd):
     return True, None
 
 
-# ====
+# ==========================================
 # PRICING ENGINE
-# ====
+# ==========================================
 
 def build_market_probs(bets, xh, xa, h_n, a_n, conf):
     probs = []
@@ -888,8 +877,8 @@ def ingest_results_into_xg_cache(headers):
             if needs_fetch:
                 try:
                     r = requests.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers=headers, params={"date": d}, timeout=10
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=headers, params={"date": d}, timeout=10
                     )
                     fixtures = r.json().get('response', [])
                     _DATE_FIXTURES_CACHE[d] = fixtures
@@ -915,24 +904,24 @@ def ingest_results_into_xg_cache(headers):
                 for team_id, gf, ga in [(h_id, h_goals, a_goals), (a_id, a_goals, h_goals)]:
                     # Cargar cache existente
                     cc.execute(
-                    "SELECT gf_series, ga_series FROM team_xg_cache WHERE team_id=?",
-                    (team_id,)
+                        "SELECT gf_series, ga_series FROM team_xg_cache WHERE team_id=?",
+                        (team_id,)
                     )
                     row = cc.fetchone()
                     if row:
-                    gf_series = json.loads(row[0])
-                    ga_series = json.loads(row[1])
+                        gf_series = json.loads(row[0])
+                        ga_series = json.loads(row[1])
                     else:
-                    gf_series, ga_series = [], []
+                        gf_series, ga_series = [], []
 
                     # Añadir resultado solo si no está ya (evitar duplicados)
                     # Usar fixture_id como clave — guardar en tabla separada
                     cc.execute(
-                    "SELECT 1 FROM xg_result_log WHERE fixture_id=? AND team_id=?",
-                    (fid, team_id)
+                        "SELECT 1 FROM xg_result_log WHERE fixture_id=? AND team_id=?",
+                        (fid, team_id)
                     )
                     if cc.fetchone():
-                    continue  # ya ingestado
+                        continue  # ya ingestado
 
                     gf_series = [gf] + gf_series[:9]  # prepend más reciente, mantener 10
                     ga_series = [ga] + ga_series[:9]
@@ -942,14 +931,14 @@ def ingest_results_into_xg_cache(headers):
                     confidence = "HIGH" if len(gf_series) >= 4 else "MED"
 
                     cc.execute("""INSERT OR REPLACE INTO team_xg_cache
-                    (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                    (team_id, json.dumps(gf_series), json.dumps(ga_series),
-                    xg_for, xg_against, confidence,
-                    datetime.now(timezone.utc).isoformat(), len(gf_series)))
+                        (team_id, gf_series, ga_series, xg_for, xg_against, confidence, updated_at, depth)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                        (team_id, json.dumps(gf_series), json.dumps(ga_series),
+                         xg_for, xg_against, confidence,
+                         datetime.now(timezone.utc).isoformat(), len(gf_series)))
                     cc.execute(
-                    "INSERT OR IGNORE INTO xg_result_log (fixture_id, team_id, ingested_at) VALUES (?,?,?)",
-                    (fid, team_id, datetime.now(timezone.utc).isoformat())
+                        "INSERT OR IGNORE INTO xg_result_log (fixture_id, team_id, ingested_at) VALUES (?,?,?)",
+                        (fid, team_id, datetime.now(timezone.utc).isoformat())
                     )
                     ingested += 1
 
@@ -961,9 +950,9 @@ def ingest_results_into_xg_cache(headers):
         print(f"  ⚠️  ingest_results error: {e}")
 
 
-# ====
+# ==========================================
 # MAIN BOT
-# ====
+# ==========================================
 
 class TripleLeagueBot:
     def __init__(self):
@@ -974,7 +963,7 @@ class TripleLeagueBot:
         # Evita que deploys repetidos acumulen conteos falsos en request_log
         sync_request_counter(self.headers)
 
-        # ── DIAGNÓSTICO DE ARRANQUE ────
+        # ── DIAGNÓSTICO DE ARRANQUE ──────────────────────────────────────────
         # Verifica API key, plan, acceso a Championship y temporada activa.
         # Todo se imprime en logs de Railway Y se envía a Telegram.
         api_ok, plan_info, req_info, access_ok, access_detail = self._startup_diagnostics()
@@ -1007,7 +996,7 @@ class TripleLeagueBot:
         4. Si hay fixtures disponibles para la temporada
         Retorna: (api_ok, plan_info, req_info, championship_ok, detail)
         """
-        # ── 1. Estado de la cuenta ────
+        # ── 1. Estado de la cuenta ───────────────────────────────────────────
         try:
             r = requests.get(
                 "https://v3.football.api-sports.io/status",
@@ -1039,7 +1028,7 @@ class TripleLeagueBot:
             print(f"  ❌ API status error: {e}")
             return False, "error de conexión", "?/?", False, str(e)
 
-        # ── 2. Acceso a Championship específicamente ────
+        # ── 2. Acceso a Championship específicamente ─────────────────────────
         # En el plan Free, algunas ligas están bloqueadas.
         # Si Championship está bloqueada, la API devuelve error 499 o lista vacía
         # incluso con fixtures reales disponibles.
@@ -1058,7 +1047,7 @@ class TripleLeagueBot:
                 for fix in r.json().get('response', []):
                     lid = fix['league']['id']
                     if lid in TARGET_LEAGUES and lid not in league_status:
-                    league_status[lid] = fix['league']['season']
+                        league_status[lid] = fix['league']['season']
                 if len(league_status) == len(TARGET_LEAGUES):
                     break
                 time.sleep(0.5)
@@ -1104,7 +1093,7 @@ class TripleLeagueBot:
         Fetches current odds for a pick and stores them.
         mark_captured=True  → cierre final (clv_captured=1), usado 60min antes del KO
         mark_captured=False → snapshot intermedio, no marca como capturado (seguirá
-                    siendo sobreescrito por el cierre real)
+                              siendo sobreescrito por el cierre real)
         """
         res = requests.get(
             f"https://v3.football.api-sports.io/odds?fixture={fid}&bookmaker=8",
@@ -1116,36 +1105,36 @@ class TripleLeagueBot:
             for b in res['response'][0]['bookmakers'][0]['bets']:
                 for v in b['values']:
                     if f"{b['id']}|{v['value']}" == skey:
-                    c.execute(
-                    "SELECT COUNT(*) FROM closing_lines WHERE fixture_id=? AND market=? AND selection_key=?",
-                    (fid, mkt, skey)
-                    )
-                    exists = c.fetchone()[0] > 0
-                    if mark_captured:
-                    # Cierre final: INSERT o UPDATE si ya había snapshot intermedio
-                    if exists:
-                    c.execute(
-                    "UPDATE closing_lines SET odd_close=?, implied_prob_close=?, capture_time=? "
-                    "WHERE fixture_id=? AND market=? AND selection_key=?",
-                    (float(v['odd']), 1/float(v['odd']), now.isoformat(),
-                    fid, mkt, skey)
-                    )
-                    else:
-                    c.execute(
-                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
-                    (fid, mkt, skey, float(v['odd']),
-                    1/float(v['odd']), now.isoformat())
-                    )
-                    else:
-                    # Snapshot intermedio: solo INSERT si aún no existe
-                    if not exists:
-                    c.execute(
-                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
-                    (fid, mkt, skey, float(v['odd']),
-                    1/float(v['odd']), now.isoformat())
-                    )
-                    found = True
-                    break
+                        c.execute(
+                            "SELECT COUNT(*) FROM closing_lines WHERE fixture_id=? AND market=? AND selection_key=?",
+                            (fid, mkt, skey)
+                        )
+                        exists = c.fetchone()[0] > 0
+                        if mark_captured:
+                            # Cierre final: INSERT o UPDATE si ya había snapshot intermedio
+                            if exists:
+                                c.execute(
+                                    "UPDATE closing_lines SET odd_close=?, implied_prob_close=?, capture_time=? "
+                                    "WHERE fixture_id=? AND market=? AND selection_key=?",
+                                    (float(v['odd']), 1/float(v['odd']), now.isoformat(),
+                                     fid, mkt, skey)
+                                )
+                            else:
+                                c.execute(
+                                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
+                                    (fid, mkt, skey, float(v['odd']),
+                                     1/float(v['odd']), now.isoformat())
+                                )
+                        else:
+                            # Snapshot intermedio: solo INSERT si aún no existe
+                            if not exists:
+                                c.execute(
+                                    "INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?)",
+                                    (fid, mkt, skey, float(v['odd']),
+                                     1/float(v['odd']), now.isoformat())
+                                )
+                        found = True
+                        break
         return found
 
     def capture_midday_lines(self):
@@ -1188,12 +1177,12 @@ class TripleLeagueBot:
                 mins = (datetime.fromisoformat(ko) - now).total_seconds() / 60.0
                 if mins <= 60.0:
                     found = self._fetch_and_store_odds(
-                    c, fid, mkt, skey, pid, now, mark_captured=True
+                        c, fid, mkt, skey, pid, now, mark_captured=True
                     )
                     time.sleep(2.0)
                     c.execute(
-                    "UPDATE picks_log SET clv_captured=? WHERE id=?",
-                    (1 if found else -1, pid)
+                        "UPDATE picks_log SET clv_captured=? WHERE id=?",
+                        (1 if found else -1, pid)
                     )
             conn.commit()
             conn.close()
@@ -1239,22 +1228,22 @@ class TripleLeagueBot:
                 d = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
                 try:
                     r = requests.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    headers=self.headers,
-                    params={"date": d},
-                    timeout=10
+                        "https://v3.football.api-sports.io/fixtures",
+                        headers=self.headers,
+                        params={"date": d},
+                        timeout=10
                     )
                     track_requests(1)   # 1 sola llamada por fecha sirve para todas las ligas
                     for fix in r.json().get('response', []):
-                    lid = fix['league']['id']
-                    if lid not in TARGET_LEAGUES:
-                    continue
-                    if fix['fixture']['status']['short'] != 'FT':
-                    continue  # solo contar equipos con partidos terminados
-                    teams_by_league[lid][fix['teams']['home']['id']] = fix['teams']['home']['name']
-                    teams_by_league[lid][fix['teams']['away']['id']] = fix['teams']['away']['name']
-                    if len(teams_by_league[lid]) >= 18:
-                    ligas_completas.add(lid)
+                        lid = fix['league']['id']
+                        if lid not in TARGET_LEAGUES:
+                            continue
+                        if fix['fixture']['status']['short'] != 'FT':
+                            continue  # solo contar equipos con partidos terminados
+                        teams_by_league[lid][fix['teams']['home']['id']] = fix['teams']['home']['name']
+                        teams_by_league[lid][fix['teams']['away']['id']] = fix['teams']['away']['name']
+                        if len(teams_by_league[lid]) >= 18:
+                            ligas_completas.add(lid)
                     time.sleep(0.5)
                 except:
                     pass
@@ -1267,39 +1256,39 @@ class TripleLeagueBot:
                 else:
                     print(f"  ⚠️  {cfg['name']}: sin equipos en los últimos 14 días")
 
-            # ── FASE 2: Cachear last10 por equipo — con techo de budget ────
+            # ── FASE 2: Cachear last10 por equipo — con techo de budget ──────────
             total_cached = total_skipped = 0
 
             for lid, cfg in TARGET_LEAGUES.items():
                 season = self.seasons.get(lid, cfg['seasons'][-1])
                 for team_id, team_name in teams_by_league[lid].items():
                     if reqs_gastados() >= BUDGET_MAX:
-                    print(f"  ⚠️  Budget máximo alcanzado — parando cache")
-                    break
+                        print(f"  ⚠️  Budget máximo alcanzado — parando cache")
+                        break
 
                     # Saltar si ya tiene cache fresca con depth=10
                     try:
-                    conn = sqlite3.connect(DB_PATH)
-                    cc = conn.cursor()
-                    cc.execute(
-                    "SELECT updated_at, depth FROM team_xg_cache WHERE team_id=?",
-                    (team_id,)
-                    )
-                    row = cc.fetchone()
-                    conn.close()
-                    if row:
-                    age = (datetime.now(timezone.utc) -
-                    datetime.fromisoformat(row[0])).total_seconds() / 3600
-                    if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
-                    total_skipped += 1
-                    continue
+                        conn = sqlite3.connect(DB_PATH)
+                        cc = conn.cursor()
+                        cc.execute(
+                            "SELECT updated_at, depth FROM team_xg_cache WHERE team_id=?",
+                            (team_id,)
+                        )
+                        row = cc.fetchone()
+                        conn.close()
+                        if row:
+                            age = (datetime.now(timezone.utc) -
+                                   datetime.fromisoformat(row[0])).total_seconds() / 3600
+                            if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
+                                total_skipped += 1
+                                continue
                     except:
-                    pass
+                        pass
 
                     # fetch_team_xg hace la llamada API internamente — NO hacer track_requests aquí
                     fetch_team_xg(
-                    team_id, season, self.headers,
-                    league_id=lid, use_cache=False, depth=10
+                        team_id, season, self.headers,
+                        league_id=lid, use_cache=False, depth=10
                     )
                     # track_requests ya se llama dentro de fetch_team_xg — no duplicar
                     total_cached += 1
@@ -1307,16 +1296,16 @@ class TripleLeagueBot:
 
                     # Actualizar nombre en cache
                     try:
-                    conn = sqlite3.connect(DB_PATH)
-                    cc = conn.cursor()
-                    cc.execute(
-                    "UPDATE team_xg_cache SET team_name=?, depth=10 WHERE team_id=?",
-                    (team_name, team_id)
-                    )
-                    conn.commit()
-                    conn.close()
+                        conn = sqlite3.connect(DB_PATH)
+                        cc = conn.cursor()
+                        cc.execute(
+                            "UPDATE team_xg_cache SET team_name=?, depth=10 WHERE team_id=?",
+                            (team_name, team_id)
+                        )
+                        conn.commit()
+                        conn.close()
                     except:
-                    pass
+                        pass
 
             req_total = reqs_gastados()
             self.send_msg(
@@ -1381,47 +1370,47 @@ class TripleLeagueBot:
                 cc   = conn.cursor()
                 for b in r[0]['bookmakers'][0]['bets']:
                     for v in b['values']:
-                    mkt_key = f"{b['id']}|{v['value']}"
-                    odd_now = float(v['odd'])
+                        mkt_key = f"{b['id']}|{v['value']}"
+                        odd_now = float(v['odd'])
 
-                    cc.execute(
-                    "SELECT odd_open FROM line_snapshots "
-                    "WHERE fixture_id=? AND market=? ORDER BY id ASC LIMIT 1",
-                    (fid, mkt_key)
-                    )
-                    first = cc.fetchone()
+                        cc.execute(
+                            "SELECT odd_open FROM line_snapshots "
+                            "WHERE fixture_id=? AND market=? ORDER BY id ASC LIMIT 1",
+                            (fid, mkt_key)
+                        )
+                        first = cc.fetchone()
 
-                    if first:
-                    odd_open = first[0]
-                    move = abs(odd_now - odd_open) / odd_open
-                    if move >= LINE_ALERT_MOVE_PCT:
-                    direction = "📉" if odd_now < odd_open else "📈"
-                    alerts.append(
-                    f"{direction} <b>{h_n} vs {a_n}</b>\n"
-                    f"   {v['value']}: {odd_open:.2f} → {odd_now:.2f} "
-                    f"({move*100:+.1f}%)"
-                    )
-                    else:
-                    # Primera vez — este snapshot ES el baseline
-                    cc.execute(
-                    """INSERT INTO line_snapshots
-                    (fixture_id, home_team, away_team, kickoff_time,
-                    market, selection, odd_snapshot, odd_open, captured_at)
-                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (fid, h_n, a_n, ko, mkt_key, v['value'],
-                    odd_now, odd_now, now.isoformat())
-                    )
-                    # Siempre guardar snapshot actual para historial de movimiento
-                    cc.execute(
-                    """INSERT INTO line_snapshots
-                    (fixture_id, home_team, away_team, kickoff_time,
-                    market, selection, odd_snapshot, odd_open, captured_at)
-                    VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (fid, h_n, a_n, ko, mkt_key, v['value'],
-                    odd_now,
-                    first[0] if first else odd_now,
-                    now.isoformat())
-                    )
+                        if first:
+                            odd_open = first[0]
+                            move = abs(odd_now - odd_open) / odd_open
+                            if move >= LINE_ALERT_MOVE_PCT:
+                                direction = "📉" if odd_now < odd_open else "📈"
+                                alerts.append(
+                                    f"{direction} <b>{h_n} vs {a_n}</b>\n"
+                                    f"   {v['value']}: {odd_open:.2f} → {odd_now:.2f} "
+                                    f"({move*100:+.1f}%)"
+                                )
+                        else:
+                            # Primera vez — este snapshot ES el baseline
+                            cc.execute(
+                                """INSERT INTO line_snapshots
+                                   (fixture_id, home_team, away_team, kickoff_time,
+                                    market, selection, odd_snapshot, odd_open, captured_at)
+                                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                                (fid, h_n, a_n, ko, mkt_key, v['value'],
+                                 odd_now, odd_now, now.isoformat())
+                            )
+                        # Siempre guardar snapshot actual para historial de movimiento
+                        cc.execute(
+                            """INSERT INTO line_snapshots
+                               (fixture_id, home_team, away_team, kickoff_time,
+                                market, selection, odd_snapshot, odd_open, captured_at)
+                               VALUES (?,?,?,?,?,?,?,?,?)""",
+                            (fid, h_n, a_n, ko, mkt_key, v['value'],
+                             odd_now,
+                             first[0] if first else odd_now,
+                             now.isoformat())
+                        )
                 conn.commit()
                 conn.close()
                 time.sleep(2.0)
@@ -1460,9 +1449,9 @@ class TripleLeagueBot:
                 # INSERT OR IGNORE para no duplicar si el scan corre dos veces
                 cc.execute(
                     """INSERT OR IGNORE INTO injury_watch
-                    (team_id, team_name, player_name, injury_type, status,
-                    expected_return, captured_at)
-                    VALUES (?,?,?,?,?,?,?)""",
+                       (team_id, team_name, player_name, injury_type, status,
+                        expected_return, captured_at)
+                       VALUES (?,?,?,?,?,?,?)""",
                     (tid, tname, pname, itype, status, 'N/A', now.isoformat())
                 )
             conn.commit()
@@ -1553,17 +1542,17 @@ class TripleLeagueBot:
                     gf     = stats['goals']['for']
                     ga     = stats['goals']['against']
                     cc.execute(
-                    """INSERT INTO league_stats
-                    (season, team_id, team_name, played, wins, draws, losses,
-                    goals_for, goals_against, avg_goals_for, avg_goals_against,
-                    captured_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (season, t['id'], t['name'],
-                    played, stats['win'], stats['draw'], stats['lose'],
-                    gf, ga,
-                    round(gf / played, 3) if played else 0,
-                    round(ga / played, 3) if played else 0,
-                    now.isoformat())
+                        """INSERT INTO league_stats
+                           (season, team_id, team_name, played, wins, draws, losses,
+                            goals_for, goals_against, avg_goals_for, avg_goals_against,
+                            captured_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (season, t['id'], t['name'],
+                         played, stats['win'], stats['draw'], stats['lose'],
+                         gf, ga,
+                         round(gf / played, 3) if played else 0,
+                         round(ga / played, 3) if played else 0,
+                         now.isoformat())
                     )
                     teams_saved += 1
 
@@ -1601,7 +1590,7 @@ class TripleLeagueBot:
                 for fix in r.json().get('response', []):
                     lid = fix['league']['id']
                     if lid in TARGET_LEAGUES:
-                    matches_by_league[lid].append(fix)
+                        matches_by_league[lid].append(fix)
             except:
                 pass
 
@@ -1713,9 +1702,8 @@ class TripleLeagueBot:
                 h_id, a_id, hinj, ainj, season, self.headers, league_id=lid
             )
             print(f"     xG modelo: {h_n}={xh:.2f} {a_n}={xa:.2f} total={xt:.2f} conf={conf} src={xg_src}")
-            track_requests(req_made)  # FIX v6.5: fetch_team_xg NO llama track_requests internamente
-            # req_made = nº de llamadas API reales hechas (0 si ambos equipos vinieron de cache)
             print(f"     Requests usados hasta aquí: {track_requests(0)}/100")
+            track_requests(req_made)  # FIX: tracking exacto de requests reales
 
             # Validar consistencia xG vs mercado
             ok, reason = validate_xg(xh, xa, bets)
@@ -1754,13 +1742,12 @@ class TripleLeagueBot:
                     log_rejection(fid, label, item['mkt'], item['odd'], ev, rej)
                     continue
 
-                print(f"     ✅ CANDIDATO: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.2f}")
-                candidates.append({
+                    print(f"     ✅ CANDIDATO: {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.2f}")
+            candidates.append({
                     **item, 'ev': ev, 'base_stake': kelly,
                     'urs': urs, 'conf': conf, 'xg_src': xg_src,
                     'fid': fid, 'h_n': h_n, 'a_n': a_n, 'ko': ko,
-                    'xh': xh, 'xa': xa, 'xt': xt,
-                    'l_name': l_name  # FIX v6.5: liga correcta por pick
+                    'xh': xh, 'xa': xa, 'xt': xt
                 })
 
             if not candidates:
@@ -1785,16 +1772,16 @@ class TripleLeagueBot:
             for p in final:
                 c.execute("""INSERT INTO picks_log
                     (fixture_id, league, home_team, away_team, market, selection,
-                    selection_key, odd_open, prob_model, ev_open, stake_pct,
-                    xg_home, xg_away, xg_total, pick_time, kickoff_time, urs,
-                    model_gap, xg_source)
+                     selection_key, odd_open, prob_model, ev_open, stake_pct,
+                     xg_home, xg_away, xg_total, pick_time, kickoff_time, urs,
+                     model_gap, xg_source)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (p['fid'], p['l_name'], p['h_n'], p['a_n'], p['mkt'], p['pick'],
-                    f"{p['bid']}|{p['val']}", p['odd'], p['prob'], p['ev'],
-                    p['final_stake'] if LIVE_TRADING else 0.0,
-                    p['xh'], p['xa'], p['xt'],
-                    datetime.now(timezone.utc).isoformat(), p['ko'],
-                    p['urs'], p['model_gap'], p['xg_src'])
+                    (p['fid'], LEAGUE_NAME, p['h_n'], p['a_n'], p['mkt'], p['pick'],
+                     f"{p['bid']}|{p['val']}", p['odd'], p['prob'], p['ev'],
+                     p['final_stake'] if LIVE_TRADING else 0.0,
+                     p['xh'], p['xa'], p['xt'],
+                     datetime.now(timezone.utc).isoformat(), p['ko'],
+                     p['urs'], p['model_gap'], p['xg_src'])
                 )
                 conf_icon = "✅" if p['conf'] == "HIGH" else "⚠️ MED" if p['conf'] == "MED" else "❌ LOW"
                 gap_str   = f"+{p['model_gap']*100:.1f}%" if p['model_gap'] >= 0 else f"{p['model_gap']*100:.1f}%"
@@ -1822,7 +1809,7 @@ class TripleLeagueBot:
 if __name__ == "__main__":
     bot = TripleLeagueBot()
 
-    # ── TAREAS DIARIAS ────
+    # ── TAREAS DIARIAS ──────────────────────────────────────────────
     # Scan D-1 a las 09:00 UTC: captura cuotas de apertura líquidas
     schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
     # Captura intermedia a las 12:30 UTC del día del partido (2-6h antes del KO)
@@ -1830,7 +1817,7 @@ if __name__ == "__main__":
     # Cierre final: polling cada 30min, actúa solo si quedan ≤60min para el KO
     schedule.every(30).minutes.do(bot.capture_closing_lines)
 
-    # ── TAREAS SEMANALES (días sin jornada) ────
+    # ── TAREAS SEMANALES (días sin jornada) ──────────────────────
     # Lunes 08:00 UTC — pre-caché xG 24 equipos (~24 req, ahorra ~20 en el scan)
     schedule.every().monday.at(RUN_TIME_XG_CACHE).do(bot.weekly_xg_cache)
     # Martes 10:00 UTC — monitoreo movimiento de cuotas próxima jornada (~10 req)
@@ -1865,11 +1852,11 @@ if __name__ == "__main__":
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""SELECT ((p.odd_open-c.odd_close)/p.odd_open)*100, p.market
-                    FROM picks_log p JOIN closing_lines c
-                    ON p.fixture_id=c.fixture_id
-                    AND p.market=c.market
-                    AND p.selection_key=c.selection_key
-                    WHERE p.clv_captured=1""")
+                     FROM picks_log p JOIN closing_lines c
+                       ON p.fixture_id=c.fixture_id
+                          AND p.market=c.market
+                          AND p.selection_key=c.selection_key
+                     WHERE p.clv_captured=1""")
         picks = c.fetchall()
         conn.close()
         if picks:
@@ -1888,12 +1875,12 @@ if __name__ == "__main__":
     except:
         pass
 
-    # ── AUTO-WARMUP DE CACHE ────
+    # ── AUTO-WARMUP DE CACHE ────────────────────────────────────────────────
     # Si la cache de xG está vacía (primer deploy o DB nueva), ejecutar
     # weekly_xg_cache antes del scan para que los picks tengan xG real.
     # Sin cache, fetch_team_xg usa last6 por league+season que puede estar
     # bloqueado en Free tier — resultando en xG LOW y picks no confiables.
-    # ── AUTO-WARMUP: solo si cache vacía Y hay suficiente budget ────
+    # ── AUTO-WARMUP: solo si cache vacía Y hay suficiente budget ───────────────
     cache_count = 0
     try:
         conn_check = sqlite3.connect(DB_PATH)
@@ -1948,7 +1935,7 @@ if __name__ == "__main__":
             # Buscar hace 7 días — debería tener partidos de Brasileirao si la liga es activa
             _d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
             _r = _req.get("https://v3.football.api-sports.io/fixtures",
-                    headers=_h, params={"date": _d}, timeout=10)
+                          headers=_h, params={"date": _d}, timeout=10)
             _resp = _r.json().get('response', [])
             _bra  = [f for f in _resp if f['league']['id'] == 71]
             _all_leagues = list(set(f['league']['id'] for f in _resp))
@@ -1960,7 +1947,7 @@ if __name__ == "__main__":
                 # Buscar hace 100 días — temporada 2025 de Brasileirao
                 _d2 = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
                 _r2 = _req.get("https://v3.football.api-sports.io/fixtures",
-                    headers=_h, params={"date": _d2}, timeout=10)
+                               headers=_h, params={"date": _d2}, timeout=10)
                 _resp2 = _r2.json().get('response', [])
                 _bra2  = [f for f in _resp2 if f['league']['id'] == 71]
                 print(f"  🔍 DIAG: fecha {_d2} (100d atrás) → {len(_resp2)} fixtures | liga71={len(_bra2)}")
