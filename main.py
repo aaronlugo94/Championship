@@ -493,6 +493,13 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
         all_day = _get_fixtures_for_date(d, headers)
         if not already_cached:
             days_searched += 1
+            # Log de diagnóstico: mostrar qué ligas hay en esta fecha
+            league_ids_in_date = list(set(f['league']['id'] for f in all_day))
+            team_ids_in_date   = [f['teams']['home']['id'] for f in all_day] + [f['teams']['away']['id'] for f in all_day]
+            if team_id in team_ids_in_date:
+                matching = [f for f in all_day if f['teams']['home']['id'] == team_id or f['teams']['away']['id'] == team_id]
+                for mf in matching:
+                    print(f"    xG [{team_id}] encontrado en {d}: liga={mf['league']['id']} status={mf['fixture']['status']['short']} score={mf['goals']['home']}-{mf['goals']['away']}")
         for fix in all_day:
             if fix['league']['id'] != league_id:
                 continue
