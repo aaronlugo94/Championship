@@ -240,7 +240,13 @@ def sync_request_counter(headers):
             "https://v3.football.api-sports.io/status",
             headers=headers, timeout=10
         )
-        data    = r.json().get('response', {})
+        raw  = r.json()
+        # api-football devuelve dict normalmente, pero lista cuando throttlea
+        resp = raw if isinstance(raw, dict) else {}
+        data    = resp.get('response', {})
+        # response puede ser lista (throttled) o dict (normal)
+        if isinstance(data, list):
+            data = data[0] if data else {}
         current = data.get('requests', {}).get('current', None)
         if current is None:
             return
@@ -874,9 +880,13 @@ class TripleLeagueBot:
                 timeout=10
             )
             track_requests(1)
-            data    = r.json().get('response', {})
-            sub     = data.get('subscription', {})
-            reqs    = data.get('requests', {})
+            raw_resp = r.json()
+            data     = raw_resp if isinstance(raw_resp, dict) else {}
+            resp_val = data.get('response', {})
+            if isinstance(resp_val, list):
+                resp_val = resp_val[0] if resp_val else {}
+            sub  = resp_val.get('subscription', {})
+            reqs = resp_val.get('requests', {})
             plan    = sub.get('plan', 'Unknown')
             active  = sub.get('active', False)
             current = reqs.get('current', '?')
