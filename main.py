@@ -964,13 +964,7 @@ def ingest_results_into_xg_cache(headers):
 class TripleLeagueBot:
     def __init__(self):
         init_db()
-        # TEMP: limpiar cache corrupta — borrar después del primer deploy exitoso
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("DELETE FROM team_xg_cache")
-        conn.execute("DELETE FROM xg_result_log")
-        conn.commit()
-        conn.close()
-        print("  🧹 Cache limpiada — arrancando desde cero")
+        
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
 
         # Sincronizar contador de requests con la API real antes de cualquier lógica
@@ -1233,7 +1227,7 @@ class TripleLeagueBot:
             teams_by_league = {lid: {} for lid in TARGET_LEAGUES}  # {lid: {team_id: name}}
             ligas_completas  = set()  # ligas con >= 18 equipos encontrados
 
-            for days_back in range(1, 16):   # 15 fechas hacia atrás (sin hoy — partidos no terminados)
+            for days_back in range(1, 36):   # 15 fechas hacia atrás (sin hoy — partidos no terminados)
                 if reqs_gastados() >= BUDGET_MAX:
                     break
                 if len(ligas_completas) == len(TARGET_LEAGUES):
