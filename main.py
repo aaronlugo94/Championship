@@ -964,6 +964,13 @@ def ingest_results_into_xg_cache(headers):
 class TripleLeagueBot:
     def __init__(self):
         init_db()
+        # TEMP: limpiar cache corrupta — borrar después del primer deploy exitoso
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM team_xg_cache")
+        conn.execute("DELETE FROM xg_result_log")
+        conn.commit()
+        conn.close()
+        print("  🧹 Cache limpiada — arrancando desde cero")
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
 
         # Sincronizar contador de requests con la API real antes de cualquier lógica
