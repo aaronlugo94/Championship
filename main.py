@@ -1238,32 +1238,51 @@ class TripleLeagueV72:
                 odd_close=None
                 cfg=TARGET_LEAGUES.get(div,{})
 
+                def _clv_1x2(co, home_n, away_n, sel_str):
+                    """Fuzzy match para saber si apostamos home, away o empate."""
+                    if "Empate" in sel_str: return co.get("D")
+                    team = sel_str.replace("Gana ","").strip()
+                    sh = difflib.SequenceMatcher(None, team.lower(), home_n.lower()).ratio()
+                    sa = difflib.SequenceMatcher(None, team.lower(), away_n.lower()).ratio()
+                    if sh >= 0.60 and sh >= sa: return co.get("H")
+                    if sa >= 0.60 and sa > sh:  return co.get("A")
+                    return None   # no identificado
+
                 if div=="MEX":
                     # [3] api-football para cerrar MEX
                     close=get_mx_odds(fid, self.apif_h)
                     if close:
-                        if mkt=="OVER":  odd_close=close.get("O25")
+                        if mkt=="OVER":   odd_close=close.get("O25")
                         elif mkt=="UNDER": odd_close=close.get("U25")
-                        elif mkt=="1X2":
-                            if home in sel: odd_close=close.get("H")
-                            elif away in sel: odd_close=close.get("A")
-                            else: odd_close=close.get("D")
-                        elif mkt=="BTTS": odd_close=close.get("BTTS_Y")
+                        elif mkt=="1X2":   odd_close=_clv_1x2(close, home, away, sel)
+                        elif mkt=="BTTS":  odd_close=close.get("BTTS_Y")
+                elif div=="BSA":
+                    # [2] fd.org Trend Resource para cerrar BSA — 0 req extra si ya se llamó hoy
+                    today_d=datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    fd_codes={"BSA": cfg.get("fbd_code","BSA")}
+                    ts_map=fetch_trends(today_d, fd_codes)
+                    ts=extract_trend(ts_map, home, away, "BSA", today_d)
+                    if ts:
+                        co={"H":ts.get("home_odd"),"D":ts.get("draw_odd"),
+                            "A":ts.get("away_odd"),"O25":ts.get("ou25_odd")}
+                        if mkt=="OVER":   odd_close=co.get("O25")
+                        elif mkt=="UNDER":
+                            o=co.get("O25")
+                            odd_close=round(1/(1-1/o),2) if o and o>1.01 else None
+                        elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
+                        elif mkt=="BTTS":  odd_close=ts.get("bts_odd")
                 elif fix_df is not None:
-                    # [1] fixtures.csv para europeas
+                    # [1] fixtures.csv para europeas (E0,E1,SP1,D1,I1,F1,N1,P1)
                     rh=difflib.get_close_matches(home,fix_df["HomeTeam"].dropna().unique(),n=1,cutoff=0.6)
                     ra=difflib.get_close_matches(away,fix_df["AwayTeam"].dropna().unique(),n=1,cutoff=0.6)
                     if rh and ra:
                         m=fix_df[(fix_df["HomeTeam"]==rh[0])&(fix_df["AwayTeam"]==ra[0])]
                         if not m.empty:
                             co=get_odds_from_row(m.iloc[0],cfg)
-                            if mkt=="OVER":  odd_close=co.get("O25")
+                            if mkt=="OVER":   odd_close=co.get("O25")
                             elif mkt=="UNDER": odd_close=co.get("U25")
-                            elif mkt=="1X2":
-                                if home in sel: odd_close=co.get("H")
-                                elif away in sel: odd_close=co.get("A")
-                                else: odd_close=co.get("D")
-                            elif mkt=="BTTS": odd_close=co.get("BTTS_Y")
+                            elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
+                            elif mkt=="BTTS":  odd_close=co.get("BTTS_Y")
 
                 if odd_close and odd_open:
                     clv_pct=(odd_close/odd_open-1)*100
