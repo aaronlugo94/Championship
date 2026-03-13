@@ -475,7 +475,7 @@ def fetch_team_xg(team_id, season, headers, league_id=40, use_cache=True, depth=
             row = cc.fetchone()
             conn_c.close()
             if row:
-                updated  = datetime.fromisoformat(row[5])
+                updated  = datetime.fromisoformat(row[5].replace("+00:00", "")).replace(tzinfo=timezone.utc)
                 age_h    = (datetime.now(timezone.utc) - updated).total_seconds() / 3600
                 if age_h < XG_CACHE_TTL_HOURS:
                     gf = json.loads(row[0])
@@ -964,7 +964,6 @@ def ingest_results_into_xg_cache(headers):
 class TripleLeagueBot:
     def __init__(self):
         init_db()
-        
         self.headers = {'x-apisports-key': API_SPORTS_KEY}
 
         # Sincronizar contador de requests con la API real antes de cualquier lógica
@@ -1227,7 +1226,7 @@ class TripleLeagueBot:
             teams_by_league = {lid: {} for lid in TARGET_LEAGUES}  # {lid: {team_id: name}}
             ligas_completas  = set()  # ligas con >= 18 equipos encontrados
 
-            for days_back in range(1, 36):   # 15 fechas hacia atrás (sin hoy — partidos no terminados)
+            for days_back in range(1, 16):   # 15 fechas hacia atrás (sin hoy — partidos no terminados)
                 if reqs_gastados() >= BUDGET_MAX:
                     break
                 if len(ligas_completas) == len(TARGET_LEAGUES):
@@ -1286,7 +1285,7 @@ class TripleLeagueBot:
                         conn.close()
                         if row:
                             age = (datetime.now(timezone.utc) -
-                                   datetime.fromisoformat(row[0])).total_seconds() / 3600
+                                   datetime.fromisoformat(row[0].replace("+00:00", "")).replace(tzinfo=timezone.utc)).total_seconds() / 3600
                             if age < XG_CACHE_TTL_HOURS and (row[1] or 0) >= 10:
                                 total_skipped += 1
                                 continue
