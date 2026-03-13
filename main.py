@@ -94,7 +94,7 @@ RUN_TIME_INJURY_WATCH = "08:00"   # Miércoles: lesiones activas
 RUN_TIME_LEAGUE_STATS = "08:00"   # Jueves: standings + stats de temporada
 
 # Cache TTL: si el dato tiene menos de N horas, no volver a llamar la API
-XG_CACHE_TTL_HOURS    = 20        # re-cachear si el dato tiene >20h de antigüedad
+XG_CACHE_TTL_HOURS    = 168       # 7 días — ingest_results actualiza tras cada FT orgánicamente
 LINE_ALERT_MOVE_PCT   = 0.08      # alertar si la cuota se mueve >8% desde apertura
 
 
