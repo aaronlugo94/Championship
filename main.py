@@ -711,9 +711,15 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
                         "model_gap":round(prob-1/(odd_val*1.05),4)})
 
     # ── O/U 2.5 ──────────────────────────────────────────────────────────
+    has_trend = ts.get("pct_o25") is not None
     po_raw, _ = negbinom_ou(xh+xa, std)
     po = shrink(blend(po_raw, ts.get("pct_o25")))
     pu = 1 - po
+    # Sin Trend empírico, el modelo opera puro — aplicar shrinkage extra
+    # para Under (ligas defensivas generan bias sin corrección de mercado)
+    if not has_trend:
+        pu = shrink(pu, a=0.65)   # más conservador sin datos de mercado
+        po = 1 - pu
     # Cuota Over: CSV/api-football primero, Trend como fallback
     o25 = odds.get("O25") or ts.get("ou25_odd")
     u25 = odds.get("U25")
