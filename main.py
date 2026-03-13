@@ -917,6 +917,17 @@ class TripleLeagueV72:
         except Exception as e:
             send_msg(f"🚀 V7.2 iniciado ({e})")
 
+        # ── BURN-IN EVALUATOR ─────────────────────────────────
+        try:
+            from burn_in_evaluator import print_burn_in_report
+            r = print_burn_in_report(DB_PATH)
+            if r['ready_for_live'] and not LIVE_TRADING:
+                send_msg("🟢 <b>BURN-IN SUPERADO.</b> Activar LIVE_TRADING manualmente.")
+        except ImportError:
+            print("  ⚠️ burn_in_evaluator.py no encontrado — omitiendo evaluación.", flush=True)
+        except Exception as e:
+            print(f"  ⚠️ burn-in eval: {e}", flush=True)
+
     def _filter(self, probs, label, fid, h_n, a_n, ko, xh, xa, xt, conf, src, div, ts):
         """Aplica filtros y retorna candidatos válidos listos para el portfolio."""
         cands=[]
