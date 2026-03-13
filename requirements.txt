@@ -1,5 +1,6 @@
 requests
 schedule
-google-genai
+pandas
 numpy
 scipy>=1.11.0
+openpyxl
