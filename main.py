@@ -977,7 +977,7 @@ class TripleLeagueV72:
             csv.writer(f).writerow([
                 today_str,p["div"],p["h_n"],p["a_n"],
                 p["pick"],p["mkt"],p["prob"],p["odd"],p["ev"],
-                "PENDING",p["final_stake"] if LIVE_TRADING else 0.0,0,
+                "PENDING",p["final_stake"],0,
                 p["xh"],p["xa"],"","",
                 p.get("trend_pct_o25",""),p.get("trend_pct_bts",""),p["xg_src"]
             ])
