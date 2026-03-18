@@ -1,5 +1,4 @@
 requests
-schedule
 pandas
 numpy
 scipy>=1.11.0
