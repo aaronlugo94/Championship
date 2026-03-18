@@ -1,4 +1,4 @@
-import os, time, math, json, csv, io, difflib, requests, schedule, sqlite3, numpy as np
+import os, time, math, json, csv, io, difflib, requests, sqlite3, numpy as np
 from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
@@ -144,7 +144,7 @@ KELLY   = 0.20
 MAX_STK = 0.04
 MAX_HEAT= 0.10
 TGT_VOL = 0.05
-VOL_BKT = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25}
+VOL_BKT = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25, "DC": 1.10}
 DC_RHO  = -0.13
 XG_TTL  = 72      # horas cache xG
 XG_DEC  = 0.85    # decay temporal
@@ -166,7 +166,8 @@ def init_db():
         pick_time DATETIME, kickoff_time TEXT,
         clv_captured INTEGER DEFAULT 0,
         urs REAL DEFAULT 0.0, model_gap REAL DEFAULT 0.0,
-        result TEXT DEFAULT 'PENDING', profit REAL DEFAULT 0.0
+        result TEXT DEFAULT 'PENDING', profit REAL DEFAULT 0.0,
+        UNIQUE(fixture_id, market, selection)
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS team_xg_cache (
         team_key TEXT PRIMARY KEY, div TEXT, team_name TEXT,
@@ -710,6 +711,32 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
             out.append({"mkt":"1X2","pick":pick,"odd":odd_val,"prob":prob,
                         "model_gap":round(prob-1/(odd_val*1.05),4)})
 
+    # ── DOUBLE CHANCE ────────────────────────────────────────────────────
+    # DC calculado de probabilidades Dixon-Coles ya calibradas
+    # 1X2 odds → DC odds via fair value (sin vig 1.04)
+    if conf != "LOW" and oh and od and oa:
+        dc_1x  = ph + pd_   # Local o Empate
+        dc_x2  = pd_ + pa   # Empate o Visitante
+        dc_12  = ph + pa    # Local o Visitante (sin empate)
+        # Cuota fair DC = 1 / prob; aplicar vig mínimo de DC (más bajo que 1X2)
+        for dc_prob, dc_pick, vig in [
+            (dc_1x, f"DC: {h_n} o Empate", 1.04),
+            (dc_x2, f"DC: Empate o {a_n}", 1.04),
+            (dc_12, f"DC: {h_n} o {a_n}",  1.04),
+        ]:
+            if dc_prob > 0.01:
+                # Cuota fair implícita desde probs del mercado
+                if dc_pick.endswith("o Empate"):
+                    dc_odd = 1/(1/oh + 1/od) if oh and od else None
+                elif dc_pick.endswith(f"o {a_n}"):
+                    dc_odd = 1/(1/od + 1/oa) if od and oa else None
+                else:
+                    dc_odd = 1/(1/oh + 1/oa) if oh and oa else None
+                if dc_odd and dc_odd > 1.01:
+                    out.append({"mkt":"DC","pick":dc_pick,"odd":round(dc_odd,2),
+                                "prob":dc_prob,
+                                "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
+
     # ── O/U 2.5 ──────────────────────────────────────────────────────────
     has_trend = ts.get("pct_o25") is not None
     po_raw, _ = negbinom_ou(xh+xa, std)
@@ -763,7 +790,7 @@ def validate_xg(xh, xa, oh, oa, o25):
     return True, None
 
 def sanity(p, mkt, odd):
-    VIG={"OVER":1.07,"UNDER":1.07,"1X2":1.05,"BTTS":1.06}
+    VIG={"OVER":1.07,"UNDER":1.07,"1X2":1.05,"BTTS":1.06,"DC":1.04}
     gap=abs(p-1/(odd*VIG.get(mkt,1.06)))
     if gap>0.18: return False,f"SANITY_FAIL(gap={gap:.2f})"
     return True, None
@@ -821,6 +848,16 @@ def check_result(pick, mkt, fthg, ftag, home_name="", away_name=""):
     if mkt=="BTTS":
         y=hg>0 and ag>0
         return "WIN" if ("Sí" in pick and y) or ("No" in pick and not y) else "LOSS"
+    if mkt=="DC":
+        if "o Empate" in pick and not pick.startswith("DC: Empate"):
+            # 1X: local gana o empate
+            return "WIN" if hg>=ag else "LOSS"
+        elif pick.count(" o ") == 1 and "Empate o" in pick:
+            # X2: empate o visitante gana
+            return "WIN" if hg<=ag else "LOSS"
+        else:
+            # 12: cualquier equipo gana (no empate)
+            return "WIN" if hg!=ag else "LOSS"
     if mkt=="1X2":
         if "Empate" in pick: return "WIN" if hg==ag else "LOSS"
         # Extraer el nombre del equipo del pick: "Gana Arsenal" → "Arsenal"
@@ -955,9 +992,9 @@ class TripleLeagueV72:
         return cands
 
     def _save_pick(self, p, today_str, conn_c):
-        """Guarda pick en DB y CSV de auditoría."""
+        """Guarda pick en DB y CSV de auditoría. INSERT OR IGNORE previene duplicados."""
         cfg_p=TARGET_LEAGUES.get(p["div"],{})
-        conn_c.execute("""INSERT INTO picks_log
+        conn_c.execute("""INSERT OR IGNORE INTO picks_log
             (fixture_id,league,div,home_team,away_team,market,selection,
              odd_open,prob_model,ev_open,stake_pct,
              xg_home,xg_away,xg_total,xg_source,
@@ -967,20 +1004,22 @@ class TripleLeagueV72:
             (str(p["fid"]),cfg_p.get("name",""),p["div"],p["h_n"],p["a_n"],
              p["mkt"],p["pick"],
              p["odd"],p["prob"],p["ev"],
-             p["final_stake"] if LIVE_TRADING else 0.0,
+             p["final_stake"],
              p["xh"],p["xa"],p["xt"],p["xg_src"],
              p.get("trend_pct_o25"),p.get("trend_pct_bts"),
              datetime.now(timezone.utc).isoformat(),p["ko"],
              p["urs"],p["model_gap"])
         )
-        with open(AUDIT_CSV,"a",newline="",encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                today_str,p["div"],p["h_n"],p["a_n"],
-                p["pick"],p["mkt"],p["prob"],p["odd"],p["ev"],
-                "PENDING",p["final_stake"],0,
-                p["xh"],p["xa"],"","",
-                p.get("trend_pct_o25",""),p.get("trend_pct_bts",""),p["xg_src"]
-            ])
+        # Solo escribir al CSV si realmente se insertó (no era duplicado)
+        if conn_c.rowcount > 0:
+            with open(AUDIT_CSV,"a",newline="",encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    today_str,p["div"],p["h_n"],p["a_n"],
+                    p["pick"],p["mkt"],p["prob"],p["odd"],p["ev"],
+                    "PENDING",p["final_stake"],0,
+                    p["xh"],p["xa"],"","",
+                    p.get("trend_pct_o25",""),p.get("trend_pct_bts",""),p["xg_src"]
+                ])
 
     def _report_pick(self, p):
         """Envía mensaje Telegram para un pick."""
@@ -1357,23 +1396,77 @@ class TripleLeagueV72:
         send_msg(f"📊 <b>Standings V7.2:</b> {', '.join(updated)}")
 
 # ============================================================
-# SCHEDULER
+# SCHEDULER — horas UTC fijas, independiente del boot
 # ============================================================
+
+def _hhmm(t_str):
+    """'06:00' → (6, 0)"""
+    h, m = t_str.split(":")
+    return int(h), int(m)
 
 if __name__ == "__main__":
     bot = TripleLeagueV72()
 
-    schedule.every().day.at(RUN_TIME_CSV_UPDATE).do(bot.refresh_csvs)
-    schedule.every().day.at(RUN_TIME_AUDIT).do(run_audit)
-    schedule.every().day.at(RUN_TIME_AUDIT).do(calc_pnl)
-    schedule.every().day.at(RUN_TIME_SCAN).do(bot.run_daily_scan)
-    schedule.every().day.at(RUN_TIME_CLV).do(bot.capture_clv)
-    schedule.every().tuesday.at(RUN_TIME_STANDINGS).do(bot.weekly_standings)
+    # Registro de última ejecución por tarea (fecha UTC)
+    _last_run = {}
 
-    if os.getenv("SELF_TEST","False") == "True":
+    def _ran_today(key):
+        return _last_run.get(key) == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _mark_ran(key):
+        _last_run[key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _ran_this_week(key):
+        return _last_run.get(key) == datetime.now(timezone.utc).strftime("%Y-W%W")
+
+    def _mark_ran_week(key):
+        _last_run[key] = datetime.now(timezone.utc).strftime("%Y-W%W")
+
+    if os.getenv("SELF_TEST", "False") == "True":
         bot.refresh_csvs()
         bot.run_daily_scan()
 
+    CSV_H,  CSV_M  = _hhmm(RUN_TIME_CSV_UPDATE)   # 06:00
+    AUDIT_H,AUDIT_M= _hhmm(RUN_TIME_AUDIT)         # 07:00
+    SCAN_H, SCAN_M = _hhmm(RUN_TIME_SCAN)           # 11:00
+    CLV_H,  CLV_M  = _hhmm(RUN_TIME_CLV)            # 16:00
+    STAND_H,STAND_M= _hhmm(RUN_TIME_STANDINGS)      # 09:00 martes
+
+    print("⏰ Scheduler UTC activo", flush=True)
     while True:
-        schedule.run_pending()
+        now = datetime.now(timezone.utc)
+        hh, mm = now.hour, now.minute
+
+        # 06:00 — refresh CSVs
+        if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
+            _mark_ran("csv")
+            try: bot.refresh_csvs()
+            except Exception as e: print(f"⚠️ refresh_csvs: {e}", flush=True)
+
+        # 07:00 — audit + pnl
+        if (hh, mm) == (AUDIT_H, AUDIT_M) and not _ran_today("audit"):
+            _mark_ran("audit")
+            try: run_audit()
+            except Exception as e: print(f"⚠️ run_audit: {e}", flush=True)
+            try: calc_pnl()
+            except Exception as e: print(f"⚠️ calc_pnl: {e}", flush=True)
+
+        # 11:00 — scan principal
+        if (hh, mm) == (SCAN_H, SCAN_M) and not _ran_today("scan"):
+            _mark_ran("scan")
+            try: bot.run_daily_scan()
+            except Exception as e: print(f"⚠️ run_daily_scan: {e}", flush=True)
+
+        # 16:00 — capture CLV
+        if (hh, mm) == (CLV_H, CLV_M) and not _ran_today("clv"):
+            _mark_ran("clv")
+            try: bot.capture_clv()
+            except Exception as e: print(f"⚠️ capture_clv: {e}", flush=True)
+
+        # Martes 09:00 — standings
+        if now.weekday() == 1 and (hh, mm) == (STAND_H, STAND_M) and not _ran_this_week("standings"):
+            _mark_ran_week("standings")
+            try: bot.weekly_standings()
+            except Exception as e: print(f"⚠️ weekly_standings: {e}", flush=True)
+
         time.sleep(30)
