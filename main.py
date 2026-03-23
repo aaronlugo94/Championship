@@ -262,9 +262,16 @@ def download_csv(div, force=False):
         return path if os.path.exists(path) else None
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if r.status_code == 200:
-            with open(path, "wb") as f: f.write(r.content)
-            print(f"  📥 {div} descargado ({len(r.content)//1024}KB)", flush=True)
+        if r.status_code == 200 and len(r.content) > 500:
+            # Validar que es CSV real (primera línea debe tener comas)
+            first_line = r.content[:200].decode("utf-8", errors="ignore").split("\n")[0]
+            if "," in first_line:
+                with open(path, "wb") as f: f.write(r.content)
+                print(f"  📥 {div} descargado ({len(r.content)//1024}KB)", flush=True)
+            else:
+                print(f"  ⚠️ {div}: respuesta no es CSV válido — conservando archivo anterior", flush=True)
+        elif r.status_code != 200:
+            print(f"  ⚠️ {div}: HTTP {r.status_code} — conservando archivo anterior", flush=True)
         return path
     except Exception as e:
         print(f"  ⚠️ CSV {div}: {e}", flush=True)
@@ -557,7 +564,7 @@ def get_mx_season(headers):
     El Clausura 2026 puede estar catalogado como season=2025 o season=2026
     dependiendo de cómo indexe api-football ese torneo.
     Llama /leagues?id=262, busca el season con 'current: true'.
-    Fallback: 2025 si falla.
+    Fallback: 2026 si falla.
     """
     try:
         res = apif_get("leagues", {"id": 262}, headers)
@@ -565,13 +572,22 @@ def get_mx_season(headers):
             seasons = entry.get("seasons", [])
             for s in seasons:
                 if s.get("current"):
-                    yr = s.get("year", 2025)
+                    yr = s.get("year", 2026)
                     print(f"  ✅ Liga MX season activo: {yr}", flush=True)
                     return yr
+        # Si no hay current=true, usar el más reciente
+        all_years = []
+        for entry in res:
+            for s in entry.get("seasons", []):
+                all_years.append(s.get("year", 0))
+        if all_years:
+            yr = max(all_years)
+            print(f"  ⚠️ Liga MX: sin season current, usando más reciente: {yr}", flush=True)
+            return yr
     except Exception as e:
         print(f"  ⚠️ get_mx_season: {e}", flush=True)
-    print("  ⚠️ Liga MX season: usando fallback 2025", flush=True)
-    return 2025
+    print("  ⚠️ Liga MX season: usando fallback 2026", flush=True)
+    return 2026
 
 def get_mx_fixtures(dates, headers):
     """Fixtures Liga MX para mañana y pasado mañana. ~3 req (1 season + 2 fixtures)."""
