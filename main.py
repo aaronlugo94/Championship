@@ -108,6 +108,15 @@ TARGET_LEAGUES = {
     "P1":  {"name": "🇵🇹 Primeira",       "liq": 0.82, "xg_std": 1.50, "avg_goals": 2.50,
              "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
              "fbd_code": "PPL", "source": "csv_euro", "league_factor": 0.93},
+    "B1":  {"name": "🇧🇪 Jupiler",        "liq": 0.82, "xg_std": 1.58, "avg_goals": 2.72,
+             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.95},
+    "T1":  {"name": "🇹🇷 Süper Lig",      "liq": 0.80, "xg_std": 1.62, "avg_goals": 2.68,
+             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
+    "G1":  {"name": "🇬🇷 Super League",   "liq": 0.78, "xg_std": 1.55, "avg_goals": 2.48,
+             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
     # ── BSA — goles proxy + Trend fd.org + fixtures fd.org ───────────────
     "BSA": {"name": "🇧🇷 Brasileirao",    "liq": 0.80, "xg_std": 1.54, "avg_goals": 2.39,
              "conv_home": None, "conv_away": None, "has_shots": False,
@@ -129,6 +138,9 @@ CSV_URLS = {
     "P1":  "https://www.football-data.co.uk/mmz4281/2526/P1.csv",
     "BSA": "https://www.football-data.co.uk/new/BSA.csv",
     "MEX": "https://www.football-data.co.uk/new/MEX.csv",
+    "B1":  "https://www.football-data.co.uk/mmz4281/2526/B1.csv",
+    "T1":  "https://www.football-data.co.uk/mmz4281/2526/T1.csv",
+    "G1":  "https://www.football-data.co.uk/mmz4281/2526/G1.csv",
 }
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
