@@ -1615,7 +1615,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <button class="filter-btn" data-filter="DC">dc</button>
   <button class="filter-btn" data-filter="1X2">1x2</button>
   <input id="search" type="text" placeholder="buscar equipo / liga...">
-  <button id="sync-btn" class="filter-btn" style="margin-left:8px;border-color:#4ade80;color:#4ade80;" onclick="syncData()">sincronizar DB</button>
+  <button id="sync-btn" style="margin-left:8px;font-family:'DM Mono',monospace;font-size:0.72rem;padding:6px 14px;border:1px solid #4ade80;background:transparent;color:#4ade80;border-radius:99px;cursor:pointer;" onclick="syncData()">sincronizar DB</button>
 </div>
 
 <div class="table-wrap">
@@ -1737,9 +1737,9 @@ function render() {
   document.getElementById('picks-body').innerHTML = rows;
 }
 
-document.querySelectorAll('.filter-btn').forEach(btn => {
+document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     activeFilter = btn.dataset.filter;
     render();
