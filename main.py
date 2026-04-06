@@ -1432,7 +1432,409 @@ def _hhmm(t_str):
     h, m = t_str.split(":")
     return int(h), int(m)
 
+
+# ============================================================
+# DASHBOARD WEB — servidor HTTP en hilo separado
+# ============================================================
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V7.2 Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #111118;
+    --border: #1e1e2e;
+    --accent: #7c6fff;
+    --accent2: #ff6b6b;
+    --green: #4ade80;
+    --red: #f87171;
+    --text: #e2e2f0;
+    --muted: #6b6b8a;
+    --card: #13131f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Syne', sans-serif; min-height: 100vh; }
+  
+  header {
+    padding: 2rem 2.5rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 1.5rem;
+  }
+  header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+  header span { font-family: 'DM Mono', monospace; font-size: 0.75rem; color: var(--muted); }
+  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px;
+    border: 1px solid var(--border);
+    margin: 2rem 2.5rem;
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .stat {
+    background: var(--card);
+    padding: 1.25rem 1.5rem;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .stat-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-family: 'DM Mono', monospace; }
+  .stat-value { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.03em; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.neutral { color: var(--text); }
+
+  .filters {
+    padding: 0 2.5rem 1rem;
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  }
+  .filter-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    border-radius: 99px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .filter-btn:hover, .filter-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(124,111,255,0.08); }
+  .filter-btn.active { font-weight: 500; }
+  #search {
+    margin-left: auto;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    border-radius: 8px;
+    outline: none;
+    width: 200px;
+  }
+  #search:focus { border-color: var(--accent); }
+
+  .table-wrap { padding: 0 2.5rem 2.5rem; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  thead th {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+  }
+  thead th:hover { color: var(--text); }
+  thead th.sorted { color: var(--accent); }
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    transition: background 0.1s;
+  }
+  tbody tr:hover { background: var(--card); }
+  tbody td { padding: 10px 12px; white-space: nowrap; font-family: 'DM Mono', monospace; font-size: 0.78rem; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+  }
+  .badge-win { background: rgba(74,222,128,0.12); color: var(--green); }
+  .badge-loss { background: rgba(248,113,113,0.12); color: var(--red); }
+  .badge-pending { background: rgba(124,111,255,0.12); color: var(--accent); }
+  .badge-under { background: rgba(99,185,255,0.12); color: #63b9ff; }
+  .badge-over { background: rgba(255,165,82,0.12); color: #ffa552; }
+  .badge-dc { background: rgba(200,150,255,0.12); color: #c896ff; }
+  .badge-1x2 { background: rgba(255,220,80,0.12); color: #ffdc50; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .muted { color: var(--muted); }
+
+  .empty { text-align: center; padding: 4rem; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 0.8rem; }
+  .pnl-bar { height: 3px; background: var(--border); border-radius: 2px; margin: 0.5rem 2.5rem; }
+  .pnl-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="live-dot"></span>V7.2 Dashboard</h1>
+  <span id="last-update">cargando...</span>
+</header>
+
+<div class="stats" id="stats-grid">
+  <div class="stat"><div class="stat-label">picks totales</div><div class="stat-value neutral" id="s-total">—</div></div>
+  <div class="stat"><div class="stat-label">win</div><div class="stat-value green" id="s-win">—</div></div>
+  <div class="stat"><div class="stat-label">loss</div><div class="stat-value red" id="s-loss">—</div></div>
+  <div class="stat"><div class="stat-label">pending</div><div class="stat-value accent" id="s-pend">—</div></div>
+  <div class="stat"><div class="stat-label">beat rate</div><div class="stat-value" id="s-br">—</div></div>
+  <div class="stat"><div class="stat-label">avg EV</div><div class="stat-value accent" id="s-ev">—</div></div>
+  <div class="stat"><div class="stat-label">PnL (u)</div><div class="stat-value" id="s-pnl">—</div></div>
+  <div class="stat"><div class="stat-label">burn-in</div><div class="stat-value accent" id="s-burn">—</div></div>
+</div>
+
+<div class="filters">
+  <button class="filter-btn active" data-filter="all">todos</button>
+  <button class="filter-btn" data-filter="WIN">win</button>
+  <button class="filter-btn" data-filter="LOSS">loss</button>
+  <button class="filter-btn" data-filter="PENDING">pending</button>
+  <button class="filter-btn" data-filter="UNDER">under</button>
+  <button class="filter-btn" data-filter="OVER">over</button>
+  <button class="filter-btn" data-filter="DC">dc</button>
+  <button class="filter-btn" data-filter="1X2">1x2</button>
+  <input id="search" type="text" placeholder="buscar equipo / liga...">
+</div>
+
+<div class="table-wrap">
+  <table id="picks-table">
+    <thead>
+      <tr>
+        <th data-col="date">fecha</th>
+        <th data-col="div">liga</th>
+        <th data-col="match">partido</th>
+        <th data-col="mkt">mercado</th>
+        <th data-col="pick">selección</th>
+        <th data-col="odd">cuota</th>
+        <th data-col="ev">ev</th>
+        <th data-col="prob">prob</th>
+        <th data-col="stake">stake</th>
+        <th data-col="status">resultado</th>
+        <th data-col="profit">profit</th>
+        <th data-col="xg">xG H/A</th>
+      </tr>
+    </thead>
+    <tbody id="picks-body">
+      <tr><td colspan="12" class="empty">cargando datos...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+let allPicks = [];
+let sortCol = 'date';
+let sortDir = -1;
+let activeFilter = 'all';
+
+async function loadData() {
+  try {
+    const r = await fetch('/api/picks');
+    const data = await r.json();
+    allPicks = data.picks;
+    updateStats(data.stats);
+    render();
+    document.getElementById('last-update').textContent = 'actualizado: ' + new Date().toLocaleTimeString('es-MX');
+  } catch(e) {
+    document.getElementById('picks-body').innerHTML = '<tr><td colspan="12" class="empty">error cargando datos</td></tr>';
+  }
+}
+
+function updateStats(s) {
+  document.getElementById('s-total').textContent = s.total;
+  document.getElementById('s-win').textContent = s.wins;
+  document.getElementById('s-loss').textContent = s.losses;
+  document.getElementById('s-pend').textContent = s.pending;
+  const br = s.wins + s.losses > 0 ? (s.wins / (s.wins + s.losses) * 100) : 0;
+  const brEl = document.getElementById('s-br');
+  brEl.textContent = br.toFixed(1) + '%';
+  brEl.className = 'stat-value ' + (br >= 52 ? 'green' : br >= 48 ? 'neutral' : 'red');
+  document.getElementById('s-ev').textContent = '+' + s.avg_ev.toFixed(1) + '%';
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = (s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(4);
+  pnlEl.className = 'stat-value ' + (s.pnl >= 0 ? 'green' : 'red');
+  document.getElementById('s-burn').textContent = s.resolved + '/30';
+}
+
+function mktBadge(mkt) {
+  const map = { UNDER:'badge-under', OVER:'badge-over', DC:'badge-dc', '1X2':'badge-1x2' };
+  return `<span class="badge ${map[mkt]||'badge-1x2'}">${mkt}</span>`;
+}
+function statusBadge(s) {
+  const map = { WIN:'badge-win', LOSS:'badge-loss', PENDING:'badge-pending' };
+  return `<span class="badge ${map[s]||''}">${s}</span>`;
+}
+
+function render() {
+  const search = document.getElementById('search').value.toLowerCase();
+  let data = allPicks.filter(p => {
+    if (activeFilter !== 'all' && p.status !== activeFilter && p.market !== activeFilter) return false;
+    if (search && !JSON.stringify(p).toLowerCase().includes(search)) return false;
+    return true;
+  });
+
+  data.sort((a,b) => {
+    let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    return av < bv ? sortDir : av > bv ? -sortDir : 0;
+  });
+
+  if (!data.length) {
+    document.getElementById('picks-body').innerHTML = '<tr><td colspan="12" class="empty">sin picks con ese filtro</td></tr>';
+    return;
+  }
+
+  const rows = data.map(p => {
+    const ev = parseFloat(p.ev) * 100;
+    const prob = parseFloat(p.prob) * 100;
+    const stake = parseFloat(p.stake) * 100;
+    const profit = parseFloat(p.profit || 0);
+    const profitStr = p.status === 'PENDING' ? '<span class="muted">—</span>' :
+      `<span class="${profit >= 0 ? 'positive' : 'negative'}">${profit >= 0 ? '+' : ''}${profit.toFixed(4)}</span>`;
+    const evStr = `<span class="${ev >= 0 ? 'positive' : 'negative'}">${ev >= 0 ? '+' : ''}${ev.toFixed(1)}%</span>`;
+    const date = (p.date || '').split('T')[0];
+    return `<tr>
+      <td class="muted">${date}</td>
+      <td>${p.div || '—'}</td>
+      <td>${p.home} vs ${p.away}</td>
+      <td>${mktBadge(p.market)}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis">${p.pick}</td>
+      <td>@${parseFloat(p.odd).toFixed(2)}</td>
+      <td>${evStr}</td>
+      <td>${prob.toFixed(1)}%</td>
+      <td>${stake.toFixed(2)}%</td>
+      <td>${statusBadge(p.status)}</td>
+      <td>${profitStr}</td>
+      <td class="muted">${parseFloat(p.xg_h||0).toFixed(2)}/${parseFloat(p.xg_a||0).toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('picks-body').innerHTML = rows;
+}
+
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    activeFilter = btn.dataset.filter;
+    render();
+  });
+});
+
+document.getElementById('search').addEventListener('input', render);
+
+document.querySelectorAll('thead th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.col;
+    if (sortCol === col) sortDir *= -1;
+    else { sortCol = col; sortDir = -1; }
+    document.querySelectorAll('thead th').forEach(t => t.classList.remove('sorted'));
+    th.classList.add('sorted');
+    render();
+  });
+});
+
+loadData();
+setInterval(loadData, 60000);
+</script>
+</body>
+</html>
+"""
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # silenciar logs HTTP
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/dashboard":
+            self._serve_html()
+        elif self.path == "/api/picks":
+            self._serve_api()
+        else:
+            self.send_response(404); self.end_headers()
+
+    def _serve_html(self):
+        content = DASHBOARD_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(content))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _serve_api(self):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("""
+                SELECT pick_time, div, home_team, away_team,
+                       market, selection, odd_open, prob_model, ev_open,
+                       result, stake_pct, profit, xg_home, xg_away
+                FROM picks_log ORDER BY id DESC LIMIT 500
+            """)
+            rows = c.fetchall()
+            conn.close()
+
+            picks = []
+            wins = losses = pending = 0
+            total_ev = total_pnl = 0.0
+            resolved = 0
+
+            for r in rows:
+                status = r[9] or "PENDING"
+                if status == "WIN": wins += 1; resolved += 1
+                elif status == "LOSS": losses += 1; resolved += 1
+                else: pending += 1
+                ev = float(r[8] or 0)
+                total_ev += ev
+                total_pnl += float(r[11] or 0)
+                picks.append({
+                    "date": r[0], "div": r[1], "home": r[2], "away": r[3],
+                    "market": r[4], "pick": r[5],
+                    "odd": r[6], "prob": r[7], "ev": r[8],
+                    "status": status, "stake": r[10], "profit": r[11],
+                    "xg_h": r[12], "xg_a": r[13]
+                })
+
+            n = len(picks)
+            avg_ev = (total_ev / n * 100) if n else 0
+            payload = json.dumps({
+                "picks": picks,
+                "stats": {
+                    "total": n, "wins": wins, "losses": losses,
+                    "pending": pending, "avg_ev": avg_ev,
+                    "pnl": total_pnl, "resolved": resolved
+                }
+            }).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(payload))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+def start_dashboard(port=8080):
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"  🌐 Dashboard en http://0.0.0.0:{port}", flush=True)
+    return server
+
 if __name__ == "__main__":
+    # Arrancar dashboard web en puerto 8080
+    start_dashboard(port=int(os.getenv("PORT", "8080")))
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
