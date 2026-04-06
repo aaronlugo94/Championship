@@ -1652,7 +1652,7 @@ async function loadData() {
   try {
     const r = await fetch('/api/picks');
     const data = await r.json();
-    allPicks = data.picks;
+    allPicks = data.picks || [];
     updateStats(data.stats);
     render();
     document.getElementById('last-update').textContent = 'actualizado: ' + new Date().toLocaleTimeString('es-MX');
@@ -1690,7 +1690,10 @@ function render() {
   const search = document.getElementById('search').value.toLowerCase();
   let data = allPicks.filter(p => {
     if (activeFilter !== 'all' && p.status !== activeFilter && p.market !== activeFilter) return false;
-    if (search && !JSON.stringify(p).toLowerCase().includes(search)) return false;
+    if (search) {
+      const hay = ((p.home||'') + ' ' + (p.away||'') + ' ' + (p.div||'') + ' ' + (p.market||'') + ' ' + (p.pick||'')).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
     return true;
   });
 
