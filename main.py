@@ -2,7 +2,6 @@ import os, time, math, json, csv, io, difflib, requests, sqlite3, numpy as np
 from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
-
 # ============================================================
 # TRIPLE LEAGUE V7.2 — HYBRID ENGINE (BUGS CORREGIDOS)
 # ============================================================
@@ -905,7 +904,7 @@ def run_audit():
     """07:00 UTC — resuelve picks PENDING con resultados del CSV. 0 requests."""
     import pandas as pd
     if not os.path.exists(AUDIT_CSV): return
-    rows=[]; resolved=wins=losses=0
+    rows=[]; resolved=wins=losses=0; db_updates=[]
     try:
         with open(AUDIT_CSV,"r",encoding="utf-8") as f:
             reader=csv.reader(f); header=next(reader); rows.append(header)
@@ -930,12 +929,30 @@ def run_audit():
                                 res=check_result(pick,mkt,fthg,ftag,
                                                  home_name=rh[0],away_name=ra[0])
                                 if res in("WIN","LOSS"):
+                                    profit = round(stake*odd-stake if res=="WIN" else -stake, 4)
                                     row[9]=res; row[14]=str(fthg); row[15]=str(ftag)
-                                    row[11]=str(round(stake*odd-stake if res=="WIN" else -stake,4))
+                                    row[11]=str(profit)
                                     wins+=res=="WIN"; losses+=res=="LOSS"; resolved+=1
+                                    # Sincronizar resultado a picks_log DB
+                                    db_updates.append((res, profit, fthg, ftag,
+                                                        row[2], row[3], row[5]))
                 rows.append(row)
         with open(AUDIT_CSV,"w",newline="",encoding="utf-8") as f:
             csv.writer(f).writerows(rows)
+        # Actualizar picks_log en DB con resultados resueltos
+        if db_updates:
+            try:
+                conn_a = sqlite3.connect(DB_PATH)
+                for res, profit, fthg, ftag, home, away, mkt in db_updates:
+                    conn_a.execute("""
+                        UPDATE picks_log SET result=?, profit=?
+                        WHERE home_team LIKE ? AND away_team LIKE ?
+                          AND market=? AND result='PENDING'
+                    """, (res, profit,
+                          f"%{home[:8]}%", f"%{away[:8]}%", mkt))
+                conn_a.commit(); conn_a.close()
+            except Exception as db_e:
+                print(f"  ⚠️ audit DB sync: {db_e}", flush=True)
         if resolved:
             send_msg(f"🔬 <b>Auditoría V7.2</b>\nResueltos: {resolved} | ✅{wins} WIN | ❌{losses} LOSS")
     except Exception as e:
@@ -1598,6 +1615,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <button class="filter-btn" data-filter="DC">dc</button>
   <button class="filter-btn" data-filter="1X2">1x2</button>
   <input id="search" type="text" placeholder="buscar equipo / liga...">
+  <button id="sync-btn" class="filter-btn" style="margin-left:8px;border-color:#4ade80;color:#4ade80;" onclick="syncData()">sincronizar DB</button>
 </div>
 
 <div class="table-wrap">
@@ -1738,6 +1756,19 @@ document.querySelectorAll('thead th[data-col]').forEach(th => {
   });
 });
 
+async function syncData() {
+  const btn = document.getElementById('sync-btn');
+  btn.textContent = 'sincronizando...';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/sync');
+    const d = await r.json();
+    btn.textContent = 'sincronizado (' + (d.synced||0) + ')';
+    await loadData();
+  } catch(e) { btn.textContent = 'error'; }
+  setTimeout(() => { btn.textContent = 'sincronizar DB'; btn.disabled = false; }, 3000);
+}
+
 loadData();
 setInterval(loadData, 60000);
 </script>
@@ -1757,8 +1788,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_html()
         elif self.path == "/api/picks":
             self._serve_api()
+        elif self.path == "/api/sync":
+            self._serve_sync()
         else:
             self.send_response(404); self.end_headers()
+
+    def _serve_sync(self):
+        """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
+        try:
+            import csv as csvmod, difflib as dl, pandas as pd
+            synced = 0
+            if os.path.exists(AUDIT_CSV):
+                with open(AUDIT_CSV, "r", encoding="utf-8") as f:
+                    reader = csvmod.reader(f)
+                    header = next(reader)
+                    rows = list(reader)
+                conn_s = sqlite3.connect(DB_PATH)
+                for row in rows:
+                    if len(row) < 12: continue
+                    status = row[9]
+                    if status not in ("WIN", "LOSS"): continue
+                    home, away, mkt = row[2], row[3], row[5]
+                    profit = float(row[11] or 0)
+                    conn_s.execute("""
+                        UPDATE picks_log SET result=?, profit=?
+                        WHERE home_team LIKE ? AND away_team LIKE ?
+                          AND market=? AND result='PENDING'
+                    """, (status, profit,
+                          f"%{home[:8]}%", f"%{away[:8]}%", mkt))
+                    if conn_s.total_changes > synced:
+                        synced = conn_s.total_changes
+                conn_s.commit(); conn_s.close()
+            payload = json.dumps({"ok": True, "synced": synced}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
 
     def _serve_html(self):
         content = DASHBOARD_HTML.encode("utf-8")
