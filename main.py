@@ -74,7 +74,7 @@ print(f"  📂 DATA_DIR={DATA_DIR}", flush=True)
 
 RUN_TIME_CSV_UPDATE = "06:00"
 RUN_TIME_AUDIT      = "07:00"
-RUN_TIME_SCAN       = "11:00"
+RUN_TIME_SCAN       = "06:30"
 RUN_TIME_CLV        = "16:00"
 RUN_TIME_STANDINGS  = "09:00"   # martes
 
@@ -150,13 +150,25 @@ FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 # Para activar: pon los xlsx/csv en DATA_DIR y el download_csv los encontrará por antigüedad.
 USER_UPLOADS = {}   # vacío → Railway siempre descarga desde football-data.co.uk
 
-MIN_EV  = 0.015
+MIN_EV  = 0.015   # global fallback
+# MIN_EV por mercado — calibrado post análisis 29 picks
+MIN_EV_MKT = {
+    "UNDER": 0.050,   # Under sobreestimado — requiere margen alto (BR 42%)
+    "OVER":  0.020,   # Over sin sesgo claro — margen moderado
+    "DC":    0.010,   # DC: 100% beat rate — margen mínimo
+    "1X2":   0.025,   # 1X2: mercado eficiente — margen alto
+    "BTTS":  0.020,   # BTTS Sí: moderado
+    "BTTS_NO": 0.020, # BTTS No: moderado
+    "DNB":     0.025, # DNB: mercado semi-eficiente
+}
 MAX_EV  = 0.15
 KELLY   = 0.20
 MAX_STK = 0.04
 MAX_HEAT= 0.10
+KILL_DRAWDOWN = 0.15  # pausa si bankroll cae 15% desde el máximo histórico
 TGT_VOL = 0.05
-VOL_BKT = {"OVER": 0.85, "UNDER": 0.85, "BTTS": 0.90, "1X2": 1.25, "DC": 1.10}
+VOL_BKT = {"OVER": 0.85, "UNDER": 0.65, "BTTS": 0.90, "BTTS_NO": 0.90, "1X2": 1.25, "DC": 1.20, "DNB": 1.15}
+# Under: 0.65 (reducido por BR 42%) | DC: 1.20 (aumentado por BR 100%)
 DC_RHO  = -0.13
 XG_TTL  = 72      # horas cache xG
 XG_DEC  = 0.85    # decay temporal
@@ -747,10 +759,13 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     else:
         ph, pd_, pa = dc_h, dc_d, dc_a
 
+    # 1X2: solo cuotas ≥ 2.50 en ligas menos líquidas (liq < 0.88)
+    # Mercado muy eficiente en ligas top — solo apostamos donde hay ineficiencia
+    MIN_ODD_1X2 = 2.50 if liq < 0.88 else 3.00
     for prob, odd_val, pick in [(ph,oh,f"Gana {h_n}"),
                                  (pd_,od,"Empate"),
                                  (pa,oa,f"Gana {a_n}")]:
-        if odd_val:
+        if odd_val and odd_val >= MIN_ODD_1X2:
             out.append({"mkt":"1X2","pick":pick,"odd":odd_val,"prob":prob,
                         "model_gap":round(prob-1/(odd_val*1.05),4)})
 
@@ -780,15 +795,42 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
                                 "prob":dc_prob,
                                 "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
 
+    # ── DRAW NO BET ──────────────────────────────────────────────────────
+    # DNB: si empata devuelven. EV real = ph/(ph+pa) para local,  pa/(ph+pa) para visitante.
+    # Cuota fair derivada de las probabilidades Dixon-Coles sin empate.
+    # Solo en ligas con liq < 0.88 (mercado menos eficiente) y conf HIGH.
+    if conf == "HIGH" and oh and oa and liq < 0.88:
+        ph_dnb = ph / max(ph + pa, 0.01)   # prob local sin empate
+        pa_dnb = pa / max(ph + pa, 0.01)   # prob visitante sin empate
+        # Cuota fair DNB desde las cuotas 1X2 del mercado (sin vig)
+        # DNB_H fair = 1 / (1/oh - 1/od) cuando od es la cuota empate
+        try:
+            dnb_h_odd = round(1 / (1/oh - 1/od), 2) if oh and od and (1/oh - 1/od) > 0.05 else None
+            dnb_a_odd = round(1 / (1/oa - 1/od), 2) if oa and od and (1/oa - 1/od) > 0.05 else None
+        except (ZeroDivisionError, ValueError):
+            dnb_h_odd = dnb_a_odd = None
+        # Solo cuotas razonables (1.10 - 4.00)
+        if dnb_h_odd and 1.10 < dnb_h_odd < 4.00:
+            out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
+                        "odd":dnb_h_odd,"prob":ph_dnb,
+                        "model_gap":round(ph_dnb - 1/(dnb_h_odd*1.05), 4)})
+        if dnb_a_odd and 1.10 < dnb_a_odd < 4.00:
+            out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
+                        "odd":dnb_a_odd,"prob":pa_dnb,
+                        "model_gap":round(pa_dnb - 1/(dnb_a_odd*1.05), 4)})
+
     # ── O/U 2.5 ──────────────────────────────────────────────────────────
     has_trend = ts.get("pct_o25") is not None
     po_raw, _ = negbinom_ou(xh+xa, std)
     po = shrink(blend(po_raw, ts.get("pct_o25")))
     pu = 1 - po
-    # Sin Trend empírico, el modelo opera puro — aplicar shrinkage extra
-    # para Under (ligas defensivas generan bias sin corrección de mercado)
+    # Shrinkage calibrado post análisis de 29 picks: Under 42% beat rate
+    # → shrinkage más agresivo para reducir sobreestimación de prob Under
     if not has_trend:
-        pu = shrink(pu, a=0.65)   # más conservador sin datos de mercado
+        pu = shrink(pu, a=0.45)   # sin Trend: agresivo (Under 42% BR → recalibrando)
+        po = 1 - pu
+    else:
+        pu = shrink(pu, a=0.60)   # con Trend: conservador
         po = 1 - pu
     # Cuota Over: CSV/api-football primero, Trend como fallback
     o25 = odds.get("O25") or ts.get("ou25_odd")
@@ -800,20 +842,25 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
         out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
                     "model_gap":round(pu-1/(u25*1.07),4)})
 
-    # ── BTTS ─────────────────────────────────────────────────────────────
+    # ── BTTS Sí / No ─────────────────────────────────────────────────────
     if conf != "LOW":
         py, pn = btts_prob(xh, xa)
         if py:
             py = blend(py, ts.get("pct_bts"), w=0.25); pn = 1-py
-            ob = odds.get("BTTS_Y") or ts.get("bts_odd")
-            if ob and ob>1.01:
+            ob  = odds.get("BTTS_Y") or ts.get("bts_odd")
+            obn = odds.get("BTTS_N")  # cuota explícita del CSV si existe
+            # Si no hay cuota explícita BTTS_N, derivar de BTTS_Y
+            if not obn and ob and ob > 1.01:
+                obn_derived = round(1 / max(0.01, 1 - 1/ob), 2)
+                # Solo usar si la cuota derivada es razonable (1.20 - 4.00)
+                obn = obn_derived if 1.20 < obn_derived < 4.00 else None
+            if ob and ob > 1.01:
                 out.append({"mkt":"BTTS","pick":"Ambos Marcan: Sí","odd":ob,"prob":py,
                             "model_gap":round(py-1/(ob*1.06),4)})
-                obn = 1/max(0.01, 1-1/ob)
-                if obn>1.05:
-                    out.append({"mkt":"BTTS","pick":"Ambos Marcan: No",
-                                "odd":round(obn,2),"prob":pn,
-                                "model_gap":round(pn-1/(obn*1.06),4)})
+            if obn and obn > 1.05:
+                out.append({"mkt":"BTTS_NO","pick":"Ambos Marcan: No",
+                            "odd":round(float(obn),2),"prob":pn,
+                            "model_gap":round(pn-1/(float(obn)*1.06),4)})
     return out
 
 # ============================================================
@@ -833,7 +880,7 @@ def validate_xg(xh, xa, oh, oa, o25):
     return True, None
 
 def sanity(p, mkt, odd):
-    VIG={"OVER":1.07,"UNDER":1.07,"1X2":1.05,"BTTS":1.06,"DC":1.04}
+    VIG={"OVER":1.07,"UNDER":1.07,"1X2":1.05,"BTTS":1.06,"DC":1.04,"BTTS_NO":1.06,"DNB":1.05}
     gap=abs(p-1/(odd*VIG.get(mkt,1.06)))
     if gap>0.18: return False,f"SANITY_FAIL(gap={gap:.2f})"
     return True, None
@@ -888,9 +935,20 @@ def check_result(pick, mkt, fthg, ftag, home_name="", away_name=""):
     hg=int(float(fthg)); ag=int(float(ftag))
     if mkt=="OVER":  return "WIN" if hg+ag>2.5 else "LOSS"
     if mkt=="UNDER": return "WIN" if hg+ag<2.5 else "LOSS"
-    if mkt=="BTTS":
+    if mkt in ("BTTS","BTTS_NO"):
         y=hg>0 and ag>0
         return "WIN" if ("Sí" in pick and y) or ("No" in pick and not y) else "LOSS"
+    if mkt=="DNB":
+        # DNB: empate = PUSH (devuelven) → tratamos como PENDING para no contar
+        if hg==ag: return "PENDING"   # empate → push, no cuenta como WIN ni LOSS
+        team_pick = pick.replace("DNB: Gana ","").strip()
+        sim_h = difflib.SequenceMatcher(None, team_pick.lower(), home_name.lower()).ratio()
+        sim_a = difflib.SequenceMatcher(None, team_pick.lower(), away_name.lower()).ratio()
+        if sim_h >= 0.60 and sim_h >= sim_a:
+            return "WIN" if hg>ag else "LOSS"
+        if sim_a >= 0.60 and sim_a > sim_h:
+            return "WIN" if ag>hg else "LOSS"
+        return "PENDING"
     if mkt=="DC":
         if "o Empate" in pick and not pick.startswith("DC: Empate"):
             # 1X: local gana o empate
@@ -995,6 +1053,56 @@ def calc_pnl():
         print(f"  ⚠️ pnl: {e}", flush=True)
 
 # ============================================================
+# KILL-SWITCH — protección de capital
+# ============================================================
+
+def kill_switch_check():
+    """
+    Verifica si el bankroll cayó KILL_DRAWDOWN desde el máximo histórico.
+    Si LIVE_TRADING y drawdown > 15% → pausa automática + alerta Telegram.
+    Retorna True si el sistema debe pausarse.
+    """
+    if not LIVE_TRADING:
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT profit FROM picks_log
+            WHERE result IN ('WIN','LOSS')
+            ORDER BY id ASC
+        """).fetchall()
+        conn.close()
+        if len(rows) < 5:
+            return False
+        # Calcular curva de bankroll acumulada
+        cumulative = 0.0
+        peak = 0.0
+        for (p,) in rows:
+            cumulative += float(p or 0)
+            if cumulative > peak:
+                peak = cumulative
+        # Drawdown desde el pico
+        drawdown = (peak - cumulative) / (1 + peak) if peak > 0 else 0
+        if drawdown >= KILL_DRAWDOWN:
+            send_msg(
+                f"🚨 <b>KILL-SWITCH ACTIVADO</b>\n"
+                f"Drawdown: -{drawdown*100:.1f}% desde el pico\n"
+                f"PnL acumulado: {cumulative:+.4f}U | Pico: {peak:+.4f}U\n"
+                f"Sistema en pausa. Revisar modelo antes de reactivar."
+            )
+            print(f"  🚨 KILL-SWITCH: drawdown {drawdown*100:.1f}% — pausando", flush=True)
+            return True
+        elif drawdown >= KILL_DRAWDOWN * 0.7:
+            # Advertencia al 70% del límite
+            send_msg(
+                f"⚠️ <b>Drawdown warning</b>: -{drawdown*100:.1f}% "
+                f"(límite: -{KILL_DRAWDOWN*100:.0f}%)"
+            )
+    except Exception as e:
+        print(f"  ⚠️ kill_switch_check: {e}", flush=True)
+    return False
+
+# ============================================================
 # BOT PRINCIPAL
 # ============================================================
 
@@ -1039,7 +1147,8 @@ class TripleLeagueV72:
             ev=(item["prob"]*item["odd"])-1
             ok2,fail=sanity(item["prob"],item["mkt"],item["odd"])
             if not ok2:     log_rej(label,item["mkt"],item["odd"],ev,fail); continue
-            if ev<MIN_EV:   log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
+            min_ev_mkt = MIN_EV_MKT.get(item["mkt"], MIN_EV)
+            if ev<min_ev_mkt: log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
             if ev>MAX_EV:   log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
             k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
             if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
@@ -1698,6 +1807,9 @@ td.muted-td{color:var(--muted)}
     <button class="seg-btn" data-mkt="OVER">Over</button>
     <button class="seg-btn" data-mkt="DC">DC</button>
     <button class="seg-btn" data-mkt="1X2">1X2</button>
+    <button class="seg-btn" data-mkt="BTTS">BTTS Sí</button>
+    <button class="seg-btn" data-mkt="BTTS_NO">BTTS No</button>
+    <button class="seg-btn" data-mkt="DNB">DNB</button>
   </div>
   <div class="spacer"></div>
   <input id="search" type="text" placeholder="buscar equipo, liga...">
@@ -1732,7 +1844,7 @@ let allPicks = [], sortCol = 'date', sortDir = -1;
 let activeFlt = 'all', activeMkt = 'all';
 
 const mktBadge = m => {
-  const map = {UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2'};
+  const map = {UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2',BTTS:'b-under',BTTS_NO:'b-over',DNB:'b-dc'};
   return `<span class="badge ${map[m]||'b-1x2'}">${m}</span>`;
 };
 const statusBadge = s => {
@@ -2154,7 +2266,7 @@ if __name__ == "__main__":
 
     CSV_H,  CSV_M  = _hhmm(RUN_TIME_CSV_UPDATE)   # 06:00
     AUDIT_H,AUDIT_M= _hhmm(RUN_TIME_AUDIT)         # 07:00
-    SCAN_H, SCAN_M = _hhmm(RUN_TIME_SCAN)           # 11:00
+    SCAN_H, SCAN_M = _hhmm(RUN_TIME_SCAN)           # 06:30
     CLV_H,  CLV_M  = _hhmm(RUN_TIME_CLV)            # 16:00
     STAND_H,STAND_M= _hhmm(RUN_TIME_STANDINGS)      # 09:00 martes
 
@@ -2179,11 +2291,14 @@ if __name__ == "__main__":
             try: calc_pnl()
             except Exception as e: print(f"⚠️ calc_pnl: {e}", flush=True)
 
-        # 11:00 — scan principal
+        # 06:30 — kill-switch check + scan principal
         if (hh, mm) == (SCAN_H, SCAN_M) and not _ran_today("scan"):
             _mark_ran("scan")
-            try: bot.run_daily_scan()
-            except Exception as e: print(f"⚠️ run_daily_scan: {e}", flush=True)
+            if not kill_switch_check():
+                try: bot.run_daily_scan()
+                except Exception as e: print(f"⚠️ run_daily_scan: {e}", flush=True)
+            else:
+                print("  🚨 Scan omitido — kill-switch activo", flush=True)
 
         # 16:00 — capture CLV
         if (hh, mm) == (CLV_H, CLV_M) and not _ran_today("clv"):
