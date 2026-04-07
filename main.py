@@ -1615,7 +1615,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <button class="filter-btn" data-filter="DC">dc</button>
   <button class="filter-btn" data-filter="1X2">1x2</button>
   <input id="search" type="text" placeholder="buscar equipo / liga...">
-  <button id="sync-btn" style="margin-left:8px;font-family:'DM Mono',monospace;font-size:0.72rem;padding:6px 14px;border:1px solid #4ade80;background:transparent;color:#4ade80;border-radius:99px;cursor:pointer;" onclick="syncData()">sincronizar DB</button>
+  <button id="sync-btn" style="margin-left:8px;font-family:'DM Mono',monospace;font-size:0.72rem;padding:6px 14px;border:1px solid #4ade80;background:transparent;color:#4ade80;border-radius:99px;cursor:pointer;" onclick="syncData()">resolver picks</button>
 </div>
 
 <div class="table-wrap">
@@ -1761,15 +1761,16 @@ document.querySelectorAll('thead th[data-col]').forEach(th => {
 
 async function syncData() {
   const btn = document.getElementById('sync-btn');
-  btn.textContent = 'sincronizando...';
+  btn.textContent = 'resolviendo...';
   btn.disabled = true;
   try {
-    const r = await fetch('/api/sync');
+    const r = await fetch('/api/resolve');
     const d = await r.json();
-    btn.textContent = 'sincronizado (' + (d.synced||0) + ')';
+    if (d.error) { btn.textContent = 'error: ' + d.error; }
+    else { btn.textContent = 'resueltos: ' + (d.resolved||0) + ' (' + (d.wins||0) + 'W/' + (d.losses||0) + 'L)'; }
     await loadData();
   } catch(e) { btn.textContent = 'error'; }
-  setTimeout(() => { btn.textContent = 'sincronizar DB'; btn.disabled = false; }, 3000);
+  setTimeout(() => { btn.textContent = 'resolver picks'; btn.disabled = false; }, 5000);
 }
 
 loadData();
@@ -1793,6 +1794,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_api()
         elif self.path == "/api/sync":
             self._serve_sync()
+        elif self.path == "/api/resolve":
+            self._serve_resolve()
         else:
             self.send_response(404); self.end_headers()
 
@@ -1900,6 +1903,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", len(payload))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+    def _serve_resolve(self):
+        """Resuelve picks PENDING contra los CSVs de co.uk directamente."""
+        try:
+            import pandas as pd
+            resolved = wins = losses = 0
+            conn_r = sqlite3.connect(DB_PATH)
+            pending = conn_r.execute("""
+                SELECT id, div, home_team, away_team, market, selection,
+                       odd_open, stake_pct
+                FROM picks_log WHERE result='PENDING'
+            """).fetchall()
+
+            for pid, div, home, away, mkt, pick, odd, stake in pending:
+                path = os.path.join(DATA_DIR, f"{div}.csv")
+                if not os.path.exists(path):
+                    continue
+                try:
+                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                    except: df = pd.read_csv(path, encoding="latin-1")
+                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                            "HG":"FTHG","AG":"FTAG"})
+                    played = df.dropna(subset=["FTHG","FTAG"])
+                    teams = pd.concat([played["HomeTeam"],played["AwayTeam"]]).unique()
+                    import difflib as dl
+                    rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
+                    ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
+                    if not rh or not ra:
+                        continue
+                    m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
+                    if m.empty:
+                        continue
+                    fthg = float(m.iloc[-1]["FTHG"])
+                    ftag = float(m.iloc[-1]["FTAG"])
+                    res = check_result(pick, mkt, fthg, ftag,
+                                       home_name=rh[0], away_name=ra[0])
+                    if res not in ("WIN","LOSS"):
+                        continue
+                    profit = round(float(stake or 0)*float(odd or 0) - float(stake or 0)
+                                   if res=="WIN" else -float(stake or 0), 4)
+                    conn_r.execute(
+                        "UPDATE picks_log SET result=?, profit=? WHERE id=?",
+                        (res, profit, pid)
+                    )
+                    resolved += 1
+                    if res=="WIN": wins += 1
+                    else: losses += 1
+                except Exception:
+                    continue
+
+            conn_r.commit(); conn_r.close()
+            payload = json.dumps({
+                "ok": True, "resolved": resolved,
+                "wins": wins, "losses": losses
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(payload)
