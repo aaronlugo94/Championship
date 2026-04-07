@@ -1799,7 +1799,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _serve_sync(self):
         """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
         try:
-            import csv as csvmod, difflib as dl, pandas as pd
+            import csv as csvmod
             synced = 0
             if os.path.exists(AUDIT_CSV):
                 with open(AUDIT_CSV, "r", encoding="utf-8") as f:
@@ -1807,20 +1807,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     header = next(reader)
                     rows = list(reader)
                 conn_s = sqlite3.connect(DB_PATH)
+                # Cargar todos los picks PENDING de la DB indexados por equipo+mercado
+                pending = conn_s.execute(
+                    "SELECT id, home_team, away_team, market FROM picks_log WHERE result='PENDING'"
+                ).fetchall()
+                # Construir índice: (home_lower, away_lower, market) → id
+                idx = {}
+                for pid, ht, at, mk in pending:
+                    key = (ht.lower()[:6], at.lower()[:6], mk)
+                    idx[key] = pid
                 for row in rows:
                     if len(row) < 12: continue
                     status = row[9]
                     if status not in ("WIN", "LOSS"): continue
                     home, away, mkt = row[2], row[3], row[5]
-                    profit = float(row[11] or 0)
-                    conn_s.execute("""
-                        UPDATE picks_log SET result=?, profit=?
-                        WHERE home_team LIKE ? AND away_team LIKE ?
-                          AND market=? AND result='PENDING'
-                    """, (status, profit,
-                          f"%{home[:8]}%", f"%{away[:8]}%", mkt))
-                    if conn_s.total_changes > synced:
-                        synced = conn_s.total_changes
+                    try: profit = float(row[11] or 0)
+                    except: profit = 0.0
+                    key = (home.lower()[:6], away.lower()[:6], mkt)
+                    if key in idx:
+                        conn_s.execute(
+                            "UPDATE picks_log SET result=?, profit=? WHERE id=?",
+                            (status, profit, idx[key])
+                        )
+                        synced += 1
                 conn_s.commit(); conn_s.close()
             payload = json.dumps({"ok": True, "synced": synced}).encode()
             self.send_response(200)
