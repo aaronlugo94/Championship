@@ -604,10 +604,25 @@ def get_mx_season(headers):
 def get_mx_fixtures(dates, headers):
     """Fixtures Liga MX para mañana y pasado mañana. ~3 req (1 season + 2 fixtures)."""
     season = get_mx_season(headers)
+    # Si el season detectado es 2025 y estamos en 2026, probar 2026 también
+    seasons_to_try = [season]
+    import datetime as _dt
+    if season == 2025 and _dt.datetime.now().year == 2026:
+        seasons_to_try = [2026, 2025]
+    elif season == 2026:
+        seasons_to_try = [2026]
     matches = []
     for d in dates:
-        res = apif_get("fixtures", {"date": d, "league": 262, "season": season}, headers)
-        matches.extend(res)
+        found = []
+        for s in seasons_to_try:
+            res = apif_get("fixtures", {"date": d, "league": 262, "season": s}, headers)
+            if res:
+                found = res
+                if s != season:
+                    print(f"  ✅ Liga MX fixtures encontrados con season={s}", flush=True)
+                break
+            time.sleep(1.5)
+        matches.extend(found)
         time.sleep(1.5)
     return matches
 
@@ -1231,8 +1246,17 @@ class TripleLeagueV72:
                 }
 
                 if not odds.get("H"):
-                    print(f"     ⚠️ BSA sin cuotas del Trend — skip", flush=True)
-                    log_rej(label,"ALL",0,0,"NO_ODDS_AVAILABLE"); continue
+                    # Fallback: intentar api-football para cuotas BSA
+                    # fd.org da el fixture_id del partido de BSA
+                    apif_fid = m.get("id")
+                    if apif_fid and get_req() < 80:
+                        apif_odds = get_mx_odds(apif_fid, self.apif_h)
+                        if apif_odds:
+                            odds.update(apif_odds)
+                            print(f"     📡 BSA odds via api-football", flush=True)
+                    if not odds.get("H"):
+                        print(f"     ⚠️ BSA sin cuotas — skip", flush=True)
+                        log_rej(label,"ALL",0,0,"NO_ODDS_AVAILABLE"); continue
 
                 ok,reason=validate_xg(xh,xa,odds["H"],odds["A"],odds["O25"])
                 if not ok: log_rej(label,"ALL",0,0,reason); continue
@@ -1460,193 +1484,340 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V7.2 Dashboard</title>
+<title>V7.2 · Quant Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #0a0a0f;
-    --surface: #111118;
-    --border: #1e1e2e;
-    --accent: #7c6fff;
-    --accent2: #ff6b6b;
-    --green: #4ade80;
-    --red: #f87171;
-    --text: #e2e2f0;
-    --muted: #6b6b8a;
-    --card: #13131f;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'Syne', sans-serif; min-height: 100vh; }
-  
-  header {
-    padding: 2rem 2.5rem 1.5rem;
-    border-bottom: 1px solid var(--border);
-    display: flex; align-items: baseline; gap: 1.5rem;
-  }
-  header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
-  header span { font-family: 'DM Mono', monospace; font-size: 0.75rem; color: var(--muted); }
-  .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07080d;
+  --s1:#0c0e17;
+  --s2:#11141f;
+  --border:#1c2035;
+  --border2:#252840;
+  --accent:#4f6ef7;
+  --accent2:#7c6fff;
+  --green:#22c55e;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --text:#e8eaf6;
+  --muted:#5a5f80;
+  --mono:'IBM Plex Mono',monospace;
+  --sans:'Barlow',sans-serif;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
 
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-    gap: 1px;
-    border: 1px solid var(--border);
-    margin: 2rem 2.5rem;
-    border-radius: 12px;
-    overflow: hidden;
-  }
-  .stat {
-    background: var(--card);
-    padding: 1.25rem 1.5rem;
-    display: flex; flex-direction: column; gap: 6px;
-  }
-  .stat-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-family: 'DM Mono', monospace; }
-  .stat-value { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.03em; }
-  .stat-value.green { color: var(--green); }
-  .stat-value.red { color: var(--red); }
-  .stat-value.accent { color: var(--accent); }
-  .stat-value.neutral { color: var(--text); }
+/* ── HEADER ── */
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:1.25rem 2rem;
+  border-bottom:1px solid var(--border);
+  background:var(--s1);
+}
+.logo{display:flex;align-items:center;gap:10px}
+.logo-mark{width:28px;height:28px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
+.logo-mark svg{width:16px;height:16px;fill:#fff}
+.logo h1{font-size:1rem;font-weight:600;letter-spacing:.02em;color:var(--text)}
+.logo span{font-family:var(--mono);font-size:.65rem;color:var(--muted);margin-top:1px}
+.header-right{display:flex;align-items:center;gap:12px}
+.live-pill{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.65rem;color:var(--green);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);padding:4px 10px;border-radius:99px}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1.8s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+#last-update{font-family:var(--mono);font-size:.65rem;color:var(--muted)}
 
-  .filters {
-    padding: 0 2.5rem 1rem;
-    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
-  }
-  .filter-btn {
-    font-family: 'DM Mono', monospace;
-    font-size: 0.72rem;
-    padding: 6px 14px;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--muted);
-    border-radius: 99px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .filter-btn:hover, .filter-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(124,111,255,0.08); }
-  .filter-btn.active { font-weight: 500; }
-  #search {
-    margin-left: auto;
-    font-family: 'DM Mono', monospace;
-    font-size: 0.72rem;
-    padding: 6px 14px;
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: var(--text);
-    border-radius: 8px;
-    outline: none;
-    width: 200px;
-  }
-  #search:focus { border-color: var(--accent); }
+/* ── STAT CARDS ── */
+.stats-row{
+  display:grid;
+  grid-template-columns:repeat(8,minmax(0,1fr));
+  border-bottom:1px solid var(--border);
+}
+.stat{
+  padding:1.25rem 1.5rem;
+  border-right:1px solid var(--border);
+  transition:background .15s;
+}
+.stat:last-child{border-right:none}
+.stat:hover{background:var(--s2)}
+.stat-label{font-family:var(--mono);font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
+.stat-value{font-size:1.65rem;font-weight:600;letter-spacing:-.03em;line-height:1}
+.stat-sub{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.3rem}
+.green{color:var(--green)} .red{color:var(--red)} .blue{color:var(--accent)} .amber{color:var(--amber)} .white{color:var(--text)}
 
-  .table-wrap { padding: 0 2.5rem 2.5rem; overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  thead th {
-    font-family: 'DM Mono', monospace;
-    font-size: 0.62rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    padding: 10px 12px;
-    text-align: left;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    white-space: nowrap;
-    user-select: none;
-  }
-  thead th:hover { color: var(--text); }
-  thead th.sorted { color: var(--accent); }
-  tbody tr {
-    border-bottom: 1px solid var(--border);
-    transition: background 0.1s;
-  }
-  tbody tr:hover { background: var(--card); }
-  tbody td { padding: 10px 12px; white-space: nowrap; font-family: 'DM Mono', monospace; font-size: 0.78rem; }
-  .badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.65rem;
-    font-weight: 500;
-    letter-spacing: 0.05em;
-  }
-  .badge-win { background: rgba(74,222,128,0.12); color: var(--green); }
-  .badge-loss { background: rgba(248,113,113,0.12); color: var(--red); }
-  .badge-pending { background: rgba(124,111,255,0.12); color: var(--accent); }
-  .badge-under { background: rgba(99,185,255,0.12); color: #63b9ff; }
-  .badge-over { background: rgba(255,165,82,0.12); color: #ffa552; }
-  .badge-dc { background: rgba(200,150,255,0.12); color: #c896ff; }
-  .badge-1x2 { background: rgba(255,220,80,0.12); color: #ffdc50; }
-  .positive { color: var(--green); }
-  .negative { color: var(--red); }
-  .muted { color: var(--muted); }
+/* ── TOOLBAR ── */
+.toolbar{
+  display:flex;align-items:center;gap:8px;padding:.85rem 2rem;
+  background:var(--s1);border-bottom:1px solid var(--border);
+  flex-wrap:wrap;
+}
+.seg{display:flex;gap:2px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:2px}
+.seg-btn{
+  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
+  padding:5px 12px;border:none;background:transparent;color:var(--muted);
+  border-radius:6px;cursor:pointer;transition:all .15s;
+}
+.seg-btn:hover{color:var(--text)}
+.seg-btn.active{background:var(--accent);color:#fff}
+.spacer{flex:1}
+#search{
+  font-family:var(--mono);font-size:.7rem;padding:7px 12px;
+  background:var(--s2);border:1px solid var(--border);color:var(--text);
+  border-radius:7px;outline:none;width:200px;transition:border-color .15s;
+}
+#search:focus{border-color:var(--accent)}
+#search::placeholder{color:var(--muted)}
+#resolve-btn{
+  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
+  padding:7px 14px;background:rgba(79,110,247,.12);
+  border:1px solid rgba(79,110,247,.3);color:var(--accent);
+  border-radius:7px;cursor:pointer;transition:all .15s;white-space:nowrap;
+}
+#resolve-btn:hover{background:rgba(79,110,247,.2)}
+#resolve-btn:disabled{opacity:.5;cursor:default}
 
-  .empty { text-align: center; padding: 4rem; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 0.8rem; }
-  .pnl-bar { height: 3px; background: var(--border); border-radius: 2px; margin: 0.5rem 2.5rem; }
-  .pnl-fill { height: 100%; border-radius: 2px; transition: width 0.5s; }
+/* ── TABLE ── */
+.table-wrap{overflow-x:auto;min-height:400px}
+table{width:100%;border-collapse:collapse;font-size:.78rem}
+thead th{
+  font-family:var(--mono);font-size:.58rem;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--muted);padding:10px 16px;
+  text-align:left;border-bottom:1px solid var(--border);
+  cursor:pointer;user-select:none;white-space:nowrap;
+  background:var(--s1);position:sticky;top:0;
+}
+thead th:hover{color:var(--text)}
+thead th.sorted{color:var(--accent)}
+thead th.sorted::after{content:' ↓';font-size:.55rem}
+thead th.sorted.asc::after{content:' ↑'}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:hover{background:var(--s2)}
+tbody td{padding:10px 16px;white-space:nowrap;font-family:var(--mono);font-size:.73rem;vertical-align:middle}
+td.party{font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--text);white-space:normal;min-width:160px}
+td.muted-td{color:var(--muted)}
+
+/* ── BADGES ── */
+.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:.6rem;font-weight:500;letter-spacing:.05em;gap:4px}
+.b-win{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.b-loss{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
+.b-pend{background:rgba(79,110,247,.1);color:var(--accent);border:1px solid rgba(79,110,247,.2)}
+.b-under{background:rgba(56,189,248,.08);color:#38bdf8;border:1px solid rgba(56,189,248,.15)}
+.b-over{background:rgba(251,146,60,.08);color:#fb923c;border:1px solid rgba(251,146,60,.15)}
+.b-dc{background:rgba(167,139,250,.08);color:#a78bfa;border:1px solid rgba(167,139,250,.15)}
+.b-1x2{background:rgba(250,204,21,.08);color:#facc15;border:1px solid rgba(250,204,21,.15)}
+
+.pos{color:var(--green)} .neg{color:var(--red)} .neu{color:var(--muted)}
+.ev-high{color:var(--green)} .ev-mid{color:var(--amber)} .ev-low{color:var(--muted)}
+
+/* ── EMPTY ── */
+.empty{text-align:center;padding:5rem;color:var(--muted);font-family:var(--mono);font-size:.8rem}
+
+/* ── MINI CHART BAR ── */
+.xg-bar{display:flex;gap:3px;align-items:center}
+.xg-seg{height:4px;border-radius:2px;min-width:3px}
+
+/* ── RESPONSIVE ── */
+@media(max-width:900px){
+  .stats-row{grid-template-columns:repeat(4,1fr)}
+  .stat{border-bottom:1px solid var(--border)}
+  header{padding:1rem}
+  .toolbar{padding:.75rem 1rem}
+  tbody td{padding:8px 10px}
+}
 </style>
 </head>
 <body>
+
 <header>
-  <h1><span class="live-dot"></span>V7.2 Dashboard</h1>
-  <span id="last-update">cargando...</span>
+  <div class="logo">
+    <div class="logo-mark">
+      <svg viewBox="0 0 16 16"><path d="M2 12 L8 4 L14 12 Z"/></svg>
+    </div>
+    <div>
+      <h1>V7.2 Quant</h1>
+      <span>Triple League Specialist</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="last-update"></span>
+    <div class="live-pill"><span class="live-dot"></span>LIVE</div>
+  </div>
 </header>
 
-<div class="stats" id="stats-grid">
-  <div class="stat"><div class="stat-label">picks totales</div><div class="stat-value neutral" id="s-total">—</div></div>
-  <div class="stat"><div class="stat-label">win</div><div class="stat-value green" id="s-win">—</div></div>
-  <div class="stat"><div class="stat-label">loss</div><div class="stat-value red" id="s-loss">—</div></div>
-  <div class="stat"><div class="stat-label">pending</div><div class="stat-value accent" id="s-pend">—</div></div>
-  <div class="stat"><div class="stat-label">beat rate</div><div class="stat-value" id="s-br">—</div></div>
-  <div class="stat"><div class="stat-label">avg EV</div><div class="stat-value accent" id="s-ev">—</div></div>
-  <div class="stat"><div class="stat-label">PnL (u)</div><div class="stat-value" id="s-pnl">—</div></div>
-  <div class="stat"><div class="stat-label">burn-in</div><div class="stat-value accent" id="s-burn">—</div></div>
+<div class="stats-row">
+  <div class="stat">
+    <div class="stat-label">Picks totales</div>
+    <div class="stat-value white" id="s-total">—</div>
+    <div class="stat-sub" id="s-sub-total"></div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Win</div>
+    <div class="stat-value green" id="s-win">—</div>
+    <div class="stat-sub" id="s-sub-win"></div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Loss</div>
+    <div class="stat-value red" id="s-loss">—</div>
+    <div class="stat-sub" id="s-sub-loss"></div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Pending</div>
+    <div class="stat-value blue" id="s-pend">—</div>
+    <div class="stat-sub">esperando resultado</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Beat Rate</div>
+    <div class="stat-value" id="s-br">—</div>
+    <div class="stat-sub">mín. 52% para live</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Avg EV</div>
+    <div class="stat-value blue" id="s-ev">—</div>
+    <div class="stat-sub">apertura</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">PnL (u)</div>
+    <div class="stat-value" id="s-pnl">—</div>
+    <div class="stat-sub">unidades de bankroll</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Burn-in</div>
+    <div class="stat-value" id="s-burn">—</div>
+    <div class="stat-sub" id="s-burn-sub">picks resueltos</div>
+  </div>
 </div>
 
-<div class="filters">
-  <button class="filter-btn active" data-filter="all">todos</button>
-  <button class="filter-btn" data-filter="WIN">win</button>
-  <button class="filter-btn" data-filter="LOSS">loss</button>
-  <button class="filter-btn" data-filter="PENDING">pending</button>
-  <button class="filter-btn" data-filter="UNDER">under</button>
-  <button class="filter-btn" data-filter="OVER">over</button>
-  <button class="filter-btn" data-filter="DC">dc</button>
-  <button class="filter-btn" data-filter="1X2">1x2</button>
-  <input id="search" type="text" placeholder="buscar equipo / liga...">
-  <button id="sync-btn" style="margin-left:8px;font-family:'DM Mono',monospace;font-size:0.72rem;padding:6px 14px;border:1px solid #4ade80;background:transparent;color:#4ade80;border-radius:99px;cursor:pointer;" onclick="syncData()">resolver picks</button>
+<div class="toolbar">
+  <div class="seg" id="filter-seg">
+    <button class="seg-btn active" data-filter="all">Todos</button>
+    <button class="seg-btn" data-filter="WIN">Win</button>
+    <button class="seg-btn" data-filter="LOSS">Loss</button>
+    <button class="seg-btn" data-filter="PENDING">Pending</button>
+  </div>
+  <div class="seg" id="mkt-seg">
+    <button class="seg-btn active" data-mkt="all">Mercados</button>
+    <button class="seg-btn" data-mkt="UNDER">Under</button>
+    <button class="seg-btn" data-mkt="OVER">Over</button>
+    <button class="seg-btn" data-mkt="DC">DC</button>
+    <button class="seg-btn" data-mkt="1X2">1X2</button>
+  </div>
+  <div class="spacer"></div>
+  <input id="search" type="text" placeholder="buscar equipo, liga...">
+  <button id="resolve-btn" onclick="resolveData()">resolver picks</button>
 </div>
 
 <div class="table-wrap">
-  <table id="picks-table">
-    <thead>
-      <tr>
-        <th data-col="date">fecha</th>
-        <th data-col="div">liga</th>
-        <th data-col="match">partido</th>
-        <th data-col="mkt">mercado</th>
-        <th data-col="pick">selección</th>
-        <th data-col="odd">cuota</th>
-        <th data-col="ev">ev</th>
-        <th data-col="prob">prob</th>
-        <th data-col="stake">stake</th>
-        <th data-col="status">resultado</th>
-        <th data-col="profit">profit</th>
-        <th data-col="xg">xG H/A</th>
-      </tr>
-    </thead>
-    <tbody id="picks-body">
-      <tr><td colspan="12" class="empty">cargando datos...</td></tr>
-    </tbody>
-  </table>
+<table id="picks-table">
+  <thead>
+    <tr>
+      <th data-col="date">Fecha</th>
+      <th data-col="div">Liga</th>
+      <th data-col="match">Partido</th>
+      <th data-col="market">Mkt</th>
+      <th data-col="odd">Cuota</th>
+      <th data-col="ev">EV</th>
+      <th data-col="prob">Prob</th>
+      <th data-col="stake">Stake</th>
+      <th data-col="xg">xG</th>
+      <th data-col="status">Resultado</th>
+      <th data-col="profit">Profit</th>
+    </tr>
+  </thead>
+  <tbody id="picks-body">
+    <tr><td colspan="11" class="empty">cargando...</td></tr>
+  </tbody>
+</table>
 </div>
 
 <script>
-let allPicks = [];
-let sortCol = 'date';
-let sortDir = -1;
-let activeFilter = 'all';
+let allPicks = [], sortCol = 'date', sortDir = -1;
+let activeFlt = 'all', activeMkt = 'all';
+
+const mktBadge = m => {
+  const map = {UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2'};
+  return `<span class="badge ${map[m]||'b-1x2'}">${m}</span>`;
+};
+const statusBadge = s => {
+  const map = {WIN:'b-win',LOSS:'b-loss',PENDING:'b-pend'};
+  const icon = {WIN:'▲',LOSS:'▼',PENDING:'◎'};
+  return `<span class="badge ${map[s]||''}">${icon[s]||''}${s}</span>`;
+};
+const evClass = v => v >= 0.10 ? 'ev-high' : v >= 0.05 ? 'ev-mid' : 'ev-low';
+const fmtDate = d => { if (!d) return '—'; const p = d.split('T')[0].split('-'); return `${p[2]}/${p[1]}/${p[0].slice(2)}`; };
+const xgBar = (h, a) => {
+  const total = (h||0) + (a||0);
+  if (!total) return '—';
+  const hw = Math.round((h/total)*60);
+  return `<div class="xg-bar"><span style="font-size:.6rem;color:var(--muted)">${(h||0).toFixed(1)}</span><div class="xg-seg" style="width:${hw}px;background:var(--accent)"></div><div class="xg-seg" style="width:${60-hw}px;background:var(--red)"></div><span style="font-size:.6rem;color:var(--muted)">${(a||0).toFixed(1)}</span></div>`;
+};
+
+function updateStats(s) {
+  const resolved = s.wins + s.losses;
+  const br = resolved ? s.wins/resolved : 0;
+  document.getElementById('s-total').textContent = s.total;
+  document.getElementById('s-sub-total').textContent = `${resolved} resueltos`;
+  document.getElementById('s-win').textContent = s.wins;
+  document.getElementById('s-sub-win').textContent = resolved ? `${(s.wins/resolved*100).toFixed(1)}%` : '';
+  document.getElementById('s-loss').textContent = s.losses;
+  document.getElementById('s-sub-loss').textContent = resolved ? `${(s.losses/resolved*100).toFixed(1)}%` : '';
+  document.getElementById('s-pend').textContent = s.pending;
+  const brEl = document.getElementById('s-br');
+  brEl.textContent = resolved ? (br*100).toFixed(1)+'%' : '—';
+  brEl.className = 'stat-value ' + (br >= 0.55 ? 'green' : br >= 0.50 ? 'amber' : 'red');
+  document.getElementById('s-ev').textContent = '+' + s.avg_ev.toFixed(1) + '%';
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = (s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(4);
+  pnlEl.className = 'stat-value ' + (s.pnl > 0 ? 'green' : s.pnl < 0 ? 'red' : 'white');
+  const burnEl = document.getElementById('s-burn');
+  burnEl.textContent = s.resolved + '/30';
+  burnEl.className = 'stat-value ' + (s.resolved >= 30 ? 'green' : 'blue');
+  document.getElementById('s-burn-sub').textContent = s.resolved >= 30 ? '¡listo para live!' : `faltan ${30-s.resolved}`;
+  document.getElementById('last-update').textContent = new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+
+function render() {
+  const search = document.getElementById('search').value.toLowerCase();
+  let data = allPicks.filter(p => {
+    if (activeFlt !== 'all' && p.status !== activeFlt) return false;
+    if (activeMkt !== 'all' && p.market !== activeMkt) return false;
+    if (search) {
+      const hay = ((p.home||'') + ' ' + (p.away||'') + ' ' + (p.div||'') + ' ' + (p.market||'')).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+  data.sort((a,b) => {
+    let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
+    if (typeof av === 'string') av = av.toLowerCase();
+    if (typeof bv === 'string') bv = bv.toLowerCase();
+    return av < bv ? sortDir : av > bv ? -sortDir : 0;
+  });
+  if (!data.length) {
+    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">sin picks con ese filtro</td></tr>`;
+    return;
+  }
+  const rows = data.map(p => {
+    const ev = parseFloat(p.ev||0);
+    const prob = parseFloat(p.prob||0)*100;
+    const stake = parseFloat(p.stake||0)*100;
+    const profit = parseFloat(p.profit||0);
+    const profitStr = p.status === 'PENDING'
+      ? `<span class="neu">—</span>`
+      : `<span class="${profit >= 0 ? 'pos' : 'neg'}">${profit >= 0 ? '+' : ''}${profit.toFixed(4)}</span>`;
+    return `<tr>
+      <td class="muted-td">${fmtDate(p.date)}</td>
+      <td class="muted-td">${p.div||'—'}</td>
+      <td class="party">${p.home||''} <span style="color:var(--muted);font-weight:300">vs</span> ${p.away||''}</td>
+      <td>${mktBadge(p.market)}</td>
+      <td>@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td class="${evClass(ev)}">+${(ev*100).toFixed(1)}%</td>
+      <td class="muted-td">${prob.toFixed(1)}%</td>
+      <td class="muted-td">${stake.toFixed(2)}%</td>
+      <td>${xgBar(p.xg_h, p.xg_a)}</td>
+      <td>${statusBadge(p.status)}</td>
+      <td>${profitStr}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('picks-body').innerHTML = rows;
+}
 
 async function loadData() {
   try {
@@ -1655,123 +1826,44 @@ async function loadData() {
     allPicks = data.picks || [];
     updateStats(data.stats);
     render();
-    document.getElementById('last-update').textContent = 'actualizado: ' + new Date().toLocaleTimeString('es-MX');
   } catch(e) {
-    document.getElementById('picks-body').innerHTML = '<tr><td colspan="12" class="empty">error cargando datos</td></tr>';
+    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">error cargando datos</td></tr>`;
   }
 }
 
-function updateStats(s) {
-  document.getElementById('s-total').textContent = s.total;
-  document.getElementById('s-win').textContent = s.wins;
-  document.getElementById('s-loss').textContent = s.losses;
-  document.getElementById('s-pend').textContent = s.pending;
-  const br = s.wins + s.losses > 0 ? (s.wins / (s.wins + s.losses) * 100) : 0;
-  const brEl = document.getElementById('s-br');
-  brEl.textContent = br.toFixed(1) + '%';
-  brEl.className = 'stat-value ' + (br >= 52 ? 'green' : br >= 48 ? 'neutral' : 'red');
-  document.getElementById('s-ev').textContent = '+' + s.avg_ev.toFixed(1) + '%';
-  const pnlEl = document.getElementById('s-pnl');
-  pnlEl.textContent = (s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(4);
-  pnlEl.className = 'stat-value ' + (s.pnl >= 0 ? 'green' : 'red');
-  document.getElementById('s-burn').textContent = s.resolved + '/30';
-}
-
-function mktBadge(mkt) {
-  const map = { UNDER:'badge-under', OVER:'badge-over', DC:'badge-dc', '1X2':'badge-1x2' };
-  return `<span class="badge ${map[mkt]||'badge-1x2'}">${mkt}</span>`;
-}
-function statusBadge(s) {
-  const map = { WIN:'badge-win', LOSS:'badge-loss', PENDING:'badge-pending' };
-  return `<span class="badge ${map[s]||''}">${s}</span>`;
-}
-
-function render() {
-  const search = document.getElementById('search').value.toLowerCase();
-  let data = allPicks.filter(p => {
-    if (activeFilter !== 'all' && p.status !== activeFilter && p.market !== activeFilter) return false;
-    if (search) {
-      const hay = ((p.home||'') + ' ' + (p.away||'') + ' ' + (p.div||'') + ' ' + (p.market||'') + ' ' + (p.pick||'')).toLowerCase();
-      if (!hay.includes(search)) return false;
-    }
-    return true;
-  });
-
-  data.sort((a,b) => {
-    let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
-    if (typeof av === 'string') av = av.toLowerCase();
-    if (typeof bv === 'string') bv = bv.toLowerCase();
-    return av < bv ? sortDir : av > bv ? -sortDir : 0;
-  });
-
-  if (!data.length) {
-    document.getElementById('picks-body').innerHTML = '<tr><td colspan="12" class="empty">sin picks con ese filtro</td></tr>';
-    return;
-  }
-
-  const rows = data.map(p => {
-    const ev = parseFloat(p.ev) * 100;
-    const prob = parseFloat(p.prob) * 100;
-    const stake = parseFloat(p.stake) * 100;
-    const profit = parseFloat(p.profit || 0);
-    const profitStr = p.status === 'PENDING' ? '<span class="muted">—</span>' :
-      `<span class="${profit >= 0 ? 'positive' : 'negative'}">${profit >= 0 ? '+' : ''}${profit.toFixed(4)}</span>`;
-    const evStr = `<span class="${ev >= 0 ? 'positive' : 'negative'}">${ev >= 0 ? '+' : ''}${ev.toFixed(1)}%</span>`;
-    const date = (p.date || '').split('T')[0];
-    return `<tr>
-      <td class="muted">${date}</td>
-      <td>${p.div || '—'}</td>
-      <td>${p.home} vs ${p.away}</td>
-      <td>${mktBadge(p.market)}</td>
-      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis">${p.pick}</td>
-      <td>@${parseFloat(p.odd).toFixed(2)}</td>
-      <td>${evStr}</td>
-      <td>${prob.toFixed(1)}%</td>
-      <td>${stake.toFixed(2)}%</td>
-      <td>${statusBadge(p.status)}</td>
-      <td>${profitStr}</td>
-      <td class="muted">${parseFloat(p.xg_h||0).toFixed(2)}/${parseFloat(p.xg_a||0).toFixed(2)}</td>
-    </tr>`;
-  }).join('');
-
-  document.getElementById('picks-body').innerHTML = rows;
-}
-
-document.querySelectorAll('.filter-btn[data-filter]').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.filter-btn[data-filter]').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    activeFilter = btn.dataset.filter;
-    render();
-  });
-});
-
-document.getElementById('search').addEventListener('input', render);
-
-document.querySelectorAll('thead th[data-col]').forEach(th => {
-  th.addEventListener('click', () => {
-    const col = th.dataset.col;
-    if (sortCol === col) sortDir *= -1;
-    else { sortCol = col; sortDir = -1; }
-    document.querySelectorAll('thead th').forEach(t => t.classList.remove('sorted'));
-    th.classList.add('sorted');
-    render();
-  });
-});
-
-async function syncData() {
-  const btn = document.getElementById('sync-btn');
-  btn.textContent = 'resolviendo...';
-  btn.disabled = true;
+async function resolveData() {
+  const btn = document.getElementById('resolve-btn');
+  btn.textContent = 'resolviendo...'; btn.disabled = true;
   try {
     const r = await fetch('/api/resolve');
     const d = await r.json();
-    if (d.error) { btn.textContent = 'error: ' + d.error; }
-    else { btn.textContent = 'resueltos: ' + (d.resolved||0) + ' (' + (d.wins||0) + 'W/' + (d.losses||0) + 'L)'; }
+    btn.textContent = d.error ? 'error' : `✓ ${d.resolved||0} resueltos (${d.wins||0}W/${d.losses||0}L)`;
     await loadData();
   } catch(e) { btn.textContent = 'error'; }
   setTimeout(() => { btn.textContent = 'resolver picks'; btn.disabled = false; }, 5000);
 }
+
+document.querySelectorAll('#filter-seg .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#filter-seg .seg-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active'); activeFlt = btn.dataset.filter; render();
+  });
+});
+document.querySelectorAll('#mkt-seg .seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#mkt-seg .seg-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active'); activeMkt = btn.dataset.mkt; render();
+  });
+});
+document.querySelectorAll('thead th[data-col]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.col;
+    if (sortCol === col) { sortDir *= -1; th.classList.toggle('asc'); }
+    else { sortCol = col; sortDir = -1; document.querySelectorAll('thead th').forEach(t => { t.classList.remove('sorted','asc'); }); }
+    th.classList.add('sorted'); render();
+  });
+});
+document.getElementById('search').addEventListener('input', render);
 
 loadData();
 setInterval(loadData, 60000);
@@ -1779,7 +1871,6 @@ setInterval(loadData, 60000);
 </body>
 </html>
 """
-
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
@@ -1979,6 +2070,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(err)
 
+def auto_resolve():
+    """Resuelve picks PENDING contra CSVs al arrancar. Sin requests externos."""
+    import difflib as dl
+    import pandas as pd
+    resolved = wins = losses = 0
+    try:
+        conn_r = sqlite3.connect(DB_PATH)
+        pending = conn_r.execute("""
+            SELECT id, div, home_team, away_team, market, selection,
+                   odd_open, stake_pct
+            FROM picks_log WHERE result='PENDING'
+        """).fetchall()
+        for pid, div, home, away, mkt, pick, odd, stake in pending:
+            path = os.path.join(DATA_DIR, f"{div}.csv")
+            if not os.path.exists(path):
+                continue
+            try:
+                try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                except: df = pd.read_csv(path, encoding="latin-1")
+                df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                        "HG":"FTHG","AG":"FTAG"})
+                played = df.dropna(subset=["FTHG","FTAG"])
+                teams = pd.concat([played["HomeTeam"], played["AwayTeam"]]).unique()
+                rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
+                ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
+                if not rh or not ra: continue
+                m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
+                if m.empty: continue
+                fthg = float(m.iloc[-1]["FTHG"])
+                ftag = float(m.iloc[-1]["FTAG"])
+                res = check_result(pick, mkt, fthg, ftag,
+                                   home_name=rh[0], away_name=ra[0])
+                if res not in ("WIN","LOSS"): continue
+                profit = round(
+                    float(stake or 0)*float(odd or 0) - float(stake or 0)
+                    if res=="WIN" else -float(stake or 0), 4)
+                conn_r.execute(
+                    "UPDATE picks_log SET result=?, profit=? WHERE id=?",
+                    (res, profit, pid))
+                resolved += 1
+                if res=="WIN": wins += 1
+                else: losses += 1
+            except Exception:
+                continue
+        conn_r.commit(); conn_r.close()
+        if resolved:
+            print(f"  ✅ Auto-resolve: {resolved} picks ({wins}W/{losses}L)", flush=True)
+    except Exception as e:
+        print(f"  ⚠️ auto_resolve: {e}", flush=True)
+
 def start_dashboard(port=8080):
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1989,6 +2130,7 @@ def start_dashboard(port=8080):
 if __name__ == "__main__":
     # Arrancar dashboard web en puerto 8080
     start_dashboard(port=int(os.getenv("PORT", "8080")))
+    auto_resolve()   # resolver picks PENDING contra CSVs al arrancar
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
@@ -2027,11 +2169,13 @@ if __name__ == "__main__":
             try: bot.refresh_csvs()
             except Exception as e: print(f"⚠️ refresh_csvs: {e}", flush=True)
 
-        # 07:00 — audit + pnl
+        # 07:00 — audit + pnl + auto-resolve
         if (hh, mm) == (AUDIT_H, AUDIT_M) and not _ran_today("audit"):
             _mark_ran("audit")
             try: run_audit()
             except Exception as e: print(f"⚠️ run_audit: {e}", flush=True)
+            try: auto_resolve()
+            except Exception as e: print(f"⚠️ auto_resolve: {e}", flush=True)
             try: calc_pnl()
             except Exception as e: print(f"⚠️ calc_pnl: {e}", flush=True)
 
