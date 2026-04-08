@@ -117,6 +117,25 @@ TARGET_LEAGUES = {
     "G1":  {"name": "🇬🇷 Super League",   "liq": 0.78, "xg_std": 1.55, "avg_goals": 2.48,
              "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
              "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
+    # ── Segundas divisiones — mayor ineficiencia de mercado ──────────────
+    "D2":  {"name": "🇩🇪 Bundesliga 2",   "liq": 0.82, "xg_std": 1.62, "avg_goals": 2.95,
+             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.95},
+    "I2":  {"name": "🇮🇹 Serie B",        "liq": 0.78, "xg_std": 1.55, "avg_goals": 2.42,
+             "conv_home": 0.29, "conv_away": 0.30, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
+    "SP2": {"name": "🇪🇸 Segunda Div",    "liq": 0.80, "xg_std": 1.52, "avg_goals": 2.48,
+             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
+    "F2":  {"name": "🇫🇷 Ligue 2",        "liq": 0.78, "xg_std": 1.50, "avg_goals": 2.35,
+             "conv_home": 0.29, "conv_away": 0.30, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
+    "SC0": {"name": "🏴󠁧󠁢󠁳󠁣󠁴 Premiership",   "liq": 0.80, "xg_std": 1.58, "avg_goals": 2.62,
+             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
+    "E2":  {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 League One",   "liq": 0.78, "xg_std": 1.52, "avg_goals": 2.60,
+             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
+             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
     # ── BSA — goles proxy + Trend fd.org + fixtures fd.org ───────────────
     "BSA": {"name": "🇧🇷 Brasileirao",    "liq": 0.80, "xg_std": 1.54, "avg_goals": 2.39,
              "conv_home": None, "conv_away": None, "has_shots": False,
@@ -141,6 +160,12 @@ CSV_URLS = {
     "B1":  "https://www.football-data.co.uk/mmz4281/2526/B1.csv",
     "T1":  "https://www.football-data.co.uk/mmz4281/2526/T1.csv",
     "G1":  "https://www.football-data.co.uk/mmz4281/2526/G1.csv",
+    "D2":  "https://www.football-data.co.uk/mmz4281/2526/D2.csv",
+    "I2":  "https://www.football-data.co.uk/mmz4281/2526/I2.csv",
+    "SP2": "https://www.football-data.co.uk/mmz4281/2526/SP2.csv",
+    "F2":  "https://www.football-data.co.uk/mmz4281/2526/F2.csv",
+    "SC0": "https://www.football-data.co.uk/mmz4281/2526/SC0.csv",
+    "E2":  "https://www.football-data.co.uk/mmz4281/2526/E2.csv",
 }
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
@@ -386,6 +411,28 @@ def _form(series):
     if p < 0.1: return 1.0
     return max(0.85, min(r/p, 1.15))
 
+def _form_pts(gf_series, ga_series, n=5):
+    """
+    Forma basada en puntos reales (V/E/D) de los últimos N partidos.
+    Retorna multiplicador 0.80–1.20 basado en rendimiento reciente.
+    Mejor señal que _form() porque captura rachas reales de resultados.
+    """
+    if len(gf_series) < 3 or len(ga_series) < 3:
+        return 1.0
+    pts = []
+    for gf, ga in zip(gf_series[:n], ga_series[:n]):
+        if gf > ga:   pts.append(3)   # victoria
+        elif gf == ga: pts.append(1)  # empate
+        else:          pts.append(0)  # derrota
+    if not pts: return 1.0
+    # Promedio ponderado con decay — partidos recientes pesan más
+    weights = [0.85**i for i in range(len(pts))]
+    avg_pts = sum(p*w for p,w in zip(pts,weights)) / sum(weights)
+    # Normalizar: 3pts = forma perfecta (1.20), 0pts = forma terrible (0.80)
+    # Media esperada ~1.3 pts/partido en liga típica → factor neutral
+    factor = 0.80 + (avg_pts / 3.0) * 0.40
+    return round(max(0.80, min(factor, 1.20)), 3)
+
 def get_team_stats(df, team_name, cfg, depth=8):
     """
     Extrae xG del equipo desde el DataFrame.
@@ -417,18 +464,26 @@ def get_team_stats(df, team_name, cfg, depth=8):
                     sa_l.append(ast if ih else hst)
             except: pass
 
+    # Forma xG (goles marcados/concedidos) — detecta tendencia ofensiva/defensiva
     ff_f = _form(gf_l); ff_a = _form(ga_l)
+    # Forma puntos (V/E/D) — detecta rachas de resultados reales
+    # Blend: 60% forma xG + 40% forma puntos para capturar contexto real
+    fp_f = _form_pts(gf_l, ga_l, n=5)
+    fp_a = _form_pts(ga_l, gf_l, n=5)   # para déficit: invertir perspectiva
+    ff_f_final = ff_f * 0.60 + fp_f * 0.40
+    ff_a_final = ff_a * 0.60 + fp_a * 0.40
+
     if cfg["has_shots"] and sf_l:
-        xgf = _wavg(sf_l) * cfg["conv_home"] * ff_f
-        xga = _wavg(sa_l) * cfg["conv_away"] * ff_a
+        xgf = _wavg(sf_l) * cfg["conv_home"] * ff_f_final
+        xga = _wavg(sa_l) * cfg["conv_away"] * ff_a_final
         src = "shots"
     else:
-        xgf = _wavg(gf_l) * ff_f
-        xga = _wavg(ga_l) * ff_a
+        xgf = _wavg(gf_l) * ff_f_final
+        xga = _wavg(ga_l) * ff_a_final
         src = "goals_proxy"
 
     conf = "HIGH" if len(gf_l)>=6 else "MED" if len(gf_l)>=3 else "LOW"
-    print(f"    [{name}] {len(gf_l)}pts via {src} → xGF={xgf:.2f} xGA={xga:.2f} {conf}", flush=True)
+    print(f"    [{name}] {len(gf_l)}pts via {src} → xGF={xgf:.2f} xGA={xga:.2f} {conf} [forma={ff_f_final:.2f}]", flush=True)
     return xgf, xga, gf_l, ga_l, conf
 
 def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
@@ -790,7 +845,9 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
                     dc_odd = 1/(1/od + 1/oa) if od and oa else None
                 else:
                     dc_odd = 1/(1/oh + 1/oa) if oh and oa else None
-                if dc_odd and dc_odd > 1.01:
+                # FILTRO CALIBRADO: DC solo funciona con cuota < 1.52
+                # Análisis 40 picks: cuota <1.50 = 100% BR, cuota 1.50-1.60 = 33% BR
+                if dc_odd and 1.01 < dc_odd < 1.52:
                     out.append({"mkt":"DC","pick":dc_pick,"odd":round(dc_odd,2),
                                 "prob":dc_prob,
                                 "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
@@ -836,11 +893,23 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     o25 = odds.get("O25") or ts.get("ou25_odd")
     u25 = odds.get("U25")
     if o25 and o25>1.01:
-        out.append({"mkt":"OVER","pick":"Over 2.5 Goles","odd":o25,"prob":po,
-                    "model_gap":round(po-1/(o25*1.07),4)})
+        xg_total = xh + xa
+        # FILTRO CALIBRADO: Over en xG 2.5-3.2 tiene 33% BR (análisis 40 picks)
+        # Solo apostar Over si el xG total es suficientemente alto (>3.2) o bajo (<2.5)
+        if not (2.50 <= xg_total <= 3.20):
+            out.append({"mkt":"OVER","pick":"Over 2.5 Goles","odd":o25,"prob":po,
+                        "model_gap":round(po-1/(o25*1.07),4)})
+        else:
+            pass  # xG 2.5-3.2 → skip Over (rango sin edge)
     if u25 and u25>1.01:
-        out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
-                    "model_gap":round(pu-1/(u25*1.07),4)})
+        xg_total = xh + xa
+        # FILTRO CALIBRADO: Under en xG 1.8-2.2 tiene 33% BR (análisis 40 picks)
+        # Ese rango es el más peligroso — mercado ya lo sabe
+        if not (1.80 <= xg_total <= 2.20):
+            out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
+                        "model_gap":round(pu-1/(u25*1.07),4)})
+        else:
+            pass  # xG 1.8-2.2 → skip Under (rango descalibrado)
 
     # ── BTTS Sí / No ─────────────────────────────────────────────────────
     if conf != "LOW":
@@ -1457,7 +1526,7 @@ class TripleLeagueV72:
             conn=sqlite3.connect(DB_PATH); cc=conn.cursor()
             cc.execute(
                 "SELECT id,fixture_id,div,home_team,away_team,market,selection,odd_open,kickoff_time "
-                "FROM picks_log WHERE clv_captured=0 AND result='PENDING'"
+                "FROM picks_log WHERE clv_captured=0 AND result IN ('PENDING','WIN','LOSS')"
             )
             pending=cc.fetchall(); conn.close()
             if not pending: return
@@ -1467,7 +1536,10 @@ class TripleLeagueV72:
                 pid,fid,div,home,away,mkt,sel,odd_open,ko_str=row
                 try:
                     ko=datetime.fromisoformat(ko_str.replace("Z","+00:00"))
-                    if not -1<=(ko-now_utc).total_seconds()/3600<=6: continue
+                    hours_diff = (ko-now_utc).total_seconds()/3600
+                    # Capturar picks que se juegan hoy (hasta 12h antes del KO)
+                    # o que ya empezaron hace menos de 3h (para partidos tarde)
+                    if not -3 <= hours_diff <= 12: continue
                 except: continue
 
                 odd_close=None
@@ -1507,17 +1579,51 @@ class TripleLeagueV72:
                         elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
                         elif mkt=="BTTS":  odd_close=ts.get("bts_odd")
                 elif fix_df is not None:
-                    # [1] fixtures.csv para europeas (E0,E1,SP1,D1,I1,F1,N1,P1)
-                    rh=difflib.get_close_matches(home,fix_df["HomeTeam"].dropna().unique(),n=1,cutoff=0.6)
-                    ra=difflib.get_close_matches(away,fix_df["AwayTeam"].dropna().unique(),n=1,cutoff=0.6)
+                    # [1] fixtures.csv para europeas — usar Pinnacle como closing line
+                    # Pinnacle es el bookmaker más eficiente — mejor referencia de mercado
+                    rh=difflib.get_close_matches(home,fix_df["HomeTeam"].dropna().unique(),n=1,cutoff=0.55)
+                    ra=difflib.get_close_matches(away,fix_df["AwayTeam"].dropna().unique(),n=1,cutoff=0.55)
                     if rh and ra:
                         m=fix_df[(fix_df["HomeTeam"]==rh[0])&(fix_df["AwayTeam"]==ra[0])]
                         if not m.empty:
-                            co=get_odds_from_row(m.iloc[0],cfg)
-                            if mkt=="OVER":   odd_close=co.get("O25")
+                            row=m.iloc[0]
+                            def best_close(*cols):
+                                for c in cols:
+                                    try:
+                                        v=row.get(c) if hasattr(row,"get") else getattr(row,c,None)
+                                        if v is not None:
+                                            f=float(v)
+                                            if f>1.01 and not (f!=f): return f
+                                    except: pass
+                                return None
+                            # Prioridad: Pinnacle > BetVictor > B365 > Avg
+                            co={
+                                "H":   best_close("PSH","VCH","B365H","AvgH","BbAvH"),
+                                "D":   best_close("PSD","VCD","B365D","AvgD","BbAvD"),
+                                "A":   best_close("PSA","VCA","B365A","AvgA","BbAvA"),
+                                "O25": best_close("P>2.5","B365>2.5","Avg>2.5","BbAv>2.5"),
+                                "U25": best_close("P<2.5","B365<2.5","Avg<2.5","BbAv<2.5"),
+                                "BTTS_Y": best_close("B365BTTSY","BbAvBBTS"),
+                            }
+                            if mkt=="OVER":    odd_close=co.get("O25")
                             elif mkt=="UNDER": odd_close=co.get("U25")
                             elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
                             elif mkt=="BTTS":  odd_close=co.get("BTTS_Y")
+                            elif mkt=="DC":
+                                # DC closing: derivar de Pinnacle H/D/A
+                                oh,od,oa=co.get("H"),co.get("D"),co.get("A")
+                                if oh and od and oa:
+                                    if "o Empate" in sel and not sel.startswith("DC: Empate"):
+                                        odd_close=round(1/(1/oh+1/od),2)
+                                    elif "Empate o" in sel:
+                                        odd_close=round(1/(1/od+1/oa),2)
+                                    else:
+                                        odd_close=round(1/(1/oh+1/oa),2)
+                            elif mkt=="DNB":
+                                oh,od,oa=co.get("H"),co.get("D"),co.get("A")
+                                if oh and od:
+                                    try: odd_close=round(1/(1/oh-1/od),2) if (1/oh-1/od)>0.05 else None
+                                    except: odd_close=None
 
                 if odd_close and odd_open:
                     clv_pct=(odd_close/odd_open-1)*100
@@ -1529,7 +1635,15 @@ class TripleLeagueV72:
                     clv_lines.append(f"{sel} @{odd_open:.2f}→{odd_close:.2f} CLV={clv_pct:+.1f}%")
 
             if clv_lines:
-                send_msg("📉 <b>CLV V7.2:</b>\n"+"\n".join(clv_lines))
+                pos = sum(1 for l in clv_lines if "CLV=+" in l)
+                neg = len(clv_lines) - pos
+                beat_rate = pos/len(clv_lines)*100 if clv_lines else 0
+                send_msg(
+                    f"📉 <b>CLV V7.2</b> — {len(clv_lines)} picks\n"
+                    f"Beat closing: {pos}/{len(clv_lines)} ({beat_rate:.0f}%)\n"
+                    f"{'\n'.join(clv_lines[:10])}"
+                    + (f"\n... +{len(clv_lines)-10} más" if len(clv_lines)>10 else "")
+                )
         except Exception as e:
             print(f"  ⚠️ CLV: {e}", flush=True)
 
