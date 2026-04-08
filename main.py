@@ -3,6 +3,134 @@ from datetime import datetime, timedelta, timezone
 from math import exp, lgamma, log
 
 # ============================================================
+# LOGGER ESTRUCTURADO — salida clara para Railway logs
+# ============================================================
+
+class Log:
+    """Logger con timestamps UTC y niveles. Todo va a stdout para Railway."""
+
+    _session_stats = {
+        "picks_generados": 0,
+        "picks_rechazados": 0,
+        "csvs_descargados": 0,
+        "errores": 0,
+        "clv_capturados": 0,
+        "picks_resueltos": 0,
+    }
+
+    @staticmethod
+    def _ts():
+        return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+    @staticmethod
+    def info(msg, section=None):
+        prefix = f"[{Log._ts()}]"
+        if section: prefix += f" [{section}]"
+        print(f"{prefix} {msg}", flush=True)
+
+    @staticmethod
+    def ok(msg, section=None):
+        prefix = f"[{Log._ts()}] ✅"
+        if section: prefix += f" [{section}]"
+        print(f"{prefix} {msg}", flush=True)
+
+    @staticmethod
+    def warn(msg, section=None):
+        prefix = f"[{Log._ts()}] ⚠️"
+        if section: prefix += f" [{section}]"
+        print(f"{prefix} {msg}", flush=True)
+        Log._session_stats["errores"] += 1
+
+    @staticmethod
+    def err(msg, section=None):
+        prefix = f"[{Log._ts()}] ❌"
+        if section: prefix += f" [{section}]"
+        print(f"{prefix} {msg}", flush=True)
+        Log._session_stats["errores"] += 1
+
+    @staticmethod
+    def pick(label, mkt, odd, ev, urs, xgh, xga, conf):
+        Log._session_stats["picks_generados"] += 1
+        print(
+            f"[{Log._ts()}] 🎯 PICK | {label} | {mkt} @{odd:.2f} "
+            f"EV={ev*100:.1f}% URS={urs:.3f} xG={xgh:.2f}/{xga:.2f} {conf}",
+            flush=True
+        )
+
+    @staticmethod
+    def rej(label, mkt, odd, ev, reason):
+        Log._session_stats["picks_rechazados"] += 1
+        print(
+            f"[{Log._ts()}] ↩  REJ  | {label} | {mkt} @{odd:.2f} "
+            f"EV={ev*100:.1f}% → {reason}",
+            flush=True
+        )
+
+    @staticmethod
+    def scan_start(dates):
+        print(f"\n{'='*60}", flush=True)
+        print(f"[{Log._ts()}] 🔍 SCAN — {' / '.join(dates)}", flush=True)
+        print(f"{'='*60}", flush=True)
+        Log._session_stats["picks_generados"] = 0
+        Log._session_stats["picks_rechazados"] = 0
+
+    @staticmethod
+    def scan_end(n_picks, n_leagues, heat, vol):
+        print(f"{'='*60}", flush=True)
+        print(
+            f"[{Log._ts()}] 📊 SCAN FIN | {n_picks} picks | {n_leagues} ligas "
+            f"| Heat={heat*100:.1f}% Vol={vol*100:.1f}%",
+            flush=True
+        )
+        r = Log._session_stats["picks_rechazados"]
+        g = Log._session_stats["picks_generados"]
+        pct = g/(g+r)*100 if (g+r) > 0 else 0
+        print(f"[{Log._ts()}]    Candidatos: {g+r} analizados → {g} picks ({pct:.0f}% pass rate)", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+    @staticmethod
+    def audit_end(resolved, wins, losses):
+        Log._session_stats["picks_resueltos"] += resolved
+        if resolved:
+            br = wins/resolved*100 if resolved else 0
+            print(
+                f"[{Log._ts()}] 🔬 AUDIT | {resolved} resueltos "
+                f"| {wins}W/{losses}L | BR={br:.1f}%",
+                flush=True
+            )
+        else:
+            print(f"[{Log._ts()}] 🔬 AUDIT | 0 picks nuevos resueltos", flush=True)
+
+    @staticmethod
+    def clv_end(n, beat):
+        Log._session_stats["clv_capturados"] += n
+        if n:
+            print(
+                f"[{Log._ts()}] 📉 CLV | {n} capturados "
+                f"| Beat closing: {beat:.0f}%",
+                flush=True
+            )
+        else:
+            print(f"[{Log._ts()}] 📉 CLV | 0 picks en ventana de captura", flush=True)
+
+    @staticmethod
+    def csv_ok(div, kb):
+        Log._session_stats["csvs_descargados"] += 1
+        print(f"[{Log._ts()}] 📥 CSV  | {div} ({kb}KB)", flush=True)
+
+    @staticmethod
+    def daily_summary():
+        s = Log._session_stats
+        print(f"\n{'='*60}", flush=True)
+        print(f"[{Log._ts()}] 📋 RESUMEN DEL DÍA", flush=True)
+        print(f"  CSVs descargados: {s['csvs_descargados']}", flush=True)
+        print(f"  Picks generados:  {s['picks_generados']}", flush=True)
+        print(f"  Picks resueltos:  {s['picks_resueltos']}", flush=True)
+        print(f"  CLV capturados:   {s['clv_capturados']}", flush=True)
+        print(f"  Errores/warnings: {s['errores']}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+# ============================================================
 # TRIPLE LEAGUE V7.2 — HYBRID ENGINE (BUGS CORREGIDOS)
 # ============================================================
 #
@@ -277,7 +405,7 @@ def send_msg(text, use_html=True):
         print(f"Telegram err: {e}", flush=True)
 
 def log_rej(label, market, odd, ev, reason):
-    print(f"     ❌ {reason}: {market} @{odd:.2f} EV={ev*100:.1f}%", flush=True)
+    Log.rej(label, market, odd, ev, reason)
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO rejections_log VALUES (NULL,?,?,?,?,?,?)",
@@ -316,14 +444,14 @@ def download_csv(div, force=False):
             first_line = r.content[:200].decode("utf-8", errors="ignore").split("\n")[0]
             if "," in first_line:
                 with open(path, "wb") as f: f.write(r.content)
-                print(f"  📥 {div} descargado ({len(r.content)//1024}KB)", flush=True)
+                Log.csv_ok(div, len(r.content)//1024)
             else:
-                print(f"  ⚠️ {div}: respuesta no es CSV válido — conservando archivo anterior", flush=True)
+                Log.warn(f"{div}: respuesta no es CSV válido — conservando archivo anterior", "CSV")
         elif r.status_code != 200:
-            print(f"  ⚠️ {div}: HTTP {r.status_code} — conservando archivo anterior", flush=True)
+            Log.warn(f"{div}: HTTP {r.status_code} — conservando", "CSV")
         return path
     except Exception as e:
-        print(f"  ⚠️ CSV {div}: {e}", flush=True)
+        Log.err(f"CSV {div}: {e}", "CSV")
         return path if os.path.exists(path) else None
 
 def load_csv(div):
@@ -367,10 +495,10 @@ def get_fixtures_csv():
                                   on_bad_lines="skip")
         df.columns = df.columns.str.strip()
         df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-        print(f"  📅 fixtures.csv: {len(df)} partidos", flush=True)
+        Log.info(f"fixtures.csv: {len(df)} partidos", "DATA")
         return df
     except Exception as e:
-        print(f"  ⚠️ fixtures.csv: {e}", flush=True); return None
+        Log.err(f"fixtures.csv: {e}", "DATA"); return None
 
 def get_odds_from_row(row, cfg):
     """
@@ -483,7 +611,7 @@ def get_team_stats(df, team_name, cfg, depth=8):
         src = "goals_proxy"
 
     conf = "HIGH" if len(gf_l)>=6 else "MED" if len(gf_l)>=3 else "LOW"
-    print(f"    [{name}] {len(gf_l)}pts via {src} → xGF={xgf:.2f} xGA={xga:.2f} {conf} [forma={ff_f_final:.2f}]", flush=True)
+    Log.info(f"  {name}: xGF={xgf:.2f} xGA={xga:.2f} {conf} via {src} forma={ff_f_final:.2f}", "xG")
     return xgf, xga, gf_l, ga_l, conf
 
 def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
@@ -529,7 +657,7 @@ def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
         if af: to_cache(ka, away_name, af, aa, ag, aga, ac)
 
     if hf is None or af is None:
-        print(f"    DEFAULT 1.20/1.20 — sin datos para {home_name} vs {away_name}", flush=True)
+        Log.warn(f"DEFAULT xG para {home_name} vs {away_name}", "xG")
         return 1.20, 1.20, 2.40, "LOW", "default"
 
     xh = (hf + aa) / 2
@@ -542,7 +670,7 @@ def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
     conf = "HIGH" if (hc=="HIGH" and ac=="HIGH") else \
            "MED"  if (hc!="LOW" and ac!="LOW") else "LOW"
     src  = "csv_shots" if cfg["has_shots"] else "csv_goals_proxy"
-    print(f"    xG: H={xh:.2f} A={xa:.2f} T={xh+xa:.2f} {conf}", flush=True)
+    Log.info(f"  xG: H={xh:.2f} A={xa:.2f} T={xh+xa:.2f} {conf}", "xG")
     return xh, xa, xh+xa, conf, src
 
 # ============================================================
@@ -569,17 +697,17 @@ def fetch_trends(date_str, codes):
         )
         track_req()
         if r.status_code != 200:
-            print(f"  ⚠️ Trends {date_str} HTTP {r.status_code}", flush=True); return {}
+            Log.warn(f"Trends {date_str} HTTP {r.status_code}", "DATA"); return {}
         result = {}
         for m in r.json().get("matches", []):
             h_id = m.get("homeTeam",{}).get("id")
             a_id = m.get("awayTeam",{}).get("id")
             if h_id and a_id: result[f"{h_id}_{a_id}"] = m
         _TREND_MEM[key] = result
-        print(f"  ✅ Trends {date_str}: {len(result)} partidos", flush=True)
+        Log.info(f"Trends {date_str}: {len(result)} partidos", "DATA")
         return result
     except Exception as e:
-        print(f"  ⚠️ Trends: {e}", flush=True); return {}
+        Log.err(f"Trends: {e}", "DATA"); return {}
 
 def extract_trend(entry):
     """Extrae pct_o25, pct_bts y cuotas del Trend Resource."""
@@ -652,7 +780,7 @@ def get_mx_season(headers):
             for s in seasons:
                 if s.get("current"):
                     yr = s.get("year", 2026)
-                    print(f"  ✅ Liga MX season activo: {yr}", flush=True)
+                    Log.ok(f"Liga MX season: {yr}", "MEX")
                     return yr
         # Si no hay current=true, usar el más reciente
         all_years = []
@@ -1095,10 +1223,11 @@ def run_audit():
                 conn_a.commit(); conn_a.close()
             except Exception as db_e:
                 print(f"  ⚠️ audit DB sync: {db_e}", flush=True)
+        Log.audit_end(resolved, wins, losses)
         if resolved:
             send_msg(f"🔬 <b>Auditoría V7.2</b>\nResueltos: {resolved} | ✅{wins} WIN | ❌{losses} LOSS")
     except Exception as e:
-        print(f"  ⚠️ audit: {e}", flush=True)
+        Log.err(f"audit: {e}", "AUDIT")
 
 def calc_pnl():
     import pandas as pd
@@ -1119,7 +1248,7 @@ def calc_pnl():
             f"Burn-in: {nw+nl}/30 picks"
         )
     except Exception as e:
-        print(f"  ⚠️ pnl: {e}", flush=True)
+        Log.err(f"pnl: {e}", "PNL")
 
 # ============================================================
 # KILL-SWITCH — protección de capital
@@ -1159,7 +1288,7 @@ def kill_switch_check():
                 f"PnL acumulado: {cumulative:+.4f}U | Pico: {peak:+.4f}U\n"
                 f"Sistema en pausa. Revisar modelo antes de reactivar."
             )
-            print(f"  🚨 KILL-SWITCH: drawdown {drawdown*100:.1f}% — pausando", flush=True)
+            Log.err(f"KILL-SWITCH: drawdown {drawdown*100:.1f}% — PAUSANDO SISTEMA", "RISK")
             return True
         elif drawdown >= KILL_DRAWDOWN * 0.7:
             # Advertencia al 70% del límite
@@ -1205,9 +1334,9 @@ class TripleLeagueV72:
             if r['ready_for_live'] and not LIVE_TRADING:
                 send_msg("🟢 <b>BURN-IN SUPERADO.</b> Activar LIVE_TRADING manualmente.")
         except ImportError:
-            print("  ⚠️ burn_in_evaluator.py no encontrado — omitiendo evaluación.", flush=True)
+            Log.warn("burn_in_evaluator.py no encontrado", "BURNIN")
         except Exception as e:
-            print(f"  ⚠️ burn-in eval: {e}", flush=True)
+            Log.err(f"burn-in eval: {e}", "BURNIN")
 
     def _filter(self, probs, label, fid, h_n, a_n, ko, xh, xa, xt, conf, src, div, ts):
         """Aplica filtros y retorna candidatos válidos listos para el portfolio."""
@@ -1324,6 +1453,7 @@ class TripleLeagueV72:
         today_str = datetime.now().strftime("%d/%m/%Y")
         preliminary = []
 
+        Log.scan_start([tomorrow, day_after])
         send_msg(
             f"🔍 <b>V7.2 Scan D-1</b>\n"
             f"🗓 {tomorrow} / {day_after}\n"
@@ -1431,9 +1561,9 @@ class TripleLeagueV72:
                         apif_odds = get_mx_odds(apif_fid, self.apif_h)
                         if apif_odds:
                             odds.update(apif_odds)
-                            print(f"     📡 BSA odds via api-football", flush=True)
+                            Log.info("BSA odds via api-football", "BSA")
                     if not odds.get("H"):
-                        print(f"     ⚠️ BSA sin cuotas — skip", flush=True)
+                        Log.warn("BSA sin cuotas — skip", "BSA")
                         log_rej(label,"ALL",0,0,"NO_ODDS_AVAILABLE"); continue
 
                 ok,reason=validate_xg(xh,xa,odds["H"],odds["A"],odds["O25"])
@@ -1634,6 +1764,7 @@ class TripleLeagueV72:
                     conn.commit(); conn.close()
                     clv_lines.append(f"{sel} @{odd_open:.2f}→{odd_close:.2f} CLV={clv_pct:+.1f}%")
 
+            Log.clv_end(len(clv_lines), sum(1 for l in clv_lines if "CLV=+" in l)/max(len(clv_lines),1)*100)
             if clv_lines:
                 pos = sum(1 for l in clv_lines if "CLV=+" in l)
                 neg = len(clv_lines) - pos
@@ -1645,7 +1776,7 @@ class TripleLeagueV72:
                     + (f"\n... +{len(clv_lines)-10} más" if len(clv_lines)>10 else "")
                 )
         except Exception as e:
-            print(f"  ⚠️ CLV: {e}", flush=True)
+            Log.err(f"CLV: {e}", "CLV")
 
     # ── WEEKLY — STANDINGS fd.org ─────────────────────────────────────────
 
@@ -2342,15 +2473,15 @@ def auto_resolve():
                 continue
         conn_r.commit(); conn_r.close()
         if resolved:
-            print(f"  ✅ Auto-resolve: {resolved} picks ({wins}W/{losses}L)", flush=True)
+            Log.ok(f"Auto-resolve: {resolved} picks ({wins}W/{losses}L)", "RESOLVE")
     except Exception as e:
-        print(f"  ⚠️ auto_resolve: {e}", flush=True)
+        Log.err(f"auto_resolve: {e}", "RESOLVE")
 
 def start_dashboard(port=8080):
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    print(f"  🌐 Dashboard en http://0.0.0.0:{port}", flush=True)
+    Log.ok(f"Dashboard en http://0.0.0.0:{port}", "DASH")
     return server
 
 if __name__ == "__main__":
@@ -2384,7 +2515,7 @@ if __name__ == "__main__":
     CLV_H,  CLV_M  = _hhmm(RUN_TIME_CLV)            # 16:00
     STAND_H,STAND_M= _hhmm(RUN_TIME_STANDINGS)      # 09:00 martes
 
-    print("⏰ Scheduler UTC activo", flush=True)
+    Log.ok("Scheduler UTC activo — 06:00 CSV / 06:30 SCAN / 07:00 AUDIT / 16:00 CLV", "SCHED")
     while True:
         now = datetime.now(timezone.utc)
         hh, mm = now.hour, now.minute
@@ -2393,37 +2524,38 @@ if __name__ == "__main__":
         if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
             _mark_ran("csv")
             try: bot.refresh_csvs()
-            except Exception as e: print(f"⚠️ refresh_csvs: {e}", flush=True)
+            except Exception as e: Log.err(f"refresh_csvs: {e}", "SCHED")
 
         # 07:00 — audit + pnl + auto-resolve
         if (hh, mm) == (AUDIT_H, AUDIT_M) and not _ran_today("audit"):
             _mark_ran("audit")
             try: run_audit()
-            except Exception as e: print(f"⚠️ run_audit: {e}", flush=True)
+            except Exception as e: Log.err(f"run_audit: {e}", "SCHED")
             try: auto_resolve()
-            except Exception as e: print(f"⚠️ auto_resolve: {e}", flush=True)
+            except Exception as e: Log.err(f"auto_resolve: {e}", "SCHED")
             try: calc_pnl()
-            except Exception as e: print(f"⚠️ calc_pnl: {e}", flush=True)
+            except Exception as e: Log.err(f"calc_pnl: {e}", "SCHED")
+            Log.daily_summary()
 
         # 06:30 — kill-switch check + scan principal
         if (hh, mm) == (SCAN_H, SCAN_M) and not _ran_today("scan"):
             _mark_ran("scan")
             if not kill_switch_check():
                 try: bot.run_daily_scan()
-                except Exception as e: print(f"⚠️ run_daily_scan: {e}", flush=True)
+                except Exception as e: Log.err(f"run_daily_scan: {e}", "SCHED")
             else:
-                print("  🚨 Scan omitido — kill-switch activo", flush=True)
+                Log.warn("Scan omitido — kill-switch activo", "SCHED")
 
         # 16:00 — capture CLV
         if (hh, mm) == (CLV_H, CLV_M) and not _ran_today("clv"):
             _mark_ran("clv")
             try: bot.capture_clv()
-            except Exception as e: print(f"⚠️ capture_clv: {e}", flush=True)
+            except Exception as e: Log.err(f"capture_clv: {e}", "SCHED")
 
         # Martes 09:00 — standings
         if now.weekday() == 1 and (hh, mm) == (STAND_H, STAND_M) and not _ran_this_week("standings"):
             _mark_ran_week("standings")
             try: bot.weekly_standings()
-            except Exception as e: print(f"⚠️ weekly_standings: {e}", flush=True)
+            except Exception as e: Log.err(f"weekly_standings: {e}", "SCHED")
 
         time.sleep(30)
