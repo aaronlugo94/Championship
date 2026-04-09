@@ -2084,6 +2084,95 @@ td.muted-td{color:var(--muted)}
 </table>
 </div>
 
+<div style="border-top:1px solid var(--border);padding:2rem;background:var(--s1)">
+  <p style="font-family:var(--mono);font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:1rem">Analizador de partido</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem">
+    <div>
+      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">equipo local</p>
+      <input id="an-home" type="text" placeholder="ej. Napoli" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+    </div>
+    <div>
+      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">equipo visitante</p>
+      <input id="an-away" type="text" placeholder="ej. Milan" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+    </div>
+    <div>
+      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">liga (opcional)</p>
+      <input id="an-div" type="text" placeholder="ej. I1" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:80px">
+    </div>
+    <button onclick="analyzeMatch()" style="font-family:var(--mono);font-size:.65rem;padding:9px 18px;background:var(--accent);border:none;color:#fff;border-radius:7px;cursor:pointer;letter-spacing:.04em">analizar</button>
+    <span id="an-loading" style="font-family:var(--mono);font-size:.65rem;color:var(--muted);display:none">calculando...</span>
+  </div>
+  <div id="an-result" style="display:none">
+    <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:1rem;align-items:center;margin-bottom:1.5rem">
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:1.25rem;text-align:center">
+        <p id="an-home-name" style="font-size:1rem;font-weight:600;margin-bottom:.5rem"></p>
+        <p style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-bottom:.75rem">xG ofensivo</p>
+        <p id="an-home-xgf" style="font-size:1.8rem;font-weight:600;color:var(--accent)"></p>
+        <div style="margin-top:.75rem;display:flex;justify-content:center;gap:4px" id="an-home-form"></div>
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.5rem">últimos 5</p>
+      </div>
+      <div style="text-align:center">
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.5rem">xG partido</p>
+        <p id="an-xgt" style="font-size:1.4rem;font-weight:600;color:var(--text)"></p>
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.25rem" id="an-league"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:1.25rem;text-align:center">
+        <p id="an-away-name" style="font-size:1rem;font-weight:600;margin-bottom:.5rem"></p>
+        <p style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-bottom:.75rem">xG ofensivo</p>
+        <p id="an-away-xgf" style="font-size:1.8rem;font-weight:600;color:var(--accent)"></p>
+        <div style="margin-top:.75rem;display:flex;justify-content:center;gap:4px" id="an-away-form"></div>
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.5rem">últimos 5</p>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:1rem">
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">gana local</p>
+        <p id="an-ph" style="font-size:1.4rem;font-weight:600;color:var(--green)"></p>
+        <p id="an-fh" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">empate</p>
+        <p id="an-pd" style="font-size:1.4rem;font-weight:600;color:var(--amber)"></p>
+        <p id="an-fd" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
+        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">gana visitante</p>
+        <p id="an-pa" style="font-size:1.4rem;font-weight:600;color:var(--red)"></p>
+        <p id="an-fa" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1rem">
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
+        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">over 2.5</p>
+        <p id="an-po" style="font-size:1.1rem;font-weight:600;color:#38bdf8"></p>
+        <p id="an-fo" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
+        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">under 2.5</p>
+        <p id="an-pu" style="font-size:1.1rem;font-weight:600;color:#a78bfa"></p>
+        <p id="an-fu" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
+        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">btts sí</p>
+        <p id="an-py" style="font-size:1.1rem;font-weight:600;color:#4ade80"></p>
+        <p id="an-fy" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
+      </div>
+      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
+        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">btts no</p>
+        <p id="an-pn" style="font-size:1.1rem;font-weight:600;color:#f87171"></p>
+        <p id="an-fn" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
+      </div>
+    </div>
+
+    <div id="an-h2h-wrap" style="display:none">
+      <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem">H2H últimos 5</p>
+      <div id="an-h2h" style="display:flex;flex-direction:column;gap:4px"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 let allPicks = [], sortCol = 'date', sortDir = -1;
 let activeFlt = 'all', activeMkt = 'all';
@@ -2222,6 +2311,78 @@ document.querySelectorAll('thead th[data-col]').forEach(th => {
 });
 document.getElementById('search').addEventListener('input', render);
 
+async function analyzeMatch() {
+  const home = document.getElementById('an-home').value.trim();
+  const away = document.getElementById('an-away').value.trim();
+  const div  = document.getElementById('an-div').value.trim();
+  if (!home || !away) return;
+  const loading = document.getElementById('an-loading');
+  const result  = document.getElementById('an-result');
+  loading.style.display = 'inline';
+  result.style.display = 'none';
+  try {
+    const url = `/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.error) { alert(d.error); loading.style.display='none'; return; }
+
+    document.getElementById('an-home-name').textContent = d.home;
+    document.getElementById('an-away-name').textContent = d.away;
+    document.getElementById('an-league').textContent = d.league || d.div;
+    document.getElementById('an-xgt').textContent = `${d.xg_home} — ${d.xg_away}`;
+
+    document.getElementById('an-home-xgf').textContent = d.home_stats.xgf;
+    document.getElementById('an-away-xgf').textContent = d.away_stats.xgf;
+
+    const formEl = (id, results) => {
+      const el = document.getElementById(id);
+      el.innerHTML = (results||[]).map(r => {
+        const c = r==='W'?'#22c55e':r==='D'?'#f59e0b':'#ef4444';
+        return `<span style="width:18px;height:18px;border-radius:3px;background:${c};display:inline-flex;align-items:center;justify-content:center;font-size:.55rem;font-weight:600;color:#fff">${r}</span>`;
+      }).join('');
+    };
+    formEl('an-home-form', d.home_stats.results);
+    formEl('an-away-form', d.away_stats.results);
+
+    const pct = v => `${(v*100).toFixed(1)}%`;
+    const fairOdd = v => v ? `@${v.toFixed(2)} fair` : '';
+
+    document.getElementById('an-ph').textContent = pct(d.probs.home);
+    document.getElementById('an-pd').textContent = pct(d.probs.draw);
+    document.getElementById('an-pa').textContent = pct(d.probs.away);
+    document.getElementById('an-fh').textContent = fairOdd(d.fair_odds.home);
+    document.getElementById('an-fd').textContent = fairOdd(d.fair_odds.draw);
+    document.getElementById('an-fa').textContent = fairOdd(d.fair_odds.away);
+
+    document.getElementById('an-po').textContent = pct(d.ou.over);
+    document.getElementById('an-pu').textContent = pct(d.ou.under);
+    document.getElementById('an-py').textContent = pct(d.btts.yes);
+    document.getElementById('an-pn').textContent = pct(d.btts.no);
+    document.getElementById('an-fo').textContent = fairOdd(d.fair_odds.over);
+    document.getElementById('an-fu').textContent = fairOdd(d.fair_odds.under);
+    document.getElementById('an-fy').textContent = fairOdd(d.fair_odds.btts_y);
+    document.getElementById('an-fn').textContent = '';
+
+    if (d.h2h && d.h2h.length) {
+      document.getElementById('an-h2h-wrap').style.display = 'block';
+      document.getElementById('an-h2h').innerHTML = d.h2h.map(m =>
+        `<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:.68rem;padding:5px 8px;background:var(--bg);border-radius:5px;color:var(--text)">
+          <span style="color:var(--muted)">${m.date}</span>
+          <span>${m.home} <b>${m.fthg}-${m.ftag}</b> ${m.away}</span>
+        </div>`
+      ).join('');
+    } else {
+      document.getElementById('an-h2h-wrap').style.display = 'none';
+    }
+
+    result.style.display = 'block';
+  } catch(e) { alert('Error: ' + e.message); }
+  finally { loading.style.display = 'none'; }
+}
+
+document.getElementById('an-home').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
+document.getElementById('an-away').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
+
 loadData();
 setInterval(loadData, 60000);
 </script>
@@ -2244,6 +2405,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_sync()
         elif self.path == "/api/resolve":
             self._serve_resolve()
+        elif self.path.startswith("/api/analyze"):
+            self._serve_analyze()
         else:
             self.send_response(404); self.end_headers()
 
@@ -2476,6 +2639,181 @@ def auto_resolve():
             Log.ok(f"Auto-resolve: {resolved} picks ({wins}W/{losses}L)", "RESOLVE")
     except Exception as e:
         Log.err(f"auto_resolve: {e}", "RESOLVE")
+
+    def _serve_analyze(self):
+        """Analiza un partido en tiempo real desde la DB y CSVs."""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            import pandas as pd
+            qs = parse_qs(urlparse(self.path).query)
+            home = qs.get("home", [""])[0].strip()
+            away = qs.get("away", [""])[0].strip()
+            div  = qs.get("div",  [""])[0].strip().upper()
+
+            if not home or not away:
+                payload = json.dumps({"error": "Faltan parámetros home/away"}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type","application/json")
+                self.end_headers(); self.wfile.write(payload); return
+
+            result = {"home": home, "away": away, "div": div}
+
+            # ── Buscar div si no se especificó ──────────────────────────
+            if not div:
+                for d in TARGET_LEAGUES:
+                    if d in ("BSA","MEX"): continue
+                    path = os.path.join(DATA_DIR, f"{d}.csv")
+                    if not os.path.exists(path): continue
+                    try:
+                        try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                        except: df = pd.read_csv(path, encoding="latin-1")
+                        teams = pd.concat([df["HomeTeam"],df["AwayTeam"]]).dropna().unique()
+                        rh = difflib.get_close_matches(home, teams, n=1, cutoff=0.55)
+                        ra = difflib.get_close_matches(away, teams, n=1, cutoff=0.55)
+                        if rh and ra:
+                            div = d
+                            home = rh[0]; away = ra[0]
+                            result["home"] = home
+                            result["away"] = away
+                            result["div"]  = div
+                            break
+                    except: continue
+
+            if not div:
+                payload = json.dumps({"error": f"No se encontraron equipos en ninguna liga"}).encode()
+                self.send_response(404)
+                self.send_header("Content-Type","application/json")
+                self.end_headers(); self.wfile.write(payload); return
+
+            cfg = TARGET_LEAGUES.get(div, {})
+            path = os.path.join(DATA_DIR, f"{div}.csv")
+
+            # ── Cargar CSV ───────────────────────────────────────────────
+            try:
+                try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                except: df = pd.read_csv(path, encoding="latin-1")
+                df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                        "HG":"FTHG","AG":"FTAG"})
+            except Exception as e:
+                payload = json.dumps({"error": f"CSV no disponible: {e}"}).encode()
+                self.send_response(500)
+                self.send_header("Content-Type","application/json")
+                self.end_headers(); self.wfile.write(payload); return
+
+            played = df.dropna(subset=["FTHG","FTAG"])
+
+            def team_stats(name, depth=8):
+                rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
+                if len(rows) < 2: return None
+                gf,ga,sf,sa,pts,results = [],[],[],[],[],[]
+                for _,row in rows.iterrows():
+                    ih = (row["HomeTeam"]==name)
+                    g  = float(row["FTHG"] if ih else row["FTAG"])
+                    gc = float(row["FTAG"] if ih else row["FTHG"])
+                    gf.append(min(g,3)); ga.append(min(gc,3))
+                    if cfg.get("has_shots"):
+                        try:
+                            h = float(row.get("HST",float("nan")))
+                            a = float(row.get("AST",float("nan")))
+                            if not (h!=h or a!=a):
+                                sf.append(h if ih else a)
+                                sa.append(a if ih else h)
+                        except: pass
+                    if g>gc: pts.append(3); results.append("W")
+                    elif g==gc: pts.append(1); results.append("D")
+                    else: pts.append(0); results.append("L")
+                ff = _form(gf); fa = _form(ga)
+                fp = _form_pts(gf,ga,5)
+                ff_f = ff*0.6 + fp*0.4
+                if sf:
+                    xgf = _wavg(sf)*cfg.get("conv_home",0.30)*ff_f
+                    xga = _wavg(sa)*cfg.get("conv_away",0.31)*(1/ff_f if ff_f>0 else 1)
+                else:
+                    xgf = _wavg(gf)*ff_f
+                    xga = _wavg(ga)
+                return {
+                    "xgf": round(xgf,2), "xga": round(xga,2),
+                    "gf_avg": round(sum(gf)/len(gf),2),
+                    "ga_avg": round(sum(ga)/len(ga),2),
+                    "form_pts": round(fp,3),
+                    "form_xg":  round(ff,3),
+                    "pts_last5": pts[:5],
+                    "results":   results[:5],
+                    "n": len(gf),
+                    "conf": "HIGH" if len(gf)>=6 else "MED" if len(gf)>=3 else "LOW"
+                }
+
+            hs = team_stats(home)
+            as_ = team_stats(away)
+            if not hs or not as_:
+                payload = json.dumps({"error": "Historial insuficiente"}).encode()
+                self.send_response(404)
+                self.send_header("Content-Type","application/json")
+                self.end_headers(); self.wfile.write(payload); return
+
+            # ── xG del partido ───────────────────────────────────────────
+            xh = round((hs["xgf"] + as_["xga"]) / 2, 2)
+            xa = round((as_["xgf"] + hs["xga"]) / 2, 2)
+            xt = round(xh + xa, 2)
+
+            # ── Dixon-Coles probabilidades ───────────────────────────────
+            ph, pd_, pa = dixon_coles(xh, xa)
+            ph,pd_,pa = round(ph,3),round(pd_,3),round(pa,3)
+
+            # ── NegBinom O/U ─────────────────────────────────────────────
+            std = cfg.get("xg_std", 1.55)
+            po_raw, pu_raw = negbinom_ou(xt, std)
+            po = round(shrink(po_raw, a=0.65), 3)
+            pu = round(1-po, 3)
+
+            # ── BTTS ─────────────────────────────────────────────────────
+            py, pn = btts_prob(xh, xa)
+            py = round(py or 0, 3); pn = round(1-py, 3)
+
+            # ── H2H últimos 5 ────────────────────────────────────────────
+            h2h_rows = played[
+                ((played["HomeTeam"]==home)&(played["AwayTeam"]==away)) |
+                ((played["HomeTeam"]==away)&(played["AwayTeam"]==home))
+            ].tail(5)
+            h2h = []
+            for _,row in h2h_rows.iterrows():
+                ih = (row["HomeTeam"]==home)
+                h2h.append({
+                    "home": row["HomeTeam"], "away": row["AwayTeam"],
+                    "fthg": int(row["FTHG"]), "ftag": int(row["FTAG"]),
+                    "date": str(row.get("Date",""))
+                })
+
+            result.update({
+                "league": cfg.get("name",""),
+                "home_stats": hs,
+                "away_stats": as_,
+                "xg_home": xh, "xg_away": xa, "xg_total": xt,
+                "probs": {"home": ph, "draw": pd_, "away": pa},
+                "ou": {"over": po, "under": pu},
+                "btts": {"yes": py, "no": pn},
+                "h2h": h2h,
+                "fair_odds": {
+                    "home":  round(1/ph, 2) if ph>0 else None,
+                    "draw":  round(1/pd_,2) if pd_>0 else None,
+                    "away":  round(1/pa, 2) if pa>0 else None,
+                    "over":  round(1/po, 2) if po>0 else None,
+                    "under": round(1/pu, 2) if pu>0 else None,
+                    "btts_y":round(1/py, 2) if py>0 else None,
+                }
+            })
+
+            payload = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type","application/json")
+            self.end_headers(); self.wfile.write(err)
 
 def start_dashboard(port=8080):
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
