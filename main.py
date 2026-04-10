@@ -1,2899 +1,3149 @@
-import os, time, math, json, csv, io, difflib, requests, sqlite3, numpy as np
-from datetime import datetime, timedelta, timezone
-from math import exp, lgamma, log
-
-# ============================================================
-# LOGGER ESTRUCTURADO — salida clara para Railway logs
-# ============================================================
-
-class Log:
-    """Logger con timestamps UTC y niveles. Todo va a stdout para Railway."""
-
-    _session_stats = {
-        "picks_generados": 0,
-        "picks_rechazados": 0,
-        "csvs_descargados": 0,
-        "errores": 0,
-        "clv_capturados": 0,
-        "picks_resueltos": 0,
-    }
-
-    @staticmethod
-    def _ts():
-        return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-    @staticmethod
-    def info(msg, section=None):
-        prefix = f"[{Log._ts()}]"
-        if section: prefix += f" [{section}]"
-        print(f"{prefix} {msg}", flush=True)
-
-    @staticmethod
-    def ok(msg, section=None):
-        prefix = f"[{Log._ts()}] ✅"
-        if section: prefix += f" [{section}]"
-        print(f"{prefix} {msg}", flush=True)
-
-    @staticmethod
-    def warn(msg, section=None):
-        prefix = f"[{Log._ts()}] ⚠️"
-        if section: prefix += f" [{section}]"
-        print(f"{prefix} {msg}", flush=True)
-        Log._session_stats["errores"] += 1
-
-    @staticmethod
-    def err(msg, section=None):
-        prefix = f"[{Log._ts()}] ❌"
-        if section: prefix += f" [{section}]"
-        print(f"{prefix} {msg}", flush=True)
-        Log._session_stats["errores"] += 1
-
-    @staticmethod
-    def pick(label, mkt, odd, ev, urs, xgh, xga, conf):
-        Log._session_stats["picks_generados"] += 1
-        print(
-            f"[{Log._ts()}] 🎯 PICK | {label} | {mkt} @{odd:.2f} "
-            f"EV={ev*100:.1f}% URS={urs:.3f} xG={xgh:.2f}/{xga:.2f} {conf}",
-            flush=True
-        )
-
-    @staticmethod
-    def rej(label, mkt, odd, ev, reason):
-        Log._session_stats["picks_rechazados"] += 1
-        print(
-            f"[{Log._ts()}] ↩  REJ  | {label} | {mkt} @{odd:.2f} "
-            f"EV={ev*100:.1f}% → {reason}",
-            flush=True
-        )
-
-    @staticmethod
-    def scan_start(dates):
-        print(f"\n{'='*60}", flush=True)
-        print(f"[{Log._ts()}] 🔍 SCAN — {' / '.join(dates)}", flush=True)
-        print(f"{'='*60}", flush=True)
-        Log._session_stats["picks_generados"] = 0
-        Log._session_stats["picks_rechazados"] = 0
-
-    @staticmethod
-    def scan_end(n_picks, n_leagues, heat, vol):
-        print(f"{'='*60}", flush=True)
-        print(
-            f"[{Log._ts()}] 📊 SCAN FIN | {n_picks} picks | {n_leagues} ligas "
-            f"| Heat={heat*100:.1f}% Vol={vol*100:.1f}%",
-            flush=True
-        )
-        r = Log._session_stats["picks_rechazados"]
-        g = Log._session_stats["picks_generados"]
-        pct = g/(g+r)*100 if (g+r) > 0 else 0
-        print(f"[{Log._ts()}]    Candidatos: {g+r} analizados → {g} picks ({pct:.0f}% pass rate)", flush=True)
-        print(f"{'='*60}\n", flush=True)
-
-    @staticmethod
-    def audit_end(resolved, wins, losses):
-        Log._session_stats["picks_resueltos"] += resolved
-        if resolved:
-            br = wins/resolved*100 if resolved else 0
-            print(
-                f"[{Log._ts()}] 🔬 AUDIT | {resolved} resueltos "
-                f"| {wins}W/{losses}L | BR={br:.1f}%",
-                flush=True
-            )
-        else:
-            print(f"[{Log._ts()}] 🔬 AUDIT | 0 picks nuevos resueltos", flush=True)
-
-    @staticmethod
-    def clv_end(n, beat):
-        Log._session_stats["clv_capturados"] += n
-        if n:
-            print(
-                f"[{Log._ts()}] 📉 CLV | {n} capturados "
-                f"| Beat closing: {beat:.0f}%",
-                flush=True
-            )
-        else:
-            print(f"[{Log._ts()}] 📉 CLV | 0 picks en ventana de captura", flush=True)
-
-    @staticmethod
-    def csv_ok(div, kb):
-        Log._session_stats["csvs_descargados"] += 1
-        print(f"[{Log._ts()}] 📥 CSV  | {div} ({kb}KB)", flush=True)
-
-    @staticmethod
-    def daily_summary():
-        s = Log._session_stats
-        print(f"\n{'='*60}", flush=True)
-        print(f"[{Log._ts()}] 📋 RESUMEN DEL DÍA", flush=True)
-        print(f"  CSVs descargados: {s['csvs_descargados']}", flush=True)
-        print(f"  Picks generados:  {s['picks_generados']}", flush=True)
-        print(f"  Picks resueltos:  {s['picks_resueltos']}", flush=True)
-        print(f"  CLV capturados:   {s['clv_capturados']}", flush=True)
-        print(f"  Errores/warnings: {s['errores']}", flush=True)
-        print(f"{'='*60}\n", flush=True)
-
-# ============================================================
-# TRIPLE LEAGUE V7.2 — HYBRID ENGINE (BUGS CORREGIDOS)
-# ============================================================
-#
-# FIXES vs V7.1:
-#   1. Liga MX GENERA PICKS — restaurado /odds?fixture=X&bookmaker=8
-#      del V6.5 que sí funciona en Free tier. V7.1 nunca appendeaba
-#      a preliminary, Liga MX era letra muerta.
-#
-#   2. BSA odds — ahora usa Trend Resource como fuente primaria
-#      de cuotas (home_odd, draw_odd, away_odd, ou25_odd).
-#      V7.1 buscaba el H2H histórico entre esos dos equipos
-#      que ya terminó — cuotas de un partido pasado, inútiles.
-#
-#   3. track_req corregido — era getter/setter mal diseñado.
-#      Ahora: track_req(n) suma n, get_req() retorna total.
-#      Llamar track_req(0) sumaba 0 pero retornaba el total,
-#      ambiguo y propenso a errores.
-#
-#   4. MEX odds — restaurado flujo completo: fixtures api-football
-#      → /odds?fixture=X&bookmaker=8 → pick engine completo.
-#      V7.1 construía el dict de odds pero nunca lo llenaba
-#      con nada real y nunca generaba picks.
-#
-# FUENTES DE DATOS (las 3 funcionando realmente):
-#
-#   [1] football-data.co.uk CSV (descarga estática, 2×/semana)
-#       → xG con shots reales HST/AST para 8 ligas europeas
-#       → xG goles proxy para BSA y MEX
-#       → fixtures.csv con cuotas de apertura para europeas
-#       → CLV capture: fixtures.csv actualizado D-0
-#
-#   [2] football-data.org fd.org (sin límite diario, 10 req/min)
-#       → Trend Resource: pct_o25, pct_bts, cuotas BSA/europeas
-#       → /competitions/BSA/matches: fixtures Brasileirao con IDs
-#       → /competitions/ELC/standings: factor home/away real
-#
-#   [3] api-football Free (100 req/día)
-#       → /fixtures?date=D (Liga MX fixtures)
-#       → /odds?fixture=X&bookmaker=8 (cuotas Bet365 Liga MX)
-#       → /injuries?fixture=X (lesiones Liga MX)
-#
-# MOTOR MATEMÁTICO (calibrado con datos reales):
-#   Dixon-Coles rho=-0.13 | NegBinom std por liga | shrinkage 0.75
-#   blend Trend 30% | Kelly fraccionado 0.20 | URS selector
-#
-# PARÁMETROS CALIBRADOS (tus archivos reales):
-#   BSA: mu=2.39 std=1.54 Over25=43.4% BTTS=47.9%
-#   MEX: mu=2.84 std=1.68 Over25=55.1% BTTS=56.6%
-#   I1:  mu=2.44 std=1.51 conv_home=0.290 conv_away=0.331
-# ============================================================
-
-LIVE_TRADING = False
-
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-API_SPORTS_KEY   = os.getenv("API_SPORTS_KEY", "")
-FD_ORG_TOKEN     = os.getenv("FD_ORG_TOKEN", "")
-
-DB_DIR   = os.getenv("DB_DIR", "./data")
-DATA_DIR = os.path.join(DB_DIR, "csv")   # siempre /app/data/csv — Railway crea el subdir
-os.makedirs(DB_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_PATH   = os.path.join(DB_DIR, "quant_v72.db")
-AUDIT_CSV = os.path.join(DB_DIR, "picks_audit_v72.csv")
-
-print(f"  📂 DB={DB_PATH}", flush=True)
-print(f"  📂 DATA_DIR={DATA_DIR}", flush=True)
-
-RUN_TIME_CSV_UPDATE = "06:00"
-RUN_TIME_AUDIT      = "07:00"
-RUN_TIME_SCAN       = "06:30"
-RUN_TIME_CLV        = "16:00"
-RUN_TIME_STANDINGS  = "09:00"   # martes
-
-# ============================================================
-# CONFIGURACIÓN DE LIGAS
-# ============================================================
-
-TARGET_LEAGUES = {
-    # ── Europeas — CSV co.uk con shots HST/AST ────────────────────────────
-    "E0":  {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier",       "liq": 0.90, "xg_std": 1.60, "avg_goals": 2.82,
-             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 1.00},
-    "E1":  {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship",  "liq": 0.85, "xg_std": 1.55, "avg_goals": 2.55,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": "ELC", "source": "csv_euro", "league_factor": 0.92},
-    "SP1": {"name": "🇪🇸 La Liga",        "liq": 0.88, "xg_std": 1.55, "avg_goals": 2.65,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": "PD",  "source": "csv_euro", "league_factor": 0.95},
-    "D1":  {"name": "🇩🇪 Bundesliga",     "liq": 0.88, "xg_std": 1.70, "avg_goals": 3.10,
-             "conv_home": 0.32, "conv_away": 0.33, "has_shots": True,
-             "fbd_code": "BL1", "source": "csv_euro", "league_factor": 1.05},
-    "I1":  {"name": "🇮🇹 Serie A",        "liq": 0.87, "xg_std": 1.51, "avg_goals": 2.44,
-             "conv_home": 0.29, "conv_away": 0.33, "has_shots": True,
-             "fbd_code": "SA",  "source": "csv_euro", "league_factor": 0.93},
-    "F1":  {"name": "🇫🇷 Ligue 1",        "liq": 0.85, "xg_std": 1.52, "avg_goals": 2.45,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": "FL1", "source": "csv_euro", "league_factor": 0.93},
-    "N1":  {"name": "🇳🇱 Eredivisie",     "liq": 0.82, "xg_std": 1.75, "avg_goals": 3.20,
-             "conv_home": 0.33, "conv_away": 0.34, "has_shots": True,
-             "fbd_code": "DED", "source": "csv_euro", "league_factor": 1.05},
-    "P1":  {"name": "🇵🇹 Primeira",       "liq": 0.82, "xg_std": 1.50, "avg_goals": 2.50,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": "PPL", "source": "csv_euro", "league_factor": 0.93},
-    "B1":  {"name": "🇧🇪 Jupiler",        "liq": 0.82, "xg_std": 1.58, "avg_goals": 2.72,
-             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.95},
-    "T1":  {"name": "🇹🇷 Süper Lig",      "liq": 0.80, "xg_std": 1.62, "avg_goals": 2.68,
-             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
-    "G1":  {"name": "🇬🇷 Super League",   "liq": 0.78, "xg_std": 1.55, "avg_goals": 2.48,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
-    # ── Segundas divisiones — mayor ineficiencia de mercado ──────────────
-    "D2":  {"name": "🇩🇪 Bundesliga 2",   "liq": 0.82, "xg_std": 1.62, "avg_goals": 2.95,
-             "conv_home": 0.31, "conv_away": 0.32, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.95},
-    "I2":  {"name": "🇮🇹 Serie B",        "liq": 0.78, "xg_std": 1.55, "avg_goals": 2.42,
-             "conv_home": 0.29, "conv_away": 0.30, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
-    "SP2": {"name": "🇪🇸 Segunda Div",    "liq": 0.80, "xg_std": 1.52, "avg_goals": 2.48,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
-    "F2":  {"name": "🇫🇷 Ligue 2",        "liq": 0.78, "xg_std": 1.50, "avg_goals": 2.35,
-             "conv_home": 0.29, "conv_away": 0.30, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
-    "SC0": {"name": "🏴󠁧󠁢󠁳󠁣󠁴 Premiership",   "liq": 0.80, "xg_std": 1.58, "avg_goals": 2.62,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.92},
-    "E2":  {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 League One",   "liq": 0.78, "xg_std": 1.52, "avg_goals": 2.60,
-             "conv_home": 0.30, "conv_away": 0.31, "has_shots": True,
-             "fbd_code": None,  "source": "csv_euro", "league_factor": 0.90},
-    # ── BSA — goles proxy + Trend fd.org + fixtures fd.org ───────────────
-    "BSA": {"name": "🇧🇷 Brasileirao",    "liq": 0.80, "xg_std": 1.54, "avg_goals": 2.39,
-             "conv_home": None, "conv_away": None, "has_shots": False,
-             "fbd_code": "BSA", "source": "csv_extra", "league_factor": 0.95},
-    # ── MEX — goles proxy + api-football odds ─────────────────────────────
-    "MEX": {"name": "🇲🇽 Liga MX",        "liq": 0.75, "xg_std": 1.68, "avg_goals": 2.84,
-             "conv_home": None, "conv_away": None, "has_shots": False,
-             "fbd_code": None,  "source": "csv_extra", "league_factor": 1.00},
-}
-
-CSV_URLS = {
-    "E0":  "https://www.football-data.co.uk/mmz4281/2526/E0.csv",
-    "E1":  "https://www.football-data.co.uk/mmz4281/2526/E1.csv",
-    "SP1": "https://www.football-data.co.uk/mmz4281/2526/SP1.csv",
-    "D1":  "https://www.football-data.co.uk/mmz4281/2526/D1.csv",
-    "I1":  "https://www.football-data.co.uk/mmz4281/2526/I1.csv",
-    "F1":  "https://www.football-data.co.uk/mmz4281/2526/F1.csv",
-    "N1":  "https://www.football-data.co.uk/mmz4281/2526/N1.csv",
-    "P1":  "https://www.football-data.co.uk/mmz4281/2526/P1.csv",
-    "BSA": "https://www.football-data.co.uk/new/BSA.csv",
-    "MEX": "https://www.football-data.co.uk/new/MEX.csv",
-    "B1":  "https://www.football-data.co.uk/mmz4281/2526/B1.csv",
-    "T1":  "https://www.football-data.co.uk/mmz4281/2526/T1.csv",
-    "G1":  "https://www.football-data.co.uk/mmz4281/2526/G1.csv",
-    "D2":  "https://www.football-data.co.uk/mmz4281/2526/D2.csv",
-    "I2":  "https://www.football-data.co.uk/mmz4281/2526/I2.csv",
-    "SP2": "https://www.football-data.co.uk/mmz4281/2526/SP2.csv",
-    "F2":  "https://www.football-data.co.uk/mmz4281/2526/F2.csv",
-    "SC0": "https://www.football-data.co.uk/mmz4281/2526/SC0.csv",
-    "E2":  "https://www.football-data.co.uk/mmz4281/2526/E2.csv",
-}
-
-FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
-
-# En Railway todos los CSVs se descargan via CSV_URLS al DATA_DIR del volumen.
-# USER_UPLOADS solo se usa en desarrollo local si tienes los archivos ya descargados.
-# Para activar: pon los xlsx/csv en DATA_DIR y el download_csv los encontrará por antigüedad.
-USER_UPLOADS = {}   # vacío → Railway siempre descarga desde football-data.co.uk
-
-MIN_EV  = 0.015   # global fallback
-# MIN_EV por mercado — calibrado post análisis 29 picks
-MIN_EV_MKT = {
-    "UNDER": 0.050,   # Under sobreestimado — requiere margen alto (BR 42%)
-    "OVER":  0.020,   # Over sin sesgo claro — margen moderado
-    "DC":    0.010,   # DC: 100% beat rate — margen mínimo
-    "1X2":   0.025,   # 1X2: mercado eficiente — margen alto
-    "BTTS":  0.020,   # BTTS Sí: moderado
-    "BTTS_NO": 0.020, # BTTS No: moderado
-    "DNB":     0.025, # DNB: mercado semi-eficiente
-}
-MAX_EV  = 0.15
-KELLY   = 0.20
-MAX_STK = 0.04
-MAX_HEAT= 0.10
-KILL_DRAWDOWN = 0.15  # pausa si bankroll cae 15% desde el máximo histórico
-TGT_VOL = 0.05
-VOL_BKT = {"OVER": 0.85, "UNDER": 0.65, "BTTS": 0.90, "BTTS_NO": 0.90, "1X2": 1.25, "DC": 1.20, "DNB": 1.15}
-# Under: 0.65 (reducido por BR 42%) | DC: 1.20 (aumentado por BR 100%)
-DC_RHO  = -0.13
-XG_TTL  = 72      # horas cache xG
-XG_DEC  = 0.85    # decay temporal
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def init_db():
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS picks_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fixture_id TEXT, league TEXT, div TEXT,
-        home_team TEXT, away_team TEXT,
-        market TEXT, selection TEXT,
-        odd_open REAL, prob_model REAL, ev_open REAL, stake_pct REAL,
-        xg_home REAL, xg_away REAL, xg_total REAL, xg_source TEXT,
-        trend_pct_o25 REAL, trend_pct_bts REAL,
-        pick_time DATETIME, kickoff_time TEXT,
-        clv_captured INTEGER DEFAULT 0,
-        urs REAL DEFAULT 0.0, model_gap REAL DEFAULT 0.0,
-        result TEXT DEFAULT 'PENDING', profit REAL DEFAULT 0.0,
-        UNIQUE(fixture_id, market, selection)
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS team_xg_cache (
-        team_key TEXT PRIMARY KEY, div TEXT, team_name TEXT,
-        gf_series TEXT, ga_series TEXT, shots_for TEXT, shots_against TEXT,
-        xg_for REAL, xg_against REAL,
-        confidence TEXT, updated_at TEXT, depth INTEGER
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS rejections_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        label TEXT, market TEXT, odd REAL, ev REAL, reason TEXT, logged_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS closing_lines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fixture_id TEXT, market TEXT, selection TEXT,
-        odd_open REAL, odd_close REAL, clv_pct REAL, captured_at TEXT
-    )""")
-    conn.commit(); conn.close()
-
-# ============================================================
-# REQUEST TRACKING — FIX #3
-# track_req(n) suma n al contador y retorna el total
-# get_req()    retorna el total sin modificarlo
-# ============================================================
-
-_REQ = 0
-
-def track_req(n=1):
-    global _REQ; _REQ += n; return _REQ
-
-def get_req():
-    return _REQ
-
-def reset_req():
-    global _REQ; _REQ = 0
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_msg(text, use_html=True):
-    import re
-    if not TELEGRAM_TOKEN:
-        print(f"[MSG] {text[:200]}", flush=True); return
-    text = text.replace("**", "")
-    if len(text) > 4000:
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            send_msg(chunk, use_html); return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML" if use_html else None},
-            timeout=20
-        )
-        if r.status_code == 400 and use_html:
-            send_msg(re.sub(r'<[^>]+>', '', text), use_html=False)
-    except Exception as e:
-        print(f"Telegram err: {e}", flush=True)
-
-def log_rej(label, market, odd, ev, reason):
-    Log.rej(label, market, odd, ev, reason)
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT INTO rejections_log VALUES (NULL,?,?,?,?,?,?)",
-                     (label, market, odd, ev, reason,
-                      datetime.now(timezone.utc).isoformat()))
-        conn.commit(); conn.close()
-    except: pass
-
-# ============================================================
-# CSV ENGINE — FUENTE [1]
-# ============================================================
-
-_CSV_MEM = {}   # cache en memoria por sesión
-
-def download_csv(div, force=False):
-    """Descarga CSV y lo guarda en DATA_DIR. Solo si >12h de antigüedad."""
-    # Usar archivo subido por el usuario si existe
-    upload_path = USER_UPLOADS.get(div)
-    if upload_path and os.path.exists(upload_path) and not force:
-        return upload_path
-
-    ext  = ".csv"   # football-data.co.uk siempre sirve CSV, incluyendo /new/BSA y /new/MEX
-    path = os.path.join(DATA_DIR, f"{div}{ext}")
-
-    if not force and os.path.exists(path):
-        if (time.time() - os.path.getmtime(path)) / 3600 < 12:
-            return path
-
-    url = CSV_URLS.get(div)
-    if not url:
-        return path if os.path.exists(path) else None
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if r.status_code == 200 and len(r.content) > 500:
-            # Validar que es CSV real (primera línea debe tener comas)
-            first_line = r.content[:200].decode("utf-8", errors="ignore").split("\n")[0]
-            if "," in first_line:
-                with open(path, "wb") as f: f.write(r.content)
-                Log.csv_ok(div, len(r.content)//1024)
-            else:
-                Log.warn(f"{div}: respuesta no es CSV válido — conservando archivo anterior", "CSV")
-        elif r.status_code != 200:
-            Log.warn(f"{div}: HTTP {r.status_code} — conservando", "CSV")
-        return path
-    except Exception as e:
-        Log.err(f"CSV {div}: {e}", "CSV")
-        return path if os.path.exists(path) else None
-
-def load_csv(div):
-    """Carga CSV/XLSX en DataFrame, cache en memoria."""
-    import pandas as pd
-    if div in _CSV_MEM: return _CSV_MEM[div]
-    path = download_csv(div)
-    if not path: return None
-    try:
-        try:    df = pd.read_csv(path, encoding="utf-8-sig")
-        except: df = pd.read_csv(path, encoding="latin-1")
-        # BSA y MEX en /new/ usan nombres de columna distintos — normalizar
-        df = df.rename(columns={"Home": "HomeTeam", "Away": "AwayTeam",
-                                 "HG": "FTHG", "AG": "FTAG"})
-        # Closing odds como apertura si no hay apertura
-        for src_c, dst_c in [("AvgCH","AvgH"),("AvgCD","AvgD"),("AvgCA","AvgA"),
-                              ("B365CH","B365H"),("B365CD","B365D"),("B365CA","B365A"),
-                              ("PSCH","PSH"),("PSCD","PSD"),("PSCA","PSA")]:
-            if src_c in df.columns and dst_c not in df.columns:
-                df[dst_c] = df[src_c]
-        df = df.dropna(subset=["HomeTeam", "AwayTeam"])
-        _CSV_MEM[div] = df
-        played = df.dropna(subset=["FTHG","FTAG"])
-        print(f"  📊 {div}: {len(played)} jugados | último: {played['Date'].iloc[-1] if len(played)>0 else 'N/A'}",
-              flush=True)
-        return df
-    except Exception as e:
-        print(f"  ⚠️ load_csv {div}: {e}", flush=True); return None
-
-def get_fixtures_csv():
-    """
-    fixtures.csv de co.uk — partidos próximos con cuotas apertura.
-    Actualizado viernes (fin de semana) y martes (entre semana).
-    """
-    import pandas as pd
-    try:
-        r = requests.get(FIXTURES_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if r.status_code != 200: return None
-        try:    df = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig")))
-        except: df = pd.read_csv(io.StringIO(r.content.decode("latin-1")),
-                                  on_bad_lines="skip")
-        df.columns = df.columns.str.strip()
-        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-        Log.info(f"fixtures.csv: {len(df)} partidos", "DATA")
-        return df
-    except Exception as e:
-        Log.err(f"fixtures.csv: {e}", "DATA"); return None
-
-def get_odds_from_row(row, cfg):
-    """
-    Extrae cuotas de una fila del CSV.
-    Prioridad: PS (Pinnacle) → B365 → Avg → Max
-    """
-    def best(*cols):
-        for c in cols:
-            try:
-                v = row.get(c) if hasattr(row, 'get') else getattr(row, c, None)
-                if v is not None and not (isinstance(v, float) and math.isnan(v)):
-                    f = float(v)
-                    if f > 1.01: return f
-            except: pass
-        return None
-    return {
-        "H":      best("PSH",    "B365H",    "AvgH",    "MaxH"),
-        "D":      best("PSD",    "B365D",    "AvgD",    "MaxD"),
-        "A":      best("PSA",    "B365A",    "AvgA",    "MaxA"),
-        "O25":    best("P>2.5",  "B365>2.5", "Avg>2.5", "Max>2.5"),
-        "U25":    best("P<2.5",  "B365<2.5", "Avg<2.5", "Max<2.5"),
-        "BTTS_Y": best("BbAvBBTS","B365BTTSY"),
-    }
-
-# ============================================================
-# XG ENGINE — SHOTS + GOLES DECAY
-# ============================================================
-
-def _wavg(vals, decay=XG_DEC):
-    if not vals: return 0.0
-    w = [decay**i for i in range(len(vals))]
-    return sum(v*wi for v,wi in zip(vals,w)) / sum(w)
-
-def _form(series):
-    """Últimos 3 vs anteriores 3 → multiplicador 0.85–1.15."""
-    if len(series) < 6: return 1.0
-    r = _wavg(series[:3]); p = _wavg(series[3:6])
-    if p < 0.1: return 1.0
-    return max(0.85, min(r/p, 1.15))
-
-def _form_pts(gf_series, ga_series, n=5):
-    """
-    Forma basada en puntos reales (V/E/D) de los últimos N partidos.
-    Retorna multiplicador 0.80–1.20 basado en rendimiento reciente.
-    Mejor señal que _form() porque captura rachas reales de resultados.
-    """
-    if len(gf_series) < 3 or len(ga_series) < 3:
-        return 1.0
-    pts = []
-    for gf, ga in zip(gf_series[:n], ga_series[:n]):
-        if gf > ga:   pts.append(3)   # victoria
-        elif gf == ga: pts.append(1)  # empate
-        else:          pts.append(0)  # derrota
-    if not pts: return 1.0
-    # Promedio ponderado con decay — partidos recientes pesan más
-    weights = [0.85**i for i in range(len(pts))]
-    avg_pts = sum(p*w for p,w in zip(pts,weights)) / sum(weights)
-    # Normalizar: 3pts = forma perfecta (1.20), 0pts = forma terrible (0.80)
-    # Media esperada ~1.3 pts/partido en liga típica → factor neutral
-    factor = 0.80 + (avg_pts / 3.0) * 0.40
-    return round(max(0.80, min(factor, 1.20)), 3)
-
-def get_team_stats(df, team_name, cfg, depth=8):
-    """
-    Extrae xG del equipo desde el DataFrame.
-    Con shots (europeas): xG = wavg(HST) × conv_rate × form
-    Sin shots (BSA/MEX):  xG = wavg(FTHG) × form
-    """
-    import pandas as pd
-    teams = pd.concat([df["HomeTeam"], df["AwayTeam"]]).dropna().unique().tolist()
-    match = difflib.get_close_matches(team_name, teams, n=1, cutoff=0.55)
-    if not match: return None, None, [], [], "LOW"
-
-    name   = match[0]
-    played = df.dropna(subset=["FTHG","FTAG"])
-    rows   = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
-    if len(rows) < 2: return None, None, [], [], "LOW"
-
-    gf_l, ga_l, sf_l, sa_l = [], [], [], []
-    for _, row in rows.iterrows():
-        ih = (row["HomeTeam"] == name)
-        # Clipear a 3 — un partido de 4-0 no debe sesgar el xG promedio
-        gf_l.append(min(float(row["FTHG"] if ih else row["FTAG"]), 3.0))
-        ga_l.append(min(float(row["FTAG"] if ih else row["FTHG"]), 3.0))
-        if cfg["has_shots"]:
-            try:
-                hst = float(row.get("HST", float("nan")))
-                ast = float(row.get("AST", float("nan")))
-                if not (math.isnan(hst) or math.isnan(ast)):
-                    sf_l.append(hst if ih else ast)
-                    sa_l.append(ast if ih else hst)
-            except: pass
-
-    # Forma xG (goles marcados/concedidos) — detecta tendencia ofensiva/defensiva
-    ff_f = _form(gf_l); ff_a = _form(ga_l)
-    # Forma puntos (V/E/D) — detecta rachas de resultados reales
-    # Blend: 60% forma xG + 40% forma puntos para capturar contexto real
-    fp_f = _form_pts(gf_l, ga_l, n=5)
-    fp_a = _form_pts(ga_l, gf_l, n=5)   # para déficit: invertir perspectiva
-    ff_f_final = ff_f * 0.60 + fp_f * 0.40
-    ff_a_final = ff_a * 0.60 + fp_a * 0.40
-
-    if cfg["has_shots"] and sf_l:
-        xgf = _wavg(sf_l) * cfg["conv_home"] * ff_f_final
-        xga = _wavg(sa_l) * cfg["conv_away"] * ff_a_final
-        src = "shots"
-    else:
-        xgf = _wavg(gf_l) * ff_f_final
-        xga = _wavg(ga_l) * ff_a_final
-        src = "goals_proxy"
-
-    conf = "HIGH" if len(gf_l)>=6 else "MED" if len(gf_l)>=3 else "LOW"
-    Log.info(f"  {name}: xGF={xgf:.2f} xGA={xga:.2f} {conf} via {src} forma={ff_f_final:.2f}", "xG")
-    return xgf, xga, gf_l, ga_l, conf
-
-def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
-    """
-    xG_home = (att_home + def_weakness_away) / 2
-    xG_away = (att_away + def_weakness_home) / 2
-    Cache SQLite TTL=72h para no recalcular en cada scan.
-    """
-    def from_cache(key):
-        try:
-            conn = sqlite3.connect(DB_PATH); cc = conn.cursor()
-            cc.execute("SELECT xg_for,xg_against,confidence,updated_at FROM team_xg_cache WHERE team_key=?", (key,))
-            row = cc.fetchone(); conn.close()
-            if row:
-                age = (datetime.now(timezone.utc) -
-                       datetime.fromisoformat(row[3].replace("+00:00","")).replace(tzinfo=timezone.utc)
-                       ).total_seconds()/3600
-                if age < XG_TTL:
-                    return float(row[0]), float(row[1]), row[2]
-        except: pass
-        return None, None, None
-
-    def to_cache(key, name, xgf, xga, gf, ga, conf):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("""INSERT OR REPLACE INTO team_xg_cache
-                (team_key,div,team_name,gf_series,ga_series,shots_for,shots_against,
-                 xg_for,xg_against,confidence,updated_at,depth) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (key,div,name,json.dumps(gf),json.dumps(ga),"[]","[]",
-                 xgf,xga,conf,datetime.now(timezone.utc).isoformat(),len(gf)))
-            conn.commit(); conn.close()
-        except: pass
-
-    kh = f"{div}:{home_name}"; ka = f"{div}:{away_name}"
-    hf, ha, hc = from_cache(kh)
-    if hf is None and df is not None:
-        hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg)
-        if hf: to_cache(kh, home_name, hf, ha, hg, hga, hc)
-
-    af, aa, ac = from_cache(ka)
-    if af is None and df is not None:
-        af, aa, ag, aga, ac = get_team_stats(df, away_name, cfg)
-        if af: to_cache(ka, away_name, af, aa, ag, aga, ac)
-
-    if hf is None or af is None:
-        Log.warn(f"DEFAULT xG para {home_name} vs {away_name}", "xG")
-        return 1.20, 1.20, 2.40, "LOW", "default"
-
-    xh = (hf + aa) / 2
-    xa = (af + ha) / 2
-    xh *= (1 - min(inj_h*0.015, 0.08))
-    xa *= (1 - min(inj_a*0.015, 0.08))
-    lf  = cfg.get("league_factor", 1.0)
-    xh  = max(0.60, min(xh*lf, 3.80))
-    xa  = max(0.60, min(xa*lf, 3.80))
-    conf = "HIGH" if (hc=="HIGH" and ac=="HIGH") else \
-           "MED"  if (hc!="LOW" and ac!="LOW") else "LOW"
-    src  = "csv_shots" if cfg["has_shots"] else "csv_goals_proxy"
-    Log.info(f"  xG: H={xh:.2f} A={xa:.2f} T={xh+xa:.2f} {conf}", "xG")
-    return xh, xa, xh+xa, conf, src
-
-# ============================================================
-# FOOTBALL-DATA.ORG — FUENTE [2]
-# ============================================================
-
-_TREND_MEM = {}
-
-def fetch_trends(date_str, codes):
-    """
-    1 request → todos los partidos del día para las ligas pedidas.
-    Retorna {f'{h_id}_{a_id}': trend_entry}
-    """
-    if not FD_ORG_TOKEN: return {}
-    key = f"{date_str}_{'_'.join(sorted(codes))}"
-    if key in _TREND_MEM: return _TREND_MEM[key]
-    try:
-        r = requests.get(
-            "https://api.football-data.org/v4/trends/",
-            headers={"X-Auth-Token": FD_ORG_TOKEN},
-            params={"date": date_str, "competitions": ",".join(codes),
-                    "window": 8, "considerSide": "true"},
-            timeout=15
-        )
-        track_req()
-        if r.status_code != 200:
-            Log.warn(f"Trends {date_str} HTTP {r.status_code}", "DATA"); return {}
-        result = {}
-        for m in r.json().get("matches", []):
-            h_id = m.get("homeTeam",{}).get("id")
-            a_id = m.get("awayTeam",{}).get("id")
-            if h_id and a_id: result[f"{h_id}_{a_id}"] = m
-        _TREND_MEM[key] = result
-        Log.info(f"Trends {date_str}: {len(result)} partidos", "DATA")
-        return result
-    except Exception as e:
-        Log.err(f"Trends: {e}", "DATA"); return {}
-
-def extract_trend(entry):
-    """Extrae pct_o25, pct_bts y cuotas del Trend Resource."""
-    if not entry: return {}
-    ht = entry.get("homeTrend",{}); at = entry.get("awayTrend",{})
-    odds = entry.get("odds",{})
-    def avg_pct(k):
-        h = ht.get(k); a = at.get(k)
-        return (h+a)/200 if h is not None and a is not None else None
-    ou   = odds.get("overUnder",{})
-    bts  = odds.get("bothTeamsToScore",{})
-    m1x2 = odds.get("match",{})
-    return {
-        "pct_o25":  avg_pct("pctOver25"),
-        "pct_bts":  avg_pct("pctBtts"),
-        "ou25_odd": ou.get("over25"),
-        "bts_odd":  bts.get("yes"),
-        "home_odd": m1x2.get("home"),
-        "draw_odd": m1x2.get("draw"),
-        "away_odd": m1x2.get("away"),
-    }
-
-def get_fd_org_matches(competition_code, date_str):
-    """
-    GET /v4/competitions/{code}/matches?dateFrom=D&dateTo=D
-    Retorna lista de partidos con IDs de equipos (necesarios para Trend lookup).
-    """
-    if not FD_ORG_TOKEN: return []
-    try:
-        r = requests.get(
-            f"https://api.football-data.org/v4/competitions/{competition_code}/matches",
-            headers={"X-Auth-Token": FD_ORG_TOKEN},
-            params={"dateFrom": date_str, "dateTo": date_str},
-            timeout=15
-        )
-        track_req()
-        if r.status_code != 200: return []
-        return r.json().get("matches", [])
-    except Exception as e:
-        print(f"  ⚠️ fd.org matches {competition_code}: {e}", flush=True); return []
-
-# ============================================================
-# API-FOOTBALL — FUENTE [3] — LIGA MX
-# ============================================================
-
-def apif_get(path, params, headers):
-    """Request genérico a api-football con tracking."""
-    try:
-        r = requests.get(
-            f"https://v3.football.api-sports.io/{path}",
-            headers=headers, params=params, timeout=12
-        )
-        track_req()
-        return r.json().get("response", [])
-    except Exception as e:
-        print(f"  ⚠️ apif {path}: {e}", flush=True); return []
-
-def get_mx_season(headers):
-    """
-    Detecta el season activo de Liga MX en api-football.
-    El Clausura 2026 puede estar catalogado como season=2025 o season=2026
-    dependiendo de cómo indexe api-football ese torneo.
-    Llama /leagues?id=262, busca el season con 'current: true'.
-    Fallback: 2026 si falla.
-    """
-    try:
-        res = apif_get("leagues", {"id": 262}, headers)
-        for entry in res:
-            seasons = entry.get("seasons", [])
-            for s in seasons:
-                if s.get("current"):
-                    yr = s.get("year", 2026)
-                    Log.ok(f"Liga MX season: {yr}", "MEX")
-                    return yr
-        # Si no hay current=true, usar el más reciente
-        all_years = []
-        for entry in res:
-            for s in entry.get("seasons", []):
-                all_years.append(s.get("year", 0))
-        if all_years:
-            yr = max(all_years)
-            print(f"  ⚠️ Liga MX: sin season current, usando más reciente: {yr}", flush=True)
-            return yr
-    except Exception as e:
-        print(f"  ⚠️ get_mx_season: {e}", flush=True)
-    print("  ⚠️ Liga MX season: usando fallback 2026", flush=True)
-    return 2026
-
-def get_mx_fixtures(dates, headers):
-    """Fixtures Liga MX para mañana y pasado mañana. ~3 req (1 season + 2 fixtures)."""
-    season = get_mx_season(headers)
-    # Si el season detectado es 2025 y estamos en 2026, probar 2026 también
-    seasons_to_try = [season]
-    import datetime as _dt
-    if season == 2025 and _dt.datetime.now().year == 2026:
-        seasons_to_try = [2026, 2025]
-    elif season == 2026:
-        seasons_to_try = [2026]
-    matches = []
-    for d in dates:
-        found = []
-        for s in seasons_to_try:
-            res = apif_get("fixtures", {"date": d, "league": 262, "season": s}, headers)
-            if res:
-                found = res
-                if s != season:
-                    print(f"  ✅ Liga MX fixtures encontrados con season={s}", flush=True)
-                break
-            time.sleep(1.5)
-        matches.extend(found)
-        time.sleep(1.5)
-    return matches
-
-def get_mx_odds(fixture_id, headers):
-    """
-    Cuotas Bet365 para un fixture de Liga MX.
-    FIX #1 y #4: este endpoint SÍ funciona en Free tier — restaurado del V6.5.
-    Retorna dict con H, D, A, O25, U25, BTTS_Y o None si no hay odds.
-    """
-    time.sleep(6.1)   # respetar rate limit 10 req/min
-    res = apif_get("odds", {"fixture": fixture_id, "bookmaker": 8}, headers)
-    if not res: return None
-    try:
-        bets = res[0]["bookmakers"][0]["bets"]
-        odds = {}
-        for b in bets:
-            if b["id"] == 1:   # Match Winner
-                for v in b["values"]:
-                    if v["value"] == "Home": odds["H"] = float(v["odd"])
-                    if v["value"] == "Draw": odds["D"] = float(v["odd"])
-                    if v["value"] == "Away": odds["A"] = float(v["odd"])
-            elif b["id"] == 5:  # Goals Over/Under
-                for v in b["values"]:
-                    if v["value"] == "Over 2.5":  odds["O25"] = float(v["odd"])
-                    if v["value"] == "Under 2.5": odds["U25"] = float(v["odd"])
-            elif b["id"] == 8:  # BTTS
-                for v in b["values"]:
-                    if v["value"] == "Yes": odds["BTTS_Y"] = float(v["odd"])
-        return odds if odds.get("H") else None
-    except: return None
-
-def get_mx_injuries(fixture_id, h_id, a_id, headers):
-    """Lesiones por fixture. 1 req. Coste: 0 si no hay datos."""
-    time.sleep(2.0)
-    res = apif_get("injuries", {"fixture": fixture_id}, headers)
-    hinj = sum(1 for i in res if i.get("team",{}).get("id") == h_id)
-    ainj = sum(1 for i in res if i.get("team",{}).get("id") == a_id)
-    return hinj, ainj
-
-# ============================================================
-# MOTOR MATEMÁTICO — DIXON-COLES + NEGBINOM
-# ============================================================
-
-def _pmf(mu, k):
-    if mu <= 0 or k < 0: return 0.0
-    try: return exp(-mu + k*log(mu) - lgamma(k+1))
-    except: return 0.0
-
-def dixon_coles(lh, la, rho=DC_RHO):
-    """Dixon-Coles 1X2 con corrección scores bajos (0-0, 1-0, 0-1, 1-1)."""
-    ph = pd_ = pa = 0.0
-    for x in range(10):
-        for y in range(10):
-            p = _pmf(lh,x) * _pmf(la,y)
-            c = 1.0
-            if   x==0 and y==0: c = 1 - lh*la*rho
-            elif x==0 and y==1: c = 1 + lh*rho
-            elif x==1 and y==0: c = 1 + la*rho
-            elif x==1 and y==1: c = 1 - rho
-            p = max(0.0, p*c)
-            if x>y: ph+=p
-            elif x==y: pd_+=p
-            else: pa+=p
-    t = ph+pd_+pa
-    if t<0.01: return 0.33,0.33,0.34
-    return ph/t, pd_/t, pa/t
-
-def negbinom_ou(xg_total, std, line=2.5):
-    """NegBinom O/U con std calibrado empíricamente por liga."""
-    mu=xg_total; var=max(std**2, mu)
-    def nb(k):
-        if mu<=0: return 0.0
-        if var<=mu*1.01: return _pmf(mu,k)
-        r=mu**2/(var-mu); p=r/(r+mu)
-        try: return exp(lgamma(k+r)-lgamma(r)-lgamma(k+1)+r*log(p)+k*log(1-p))
-        except: return 0.0
-    pu = sum(nb(k) for k in range(int(np.floor(line))+1))
-    return round(1-pu,4), round(pu,4)
-
-def btts_prob(xh, xa):
-    if not (0.4<=xh<=4.0 and 0.4<=xa<=4.0): return None, None
-    y = (1-exp(-xh))*(1-exp(-xa))
-    if not 0.20<=y<=0.90: return None, None
-    return round(y,4), round(1-y,4)
-
-def shrink(p, a=0.75):
-    """Shrinkage hacia 0.5 — evita probabilidades extremas."""
-    return 0.5+(p-0.5)*a
-
-def blend(pm, pe, w=0.30):
-    """70% modelo + 30% empírico del Trend Resource."""
-    if pe is None or not 0.05<=pe<=0.95: return pm
-    return pm*(1-w)+pe*w
-
-# ============================================================
-# PRICING ENGINE
-# ============================================================
-
-def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
-    """
-    Construye candidatos con probabilidades calibradas.
-    odds: dict con H/D/A/O25/U25/BTTS_Y (del CSV o api-football)
-    trend: dict con pct_o25/pct_bts/cuotas (del Trend Resource)
-    """
-    out = []; liq = cfg["liq"]; std = cfg["xg_std"]; ts = trend or {}
-
-    # ── 1X2 Dixon-Coles ──────────────────────────────────────────────────
-    dc_h, dc_d, dc_a = dixon_coles(xh, xa)
-    # Cuotas: CSV/api-football primero, Trend como fallback
-    oh = odds.get("H") or ts.get("home_odd")
-    od = odds.get("D") or ts.get("draw_odd")
-    oa = odds.get("A") or ts.get("away_odd")
-
-    if conf != "LOW" and oh and od and oa:
-        # Normalizar implied probs con vig removal
-        i1,i2,i3 = 1/(oh*1.05),1/(od*1.05),1/(oa*1.05); t=i1+i2+i3
-        ih,id_,ia = i1/t, i2/t, i3/t
-        # Blend modelo + mercado según liquidez de la liga
-        def bm(m,i): return m*(1-liq)+i*liq
-        t2 = bm(dc_h,ih)+bm(dc_d,id_)+bm(dc_a,ia)
-        ph = bm(dc_h,ih)/t2; pd_=bm(dc_d,id_)/t2; pa=bm(dc_a,ia)/t2
-    else:
-        ph, pd_, pa = dc_h, dc_d, dc_a
-
-    # 1X2: solo cuotas ≥ 2.50 en ligas menos líquidas (liq < 0.88)
-    # Mercado muy eficiente en ligas top — solo apostamos donde hay ineficiencia
-    MIN_ODD_1X2 = 2.50 if liq < 0.88 else 3.00
-    for prob, odd_val, pick in [(ph,oh,f"Gana {h_n}"),
-                                 (pd_,od,"Empate"),
-                                 (pa,oa,f"Gana {a_n}")]:
-        if odd_val and odd_val >= MIN_ODD_1X2:
-            out.append({"mkt":"1X2","pick":pick,"odd":odd_val,"prob":prob,
-                        "model_gap":round(prob-1/(odd_val*1.05),4)})
-
-    # ── DOUBLE CHANCE ────────────────────────────────────────────────────
-    # DC calculado de probabilidades Dixon-Coles ya calibradas
-    # 1X2 odds → DC odds via fair value (sin vig 1.04)
-    if conf != "LOW" and oh and od and oa:
-        dc_1x  = ph + pd_   # Local o Empate
-        dc_x2  = pd_ + pa   # Empate o Visitante
-        dc_12  = ph + pa    # Local o Visitante (sin empate)
-        # Cuota fair DC = 1 / prob; aplicar vig mínimo de DC (más bajo que 1X2)
-        for dc_prob, dc_pick, vig in [
-            (dc_1x, f"DC: {h_n} o Empate", 1.04),
-            (dc_x2, f"DC: Empate o {a_n}", 1.04),
-            (dc_12, f"DC: {h_n} o {a_n}",  1.04),
-        ]:
-            if dc_prob > 0.01:
-                # Cuota fair implícita desde probs del mercado
-                if dc_pick.endswith("o Empate"):
-                    dc_odd = 1/(1/oh + 1/od) if oh and od else None
-                elif dc_pick.endswith(f"o {a_n}"):
-                    dc_odd = 1/(1/od + 1/oa) if od and oa else None
-                else:
-                    dc_odd = 1/(1/oh + 1/oa) if oh and oa else None
-                # FILTRO CALIBRADO: DC solo funciona con cuota < 1.52
-                # Análisis 40 picks: cuota <1.50 = 100% BR, cuota 1.50-1.60 = 33% BR
-                if dc_odd and 1.01 < dc_odd < 1.52:
-                    out.append({"mkt":"DC","pick":dc_pick,"odd":round(dc_odd,2),
-                                "prob":dc_prob,
-                                "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
-
-    # ── DRAW NO BET ──────────────────────────────────────────────────────
-    # DNB: si empata devuelven. EV real = ph/(ph+pa) para local,  pa/(ph+pa) para visitante.
-    # Cuota fair derivada de las probabilidades Dixon-Coles sin empate.
-    # Solo en ligas con liq < 0.88 (mercado menos eficiente) y conf HIGH.
-    if conf == "HIGH" and oh and oa and liq < 0.88:
-        ph_dnb = ph / max(ph + pa, 0.01)   # prob local sin empate
-        pa_dnb = pa / max(ph + pa, 0.01)   # prob visitante sin empate
-        # Cuota fair DNB desde las cuotas 1X2 del mercado (sin vig)
-        # DNB_H fair = 1 / (1/oh - 1/od) cuando od es la cuota empate
-        try:
-            dnb_h_odd = round(1 / (1/oh - 1/od), 2) if oh and od and (1/oh - 1/od) > 0.05 else None
-            dnb_a_odd = round(1 / (1/oa - 1/od), 2) if oa and od and (1/oa - 1/od) > 0.05 else None
-        except (ZeroDivisionError, ValueError):
-            dnb_h_odd = dnb_a_odd = None
-        # Solo cuotas razonables (1.10 - 4.00)
-        if dnb_h_odd and 1.10 < dnb_h_odd < 4.00:
-            out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
-                        "odd":dnb_h_odd,"prob":ph_dnb,
-                        "model_gap":round(ph_dnb - 1/(dnb_h_odd*1.05), 4)})
-        if dnb_a_odd and 1.10 < dnb_a_odd < 4.00:
-            out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
-                        "odd":dnb_a_odd,"prob":pa_dnb,
-                        "model_gap":round(pa_dnb - 1/(dnb_a_odd*1.05), 4)})
-
-    # ── O/U 2.5 ──────────────────────────────────────────────────────────
-    has_trend = ts.get("pct_o25") is not None
-    po_raw, _ = negbinom_ou(xh+xa, std)
-    po = shrink(blend(po_raw, ts.get("pct_o25")))
-    pu = 1 - po
-    # Shrinkage calibrado post análisis de 29 picks: Under 42% beat rate
-    # → shrinkage más agresivo para reducir sobreestimación de prob Under
-    if not has_trend:
-        pu = shrink(pu, a=0.45)   # sin Trend: agresivo (Under 42% BR → recalibrando)
-        po = 1 - pu
-    else:
-        pu = shrink(pu, a=0.60)   # con Trend: conservador
-        po = 1 - pu
-    # Cuota Over: CSV/api-football primero, Trend como fallback
-    o25 = odds.get("O25") or ts.get("ou25_odd")
-    u25 = odds.get("U25")
-    if o25 and o25>1.01:
-        xg_total = xh + xa
-        # FILTRO CALIBRADO: Over en xG 2.5-3.2 tiene 33% BR (análisis 40 picks)
-        # Solo apostar Over si el xG total es suficientemente alto (>3.2) o bajo (<2.5)
-        if not (2.50 <= xg_total <= 3.20):
-            out.append({"mkt":"OVER","pick":"Over 2.5 Goles","odd":o25,"prob":po,
-                        "model_gap":round(po-1/(o25*1.07),4)})
-        else:
-            pass  # xG 2.5-3.2 → skip Over (rango sin edge)
-    if u25 and u25>1.01:
-        xg_total = xh + xa
-        # FILTRO CALIBRADO: Under en xG 1.8-2.2 tiene 33% BR (análisis 40 picks)
-        # Ese rango es el más peligroso — mercado ya lo sabe
-        if not (1.80 <= xg_total <= 2.20):
-            out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
-                        "model_gap":round(pu-1/(u25*1.07),4)})
-        else:
-            pass  # xG 1.8-2.2 → skip Under (rango descalibrado)
-
-    # ── BTTS Sí / No ─────────────────────────────────────────────────────
-    if conf != "LOW":
-        py, pn = btts_prob(xh, xa)
-        if py:
-            py = blend(py, ts.get("pct_bts"), w=0.25); pn = 1-py
-            ob  = odds.get("BTTS_Y") or ts.get("bts_odd")
-            obn = odds.get("BTTS_N")  # cuota explícita del CSV si existe
-            # Si no hay cuota explícita BTTS_N, derivar de BTTS_Y
-            if not obn and ob and ob > 1.01:
-                obn_derived = round(1 / max(0.01, 1 - 1/ob), 2)
-                # Solo usar si la cuota derivada es razonable (1.20 - 4.00)
-                obn = obn_derived if 1.20 < obn_derived < 4.00 else None
-            if ob and ob > 1.01:
-                out.append({"mkt":"BTTS","pick":"Ambos Marcan: Sí","odd":ob,"prob":py,
-                            "model_gap":round(py-1/(ob*1.06),4)})
-            if obn and obn > 1.05:
-                out.append({"mkt":"BTTS_NO","pick":"Ambos Marcan: No",
-                            "odd":round(float(obn),2),"prob":pn,
-                            "model_gap":round(pn-1/(float(obn)*1.06),4)})
-    return out
-
-# ============================================================
-# VALIDACIONES + KELLY + PORTFOLIO (del V6.5 + V7.1)
-# ============================================================
-
-def validate_xg(xh, xa, oh, oa, o25):
-    if oh and oa:
-        mo=min(oh,oa); rat=max(xh,xa)/min(xh,xa) if min(xh,xa)>0 else 1
-        if mo<1.40 and rat<1.50: return False,"XG_DEFAULT_DETECTED"
-        if mo<1.65 and rat<1.20: return False,"XG_FLAT_ON_FAV"
-        if 1.30<=xh<=1.50 and 1.30<=xa<=1.50 and mo<1.60: return False,"XG_LIKELY_DEFAULT"
-    if o25:
-        pu=1/(o25*1.07)
-        if 0.01 < pu < 1.0 and abs((xh+xa)+2.5*math.log(pu))>1.8:
-            return False,"XG_INCONSISTENT"
-    return True, None
-
-def sanity(p, mkt, odd):
-    VIG={"OVER":1.07,"UNDER":1.07,"1X2":1.05,"BTTS":1.06,"DC":1.04,"BTTS_NO":1.06,"DNB":1.05}
-    gap=abs(p-1/(odd*VIG.get(mkt,1.06)))
-    if gap>0.18: return False,f"SANITY_FAIL(gap={gap:.2f})"
-    return True, None
-
-def kelly_urs(ev, odd, mkt):
-    if odd<=1.0 or ev<=0: return 0.0,0.0,"EV_NEG"
-    prob=(ev+1)/odd; q=1-prob; b=odd-1
-    fk=(b*prob-q)/b if b>0 else 0.0
-    if fk<=0: return 0.0,0.0,"KELLY_NEG"
-    k=min(fk*KELLY*VOL_BKT.get(mkt,1.0),MAX_STK)
-    urs=(ev*(prob**0.5))/max(0.5,odd-1)
-    return round(k,5), round(urs,4), "OK"
-
-def portfolio(cands):
-    if not cands: return [],{}
-    for p in cands:
-        p["adj"]=p["base_stake"]*VOL_BKT.get(p["mkt"],1.0)
-    pv=sum((p["adj"]*(p["odd"]-1))**2 for p in cands)
-    pvol=math.sqrt(pv) if pv>0 else 0.0001
-    damp=min(1.0,TGT_VOL/pvol)
-    tot=sum(p["adj"]*damp for p in cands)
-    sc=min(1.0,MAX_HEAT/tot) if tot>0 else 1.0
-    for p in cands:
-        p["final_stake"]=max(0.0,min(p["adj"]*damp*sc,0.05))
-    picks=[p for p in cands if p["final_stake"]>=0.005]
-    return picks,{"pvol":pvol,"damp":damp,"heat":sum(p["final_stake"] for p in picks)}
-
-# ============================================================
-# AUDIT — RESOLUCIÓN AUTOMÁTICA CON CSV
-# ============================================================
-
-def init_audit():
-    if not os.path.exists(AUDIT_CSV):
-        with open(AUDIT_CSV,"w",newline="",encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                "Date","Div","Home","Away","Pick","Market",
-                "Prob","Odd","EV","Status","Stake","Profit",
-                "xGH","xGA","FTHG","FTAG","pct_o25","pct_bts","xg_src"
-            ])
-
-def check_result(pick, mkt, fthg, ftag, home_name="", away_name=""):
-    """
-    Resuelve el resultado de un pick.
-    FIX #3: 1X2 ahora recibe home_name y away_name para saber exactamente
-    qué equipo apostamos — ya no depende de si 'home'/'away' está en el string.
-    pick = 'Gana Arsenal', home_name='Manchester City', away_name='Arsenal'
-    → Arsenal es visitante, si ag>hg → WIN, si hg>ag → LOSS.
-    """
-    try:
-        if math.isnan(float(fthg)) or math.isnan(float(ftag)): return "PENDING"
-    except: return "PENDING"
-    hg=int(float(fthg)); ag=int(float(ftag))
-    if mkt=="OVER":  return "WIN" if hg+ag>2.5 else "LOSS"
-    if mkt=="UNDER": return "WIN" if hg+ag<2.5 else "LOSS"
-    if mkt in ("BTTS","BTTS_NO"):
-        y=hg>0 and ag>0
-        return "WIN" if ("Sí" in pick and y) or ("No" in pick and not y) else "LOSS"
-    if mkt=="DNB":
-        # DNB: empate = PUSH (devuelven) → tratamos como PENDING para no contar
-        if hg==ag: return "PENDING"   # empate → push, no cuenta como WIN ni LOSS
-        team_pick = pick.replace("DNB: Gana ","").strip()
-        sim_h = difflib.SequenceMatcher(None, team_pick.lower(), home_name.lower()).ratio()
-        sim_a = difflib.SequenceMatcher(None, team_pick.lower(), away_name.lower()).ratio()
-        if sim_h >= 0.60 and sim_h >= sim_a:
-            return "WIN" if hg>ag else "LOSS"
-        if sim_a >= 0.60 and sim_a > sim_h:
-            return "WIN" if ag>hg else "LOSS"
-        return "PENDING"
-    if mkt=="DC":
-        if "o Empate" in pick and not pick.startswith("DC: Empate"):
-            # 1X: local gana o empate
-            return "WIN" if hg>=ag else "LOSS"
-        elif pick.count(" o ") == 1 and "Empate o" in pick:
-            # X2: empate o visitante gana
-            return "WIN" if hg<=ag else "LOSS"
-        else:
-            # 12: cualquier equipo gana (no empate)
-            return "WIN" if hg!=ag else "LOSS"
-    if mkt=="1X2":
-        if "Empate" in pick: return "WIN" if hg==ag else "LOSS"
-        # Extraer el nombre del equipo del pick: "Gana Arsenal" → "Arsenal"
-        team_pick = pick.replace("Gana ","").strip()
-        # Fuzzy match contra home y away para saber cuál es
-        sim_h = difflib.SequenceMatcher(None, team_pick.lower(), home_name.lower()).ratio()
-        sim_a = difflib.SequenceMatcher(None, team_pick.lower(), away_name.lower()).ratio()
-        if sim_h >= 0.60 and sim_h >= sim_a:
-            return "WIN" if hg>ag else "LOSS"   # apostamos al local
-        if sim_a >= 0.60 and sim_a > sim_h:
-            return "WIN" if ag>hg else "LOSS"   # apostamos al visitante
-        return "PENDING"   # no se pudo identificar el equipo
-    return "PENDING"
-
-def run_audit():
-    """07:00 UTC — resuelve picks PENDING con resultados del CSV. 0 requests."""
-    import pandas as pd
-    if not os.path.exists(AUDIT_CSV): return
-    rows=[]; resolved=wins=losses=0; db_updates=[]
-    try:
-        with open(AUDIT_CSV,"r",encoding="utf-8") as f:
-            reader=csv.reader(f); header=next(reader); rows.append(header)
-            for row in reader:
-                if len(row)<11: rows.append(row); continue
-                if row[9]=="PENDING":
-                    div=row[1]; home=row[2]; away=row[3]
-                    pick=row[4]; mkt=row[5]
-                    try: odd=float(row[7]); stake=float(row[10])
-                    except: rows.append(row); continue
-                    df=load_csv(div)
-                    if df is not None:
-                        played=df.dropna(subset=["FTHG","FTAG"])
-                        teams=pd.concat([played["HomeTeam"],played["AwayTeam"]]).unique()
-                        rh=difflib.get_close_matches(home,teams,n=1,cutoff=0.55)
-                        ra=difflib.get_close_matches(away,teams,n=1,cutoff=0.55)
-                        if rh and ra:
-                            m=played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
-                            if not m.empty:
-                                fthg=float(m.iloc[-1]["FTHG"])
-                                ftag=float(m.iloc[-1]["FTAG"])
-                                res=check_result(pick,mkt,fthg,ftag,
-                                                 home_name=rh[0],away_name=ra[0])
-                                if res in("WIN","LOSS"):
-                                    profit = round(stake*odd-stake if res=="WIN" else -stake, 4)
-                                    row[9]=res; row[14]=str(fthg); row[15]=str(ftag)
-                                    row[11]=str(profit)
-                                    wins+=res=="WIN"; losses+=res=="LOSS"; resolved+=1
-                                    # Sincronizar resultado a picks_log DB
-                                    db_updates.append((res, profit, fthg, ftag,
-                                                        row[2], row[3], row[5]))
-                rows.append(row)
-        with open(AUDIT_CSV,"w",newline="",encoding="utf-8") as f:
-            csv.writer(f).writerows(rows)
-        # Actualizar picks_log en DB con resultados resueltos
-        if db_updates:
-            try:
-                conn_a = sqlite3.connect(DB_PATH)
-                for res, profit, fthg, ftag, home, away, mkt in db_updates:
-                    conn_a.execute("""
-                        UPDATE picks_log SET result=?, profit=?
-                        WHERE home_team LIKE ? AND away_team LIKE ?
-                          AND market=? AND result='PENDING'
-                    """, (res, profit,
-                          f"%{home[:8]}%", f"%{away[:8]}%", mkt))
-                conn_a.commit(); conn_a.close()
-            except Exception as db_e:
-                print(f"  ⚠️ audit DB sync: {db_e}", flush=True)
-        Log.audit_end(resolved, wins, losses)
-        if resolved:
-            send_msg(f"🔬 <b>Auditoría V7.2</b>\nResueltos: {resolved} | ✅{wins} WIN | ❌{losses} LOSS")
-    except Exception as e:
-        Log.err(f"audit: {e}", "AUDIT")
-
-def calc_pnl():
-    import pandas as pd
-    if not os.path.exists(AUDIT_CSV): return
-    try:
-        df=pd.read_csv(AUDIT_CSV)
-        df["Profit"]=pd.to_numeric(df["Profit"],errors="coerce").fillna(0)
-        df["Stake"]=pd.to_numeric(df["Stake"],errors="coerce").fillna(0)
-        total=df["Profit"].sum()
-        nw=(df["Status"]=="WIN").sum(); nl=(df["Status"]=="LOSS").sum()
-        np_=(df["Status"]=="PENDING").sum()
-        br=nw/(nw+nl)*100 if nw+nl else 0
-        avg_ev=df[df["Status"].isin(["WIN","LOSS"])]["EV"].astype(float).mean()*100 if nw+nl else 0
-        send_msg(
-            f"💰 <b>PnL V7.2</b>\n"
-            f"Total: {total:+.4f} U | W/L/Pend: {nw}/{nl}/{np_}\n"
-            f"Beat Rate: {br:.1f}% | Avg EV: +{avg_ev:.1f}%\n"
-            f"Burn-in: {nw+nl}/30 picks"
-        )
-    except Exception as e:
-        Log.err(f"pnl: {e}", "PNL")
-
-# ============================================================
-# KILL-SWITCH — protección de capital
-# ============================================================
-
-def kill_switch_check():
-    """
-    Verifica si el bankroll cayó KILL_DRAWDOWN desde el máximo histórico.
-    Si LIVE_TRADING y drawdown > 15% → pausa automática + alerta Telegram.
-    Retorna True si el sistema debe pausarse.
-    """
-    if not LIVE_TRADING:
-        return False
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute("""
-            SELECT profit FROM picks_log
-            WHERE result IN ('WIN','LOSS')
-            ORDER BY id ASC
-        """).fetchall()
-        conn.close()
-        if len(rows) < 5:
-            return False
-        # Calcular curva de bankroll acumulada
-        cumulative = 0.0
-        peak = 0.0
-        for (p,) in rows:
-            cumulative += float(p or 0)
-            if cumulative > peak:
-                peak = cumulative
-        # Drawdown desde el pico
-        drawdown = (peak - cumulative) / (1 + peak) if peak > 0 else 0
-        if drawdown >= KILL_DRAWDOWN:
-            send_msg(
-                f"🚨 <b>KILL-SWITCH ACTIVADO</b>\n"
-                f"Drawdown: -{drawdown*100:.1f}% desde el pico\n"
-                f"PnL acumulado: {cumulative:+.4f}U | Pico: {peak:+.4f}U\n"
-                f"Sistema en pausa. Revisar modelo antes de reactivar."
-            )
-            Log.err(f"KILL-SWITCH: drawdown {drawdown*100:.1f}% — PAUSANDO SISTEMA", "RISK")
-            return True
-        elif drawdown >= KILL_DRAWDOWN * 0.7:
-            # Advertencia al 70% del límite
-            send_msg(
-                f"⚠️ <b>Drawdown warning</b>: -{drawdown*100:.1f}% "
-                f"(límite: -{KILL_DRAWDOWN*100:.0f}%)"
-            )
-    except Exception as e:
-        print(f"  ⚠️ kill_switch_check: {e}", flush=True)
-    return False
-
-# ============================================================
-# BOT PRINCIPAL
-# ============================================================
-
-class TripleLeagueV72:
-    def __init__(self):
-        self.apif_h = {
-            "x-apisports-key": API_SPORTS_KEY,
-            "x-rapidapi-host": "v3.football.api-sports.io"
-        }
-        init_db(); init_audit(); reset_req()
-        print("--- V7.2 HYBRID ENGINE STARTED ---", flush=True)
-        try:
-            conn=sqlite3.connect(DB_PATH)
-            xg_n=conn.execute("SELECT COUNT(*) FROM team_xg_cache").fetchone()[0]
-            pk_n=conn.execute("SELECT COUNT(*) FROM picks_log").fetchone()[0]
-            conn.close()
-            send_msg(
-                f"🚀 <b>V7.2 HYBRID — ONLINE</b>\n"
-                f"📂 xG cache: {xg_n} equipos | picks: {pk_n}\n"
-                f"⚡ Dixon-Coles + NegBinom calibrado\n"
-                f"📊 [1] CSV co.uk (shots) + [2] fd.org (Trend) + [3] api-football (MEX)\n"
-                f"{'🟢 LIVE' if LIVE_TRADING else '🔴 DRY-RUN'}"
-            )
-        except Exception as e:
-            send_msg(f"🚀 V7.2 iniciado ({e})")
-
-        # ── BURN-IN EVALUATOR ─────────────────────────────────
-        try:
-            from burn_in_evaluator import print_burn_in_report
-            r = print_burn_in_report(DB_PATH)
-            if r['ready_for_live'] and not LIVE_TRADING:
-                send_msg("🟢 <b>BURN-IN SUPERADO.</b> Activar LIVE_TRADING manualmente.")
-        except ImportError:
-            Log.warn("burn_in_evaluator.py no encontrado", "BURNIN")
-        except Exception as e:
-            Log.err(f"burn-in eval: {e}", "BURNIN")
-
-    def _filter(self, probs, label, fid, h_n, a_n, ko, xh, xa, xt, conf, src, div, ts):
-        """Aplica filtros y retorna candidatos válidos listos para el portfolio."""
-        cands=[]
-        for item in probs:
-            ev=(item["prob"]*item["odd"])-1
-            ok2,fail=sanity(item["prob"],item["mkt"],item["odd"])
-            if not ok2:     log_rej(label,item["mkt"],item["odd"],ev,fail); continue
-            min_ev_mkt = MIN_EV_MKT.get(item["mkt"], MIN_EV)
-            if ev<min_ev_mkt: log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
-            if ev>MAX_EV:   log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
-            k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
-            if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
-            print(f"     ✅ {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.3f}",flush=True)
-            cands.append({**item,"ev":ev,"base_stake":k,"urs":urs,
-                          "conf":conf,"xg_src":src,
-                          "fid":fid,"h_n":h_n,"a_n":a_n,"ko":ko,
-                          "xh":xh,"xa":xa,"xt":xt,"div":div,
-                          "trend_pct_o25":ts.get("pct_o25"),
-                          "trend_pct_bts":ts.get("pct_bts")})
-        return cands
-
-    def _save_pick(self, p, today_str, conn_c):
-        """Guarda pick en DB y CSV de auditoría. INSERT OR IGNORE previene duplicados."""
-        cfg_p=TARGET_LEAGUES.get(p["div"],{})
-        conn_c.execute("""INSERT OR IGNORE INTO picks_log
-            (fixture_id,league,div,home_team,away_team,market,selection,
-             odd_open,prob_model,ev_open,stake_pct,
-             xg_home,xg_away,xg_total,xg_source,
-             trend_pct_o25,trend_pct_bts,
-             pick_time,kickoff_time,urs,model_gap)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(p["fid"]),cfg_p.get("name",""),p["div"],p["h_n"],p["a_n"],
-             p["mkt"],p["pick"],
-             p["odd"],p["prob"],p["ev"],
-             p["final_stake"],
-             p["xh"],p["xa"],p["xt"],p["xg_src"],
-             p.get("trend_pct_o25"),p.get("trend_pct_bts"),
-             datetime.now(timezone.utc).isoformat(),p["ko"],
-             p["urs"],p["model_gap"])
-        )
-        # Solo escribir al CSV si realmente se insertó (no era duplicado)
-        if conn_c.rowcount > 0:
-            with open(AUDIT_CSV,"a",newline="",encoding="utf-8") as f:
-                csv.writer(f).writerow([
-                    today_str,p["div"],p["h_n"],p["a_n"],
-                    p["pick"],p["mkt"],p["prob"],p["odd"],p["ev"],
-                    "PENDING",p["final_stake"],0,
-                    p["xh"],p["xa"],"","",
-                    p.get("trend_pct_o25",""),p.get("trend_pct_bts",""),p["xg_src"]
-                ])
-
-    def _report_pick(self, p):
-        """Envía mensaje Telegram para un pick."""
-        cfg_p=TARGET_LEAGUES.get(p["div"],{})
-        ci="✅" if p["conf"]=="HIGH" else "⚠️" if p["conf"]=="MED" else "❌"
-        gs=f"+{p['model_gap']*100:.1f}%" if p["model_gap"]>=0 else f"{p['model_gap']*100:.1f}%"
-        tl=""
-        if p.get("trend_pct_o25") is not None:
-            tl=f"\n📈 Trend: o25={p['trend_pct_o25']*100:.0f}% bts={p.get('trend_pct_bts') or 0:.0f}%"
-        send_msg(
-            f"⚽ <b>{p['h_n']} vs {p['a_n']}</b>\n"
-            f"🏟 {cfg_p.get('name','')}\n"
-            f"{'🟢 [LIVE]' if LIVE_TRADING else '🟡 [DRY-RUN]'} [{p['mkt']}]: <b>{p['pick']}</b>\n"
-            f"📊 Cuota: @{p['odd']:.2f} | EV: +{p['ev']*100:.1f}%\n"
-            f"🧠 Prob: {p['prob']*100:.1f}% | Gap: {gs}\n"
-            f"🏦 Stake: {p['final_stake']*100:.2f}% | URS: {p['urs']:.3f}\n"
-            f"🎯 xG: H={p['xh']:.2f} A={p['xa']:.2f} | {ci} {p['conf']}"
-            f"{tl}"
-        )
-
-    # ── REFRESH CSVS ─────────────────────────────────────────────────────
-
-    def refresh_csvs(self):
-        """06:00 UTC — descarga CSVs frescos antes del scan."""
-        _CSV_MEM.clear()
-        updated=[]
-        for div in TARGET_LEAGUES:
-            path=download_csv(div, force=True)
-            if path: updated.append(div)
-        send_msg(f"📥 <b>CSVs actualizados:</b> {', '.join(updated)}")
-
-    # ── SCAN PRINCIPAL D-1 ────────────────────────────────────────────────
-
-    def run_daily_scan(self):
-        """
-        11:00 UTC — analiza partidos de mañana y pasado.
-
-        FLUJO REAL (las 3 fuentes alimentan preliminary):
-
-        EUROPEAS (E0,E1,SP1,D1,I1,F1,N1,P1):
-          [1] CSV co.uk → xG con shots HST/AST + cuotas apertura
-          [2] fd.org Trend → pct_o25, pct_bts (calibración) + cuotas fallback
-          → preliminary.append ✅
-
-        BRASILEIRAO (BSA):
-          [1] CSV co.uk BRA.xlsx → xG goles proxy
-          [2] fd.org /matches → fixtures con IDs de equipos
-          [2] fd.org Trend → cuotas H/D/A/O25 + pct_o25/pct_bts
-          → preliminary.append ✅
-
-        LIGA MX (MEX):
-          [1] CSV co.uk MEX.xlsx → xG goles proxy
-          [3] api-football /fixtures → fixtures del día
-          [3] api-football /odds?fixture=X&bookmaker=8 → cuotas Bet365
-          [3] api-football /injuries → lesiones
-          → preliminary.append ✅
-        """
-        import pandas as pd
-        reset_req(); _CSV_MEM.clear(); _TREND_MEM.clear()
-
-        tomorrow  = (datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d")
-        day_after = (datetime.now()+timedelta(days=2)).strftime("%Y-%m-%d")
-        today_str = datetime.now().strftime("%d/%m/%Y")
-        preliminary = []
-
-        Log.scan_start([tomorrow, day_after])
-        send_msg(
-            f"🔍 <b>V7.2 Scan D-1</b>\n"
-            f"🗓 {tomorrow} / {day_after}\n"
-            f"[1] CSV co.uk + [2] fd.org + [3] api-football"
-        )
-
-        # ── [2] Trend Resource — 1 req por fecha ─────────────────────────
-        fd_codes = [cfg["fbd_code"] for cfg in TARGET_LEAGUES.values()
-                    if cfg.get("fbd_code")]
-        all_trends = {}
-        for d in [tomorrow, day_after]:
-            all_trends.update(fetch_trends(d, fd_codes))
-            time.sleep(7.0)
-
-        # ── [1] fixtures.csv → europeas ───────────────────────────────────
-        fix_df = get_fixtures_csv()
-
-        euro_divs = [d for d,c in TARGET_LEAGUES.items() if c["source"]=="csv_euro"]
-
-        if fix_df is not None:
-            for d_off in [1,2]:
-                target_date = (datetime.now()+timedelta(days=d_off)).date()
-                daily = fix_df[
-                    (fix_df["Date"].dt.date==target_date) &
-                    (fix_df["Div"].isin(euro_divs))
-                ]
-                for _, row in daily.iterrows():
-                    div=row.get("Div")
-                    if div not in TARGET_LEAGUES: continue
-                    cfg=TARGET_LEAGUES[div]
-                    h_n=str(row.get("HomeTeam","")).strip()
-                    a_n=str(row.get("AwayTeam","")).strip()
-                    if not h_n or not a_n: continue
-                    ko=str(row.get("Date",""))
-                    label=f"{h_n} vs {a_n} ({cfg['name']})"
-                    fid=f"{div}_{h_n}_{a_n}"
-                    print(f"\n  ── {label} ──", flush=True)
-
-                    # [1] xG desde CSV histórico con shots
-                    df_hist=load_csv(div)
-                    xh,xa,xt,conf,src=build_xg(h_n,a_n,div,cfg,df_hist)
-
-                    # [1] Cuotas desde fixtures.csv
-                    odds=get_odds_from_row(row,cfg)
-
-                    # [2] Trend por nombre (fixtures.csv no tiene team_id)
-                    ts={}
-                    for te in all_trends.values():
-                        hn_t=te.get("homeTeam",{}).get("name","")
-                        an_t=te.get("awayTeam",{}).get("name","")
-                        if (difflib.SequenceMatcher(None,h_n,hn_t).ratio()>0.60 and
-                            difflib.SequenceMatcher(None,a_n,an_t).ratio()>0.60):
-                            ts=extract_trend(te); break
-
-                    ok,reason=validate_xg(xh,xa,odds.get("H"),odds.get("A"),odds.get("O25"))
-                    if not ok: log_rej(label,"ALL",0,0,reason); continue
-                    if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
-
-                    probs=build_probs(xh,xa,conf,h_n,a_n,cfg,odds,ts)
-                    cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,div,ts)
-                    if cands:
-                        cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
-                        preliminary.append(cands[0])   # ← EUROPEAS ALIMENTAN preliminary ✅
-
-        # ── [1]+[2] BSA — CSV goles proxy + fd.org fixtures + Trend ──────
-        df_bra=load_csv("BSA")
-        cfg_bra=TARGET_LEAGUES["BSA"]
-
-        for d in [tomorrow, day_after]:
-            bsa_matches=get_fd_org_matches("BSA", d)
-            time.sleep(7.0)
-            for m in bsa_matches:
-                ht=m.get("homeTeam",{}); at=m.get("awayTeam",{})
-                h_n=ht.get("name",""); a_n=at.get("name","")
-                h_id=ht.get("id",""); a_id=at.get("id","")
-                ko=m.get("utcDate",""); fid=str(m.get("id",""))
-                label=f"{h_n} vs {a_n} ({cfg_bra['name']})"
-                print(f"\n  ── {label} ──", flush=True)
-
-                # [1] xG desde CSV BRA.xlsx goles proxy
-                xh,xa,xt,conf,src=build_xg(h_n,a_n,"BSA",cfg_bra,df_bra)
-
-                # [2] Trend → cuotas H/D/A/O25 + pct_o25/pct_bts
-                # FIX #2: cuotas del Trend Resource, NO del H2H histórico
-                ts={}
-                trend_key=f"{h_id}_{a_id}"
-                if trend_key in all_trends:
-                    ts=extract_trend(all_trends[trend_key])
-
-                # Odds: Trend como fuente primaria para BSA
-                odds={
-                    "H":    ts.get("home_odd"),
-                    "D":    ts.get("draw_odd"),
-                    "A":    ts.get("away_odd"),
-                    "O25":  ts.get("ou25_odd"),
-                    "U25":  None,
-                    "BTTS_Y": ts.get("bts_odd"),
-                }
-
-                if not odds.get("H"):
-                    # Fallback: intentar api-football para cuotas BSA
-                    # fd.org da el fixture_id del partido de BSA
-                    apif_fid = m.get("id")
-                    if apif_fid and get_req() < 80:
-                        apif_odds = get_mx_odds(apif_fid, self.apif_h)
-                        if apif_odds:
-                            odds.update(apif_odds)
-                            Log.info("BSA odds via api-football", "BSA")
-                    if not odds.get("H"):
-                        Log.warn("BSA sin cuotas — skip", "BSA")
-                        log_rej(label,"ALL",0,0,"NO_ODDS_AVAILABLE"); continue
-
-                ok,reason=validate_xg(xh,xa,odds["H"],odds["A"],odds["O25"])
-                if not ok: log_rej(label,"ALL",0,0,reason); continue
-                if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
-
-                probs=build_probs(xh,xa,conf,h_n,a_n,cfg_bra,odds,ts)
-                cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,"BSA",ts)
-                if cands:
-                    cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
-                    preliminary.append(cands[0])   # ← BSA ALIMENTA preliminary ✅
-
-        # ── [1]+[3] MEX — CSV goles proxy + api-football odds ────────────
-        # FIX #1 y #4: MEX ahora genera picks reales
-        df_mex=load_csv("MEX")
-        cfg_mex=TARGET_LEAGUES["MEX"]
-        mx_fixtures=get_mx_fixtures([tomorrow,day_after], self.apif_h)
-
-        for m in mx_fixtures[:8]:
-            h_n=m["teams"]["home"]["name"]
-            a_n=m["teams"]["away"]["name"]
-            h_id=m["teams"]["home"]["id"]
-            a_id=m["teams"]["away"]["id"]
-            ko=m["fixture"]["date"]
-            fid=str(m["fixture"]["id"])
-            label=f"{h_n} vs {a_n} ({cfg_mex['name']})"
-            print(f"\n  ── {label} (fid={fid}) ──", flush=True)
-
-            # [1] xG desde CSV MEX.xlsx goles proxy
-            xh,xa,xt,conf,src=build_xg(h_n,a_n,"MEX",cfg_mex,df_mex)
-
-            # [3] Cuotas Bet365 via api-football — FIX #4 restaurado
-            odds_mx=get_mx_odds(fid, self.apif_h)
-            if not odds_mx:
-                print(f"     ⚠️ MEX sin cuotas Bet365 — skip", flush=True)
-                log_rej(label,"ALL",0,0,"NO_ODDS_APIF"); continue
-
-            # [3] Lesiones
-            inj_h,inj_a=get_mx_injuries(fid,h_id,a_id,self.apif_h)
-            if inj_h or inj_a:
-                print(f"     🚑 Lesiones: {h_n}={inj_h} {a_n}={inj_a}", flush=True)
-                # Recalcular xG con factor lesiones
-                xh,xa,xt,conf,src=build_xg(h_n,a_n,"MEX",cfg_mex,df_mex,inj_h,inj_a)
-
-            ok,reason=validate_xg(xh,xa,odds_mx.get("H"),odds_mx.get("A"),odds_mx.get("O25"))
-            if not ok: log_rej(label,"ALL",0,0,reason); continue
-            if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
-
-            probs=build_probs(xh,xa,conf,h_n,a_n,cfg_mex,odds_mx,{})
-            cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,"MEX",{})
-            if cands:
-                cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
-                preliminary.append(cands[0])   # ← MEX ALIMENTA preliminary ✅
-
-        # ── Portfolio + reporte ───────────────────────────────────────────
-        final,meta=portfolio(preliminary)
-
-        req_total=get_req()   # FIX #3: get_req() no modifica el contador
-        if not final:
-            send_msg(
-                f"🧹 <b>V7.2 Scan completado</b>\n"
-                f"Candidatos analizados: {len(preliminary)} | Picks: 0\n"
-                f"📡 api-football: {req_total}/100"
-            )
-            return
-
-        conn=sqlite3.connect(DB_PATH); c=conn.cursor()
-        send_msg(
-            f"📊 <b>V7.2 Portfolio — {len(final)} picks</b>\n"
-            f"Vol: {meta['pvol']*100:.2f}% | Damper: {meta['damp']:.2f}x\n"
-            f"Heat: {meta['heat']*100:.2f}%\n"
-            f"📡 api-football: {req_total}/100"
-        )
-        for p in final:
-            self._save_pick(p, today_str, c)
-            self._report_pick(p)
-        conn.commit(); conn.close()
-
-    # ── CLV CAPTURE ──────────────────────────────────────────────────────
-
-    def capture_clv(self):
-        """
-        16:00 UTC — captura cuotas de cierre.
-        Europeas: fixtures.csv de co.uk (0 req api-football).
-        MEX: /odds?fixture=X (1 req por pick).
-        """
-        import pandas as pd
-        fix_df=get_fixtures_csv()
-        try:
-            conn=sqlite3.connect(DB_PATH); cc=conn.cursor()
-            cc.execute(
-                "SELECT id,fixture_id,div,home_team,away_team,market,selection,odd_open,kickoff_time "
-                "FROM picks_log WHERE clv_captured=0 AND result IN ('PENDING','WIN','LOSS')"
-            )
-            pending=cc.fetchall(); conn.close()
-            if not pending: return
-
-            now_utc=datetime.now(timezone.utc); clv_lines=[]
-            for row in pending:
-                pid,fid,div,home,away,mkt,sel,odd_open,ko_str=row
-                try:
-                    ko=datetime.fromisoformat(ko_str.replace("Z","+00:00"))
-                    hours_diff = (ko-now_utc).total_seconds()/3600
-                    # Capturar picks que se juegan hoy (hasta 12h antes del KO)
-                    # o que ya empezaron hace menos de 3h (para partidos tarde)
-                    if not -3 <= hours_diff <= 12: continue
-                except: continue
-
-                odd_close=None
-                cfg=TARGET_LEAGUES.get(div,{})
-
-                def _clv_1x2(co, home_n, away_n, sel_str):
-                    """Fuzzy match para saber si apostamos home, away o empate."""
-                    if "Empate" in sel_str: return co.get("D")
-                    team = sel_str.replace("Gana ","").strip()
-                    sh = difflib.SequenceMatcher(None, team.lower(), home_n.lower()).ratio()
-                    sa = difflib.SequenceMatcher(None, team.lower(), away_n.lower()).ratio()
-                    if sh >= 0.60 and sh >= sa: return co.get("H")
-                    if sa >= 0.60 and sa > sh:  return co.get("A")
-                    return None   # no identificado
-
-                if div=="MEX":
-                    # [3] api-football para cerrar MEX
-                    close=get_mx_odds(fid, self.apif_h)
-                    if close:
-                        if mkt=="OVER":   odd_close=close.get("O25")
-                        elif mkt=="UNDER": odd_close=close.get("U25")
-                        elif mkt=="1X2":   odd_close=_clv_1x2(close, home, away, sel)
-                        elif mkt=="BTTS":  odd_close=close.get("BTTS_Y")
-                elif div=="BSA":
-                    # [2] fd.org Trend Resource para cerrar BSA — 0 req extra si ya se llamó hoy
-                    today_d=datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    fd_codes={"BSA": cfg.get("fbd_code","BSA")}
-                    ts_map=fetch_trends(today_d, fd_codes)
-                    ts=extract_trend(ts_map, home, away, "BSA", today_d)
-                    if ts:
-                        co={"H":ts.get("home_odd"),"D":ts.get("draw_odd"),
-                            "A":ts.get("away_odd"),"O25":ts.get("ou25_odd")}
-                        if mkt=="OVER":   odd_close=co.get("O25")
-                        elif mkt=="UNDER":
-                            o=co.get("O25")
-                            odd_close=round(1/(1-1/o),2) if o and o>1.01 else None
-                        elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
-                        elif mkt=="BTTS":  odd_close=ts.get("bts_odd")
-                elif fix_df is not None:
-                    # [1] fixtures.csv para europeas — usar Pinnacle como closing line
-                    # Pinnacle es el bookmaker más eficiente — mejor referencia de mercado
-                    rh=difflib.get_close_matches(home,fix_df["HomeTeam"].dropna().unique(),n=1,cutoff=0.55)
-                    ra=difflib.get_close_matches(away,fix_df["AwayTeam"].dropna().unique(),n=1,cutoff=0.55)
-                    if rh and ra:
-                        m=fix_df[(fix_df["HomeTeam"]==rh[0])&(fix_df["AwayTeam"]==ra[0])]
-                        if not m.empty:
-                            row=m.iloc[0]
-                            def best_close(*cols):
-                                for c in cols:
-                                    try:
-                                        v=row.get(c) if hasattr(row,"get") else getattr(row,c,None)
-                                        if v is not None:
-                                            f=float(v)
-                                            if f>1.01 and not (f!=f): return f
-                                    except: pass
-                                return None
-                            # Prioridad: Pinnacle > BetVictor > B365 > Avg
-                            co={
-                                "H":   best_close("PSH","VCH","B365H","AvgH","BbAvH"),
-                                "D":   best_close("PSD","VCD","B365D","AvgD","BbAvD"),
-                                "A":   best_close("PSA","VCA","B365A","AvgA","BbAvA"),
-                                "O25": best_close("P>2.5","B365>2.5","Avg>2.5","BbAv>2.5"),
-                                "U25": best_close("P<2.5","B365<2.5","Avg<2.5","BbAv<2.5"),
-                                "BTTS_Y": best_close("B365BTTSY","BbAvBBTS"),
-                            }
-                            if mkt=="OVER":    odd_close=co.get("O25")
-                            elif mkt=="UNDER": odd_close=co.get("U25")
-                            elif mkt=="1X2":   odd_close=_clv_1x2(co, home, away, sel)
-                            elif mkt=="BTTS":  odd_close=co.get("BTTS_Y")
-                            elif mkt=="DC":
-                                # DC closing: derivar de Pinnacle H/D/A
-                                oh,od,oa=co.get("H"),co.get("D"),co.get("A")
-                                if oh and od and oa:
-                                    if "o Empate" in sel and not sel.startswith("DC: Empate"):
-                                        odd_close=round(1/(1/oh+1/od),2)
-                                    elif "Empate o" in sel:
-                                        odd_close=round(1/(1/od+1/oa),2)
-                                    else:
-                                        odd_close=round(1/(1/oh+1/oa),2)
-                            elif mkt=="DNB":
-                                oh,od,oa=co.get("H"),co.get("D"),co.get("A")
-                                if oh and od:
-                                    try: odd_close=round(1/(1/oh-1/od),2) if (1/oh-1/od)>0.05 else None
-                                    except: odd_close=None
-
-                if odd_close and odd_open:
-                    clv_pct=(odd_close/odd_open-1)*100
-                    conn=sqlite3.connect(DB_PATH)
-                    conn.execute("INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?,?)",
-                                 (fid,mkt,sel,odd_open,odd_close,clv_pct,now_utc.isoformat()))
-                    conn.execute("UPDATE picks_log SET clv_captured=1 WHERE id=?",(pid,))
-                    conn.commit(); conn.close()
-                    clv_lines.append(f"{sel} @{odd_open:.2f}→{odd_close:.2f} CLV={clv_pct:+.1f}%")
-
-            Log.clv_end(len(clv_lines), sum(1 for l in clv_lines if "CLV=+" in l)/max(len(clv_lines),1)*100)
-            if clv_lines:
-                pos = sum(1 for l in clv_lines if "CLV=+" in l)
-                neg = len(clv_lines) - pos
-                beat_rate = pos/len(clv_lines)*100 if clv_lines else 0
-                send_msg(
-                    f"📉 <b>CLV V7.2</b> — {len(clv_lines)} picks\n"
-                    f"Beat closing: {pos}/{len(clv_lines)} ({beat_rate:.0f}%)\n"
-                    f"{'\n'.join(clv_lines[:10])}"
-                    + (f"\n... +{len(clv_lines)-10} más" if len(clv_lines)>10 else "")
-                )
-        except Exception as e:
-            Log.err(f"CLV: {e}", "CLV")
-
-    # ── WEEKLY — STANDINGS fd.org ─────────────────────────────────────────
-
-    def weekly_standings(self):
-        """Martes 09:00 — Standings HOME/AWAY desde fd.org. ~8 req."""
-        if not FD_ORG_TOKEN: return
-        updated=[]
-        for div,cfg in TARGET_LEAGUES.items():
-            code=cfg.get("fbd_code")
-            if not code: continue
-            try:
-                r=requests.get(
-                    f"https://api.football-data.org/v4/competitions/{code}/standings",
-                    headers={"X-Auth-Token": FD_ORG_TOKEN}, timeout=15
-                )
-                track_req()
-                if r.status_code==200:
-                    # Guardar factor home/away en cache para build_xg futuro
-                    conn=sqlite3.connect(DB_PATH)
-                    now=datetime.now(timezone.utc).isoformat()
-                    for st in r.json().get("standings",[]):
-                        stype=st.get("type","TOTAL")
-                        for e in st.get("table",[]):
-                            t=e.get("team",{}); pl=e.get("playedGames",0)
-                            key=f"STAND_{code}_{t.get('id','')}_{stype}"
-                            conn.execute(
-                                """INSERT OR REPLACE INTO team_xg_cache
-                                (team_key,div,team_name,gf_series,ga_series,
-                                 shots_for,shots_against,xg_for,xg_against,
-                                 confidence,updated_at,depth) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (key,code,t.get("name",""),"[]","[]","[]","[]",
-                                 e.get("goalsFor",0)/pl if pl else 0,
-                                 e.get("goalsAgainst",0)/pl if pl else 0,
-                                 stype,now,pl)
-                            )
-                    conn.commit(); conn.close()
-                    updated.append(code)
-                time.sleep(7.0)
-            except Exception as e:
-                print(f"  ⚠️ standings {code}: {e}", flush=True)
-        send_msg(f"📊 <b>Standings V7.2:</b> {', '.join(updated)}")
-
-# ============================================================
-# SCHEDULER — horas UTC fijas, independiente del boot
-# ============================================================
-
-def _hhmm(t_str):
-    """'06:00' → (6, 0)"""
-    h, m = t_str.split(":")
-    return int(h), int(m)
-
-
-# ============================================================
-# DASHBOARD WEB — servidor HTTP en hilo separado
-# ============================================================
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>V7.2 · Quant Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#07080d;
-  --s1:#0c0e17;
-  --s2:#11141f;
-  --border:#1c2035;
-  --border2:#252840;
-  --accent:#4f6ef7;
-  --accent2:#7c6fff;
-  --green:#22c55e;
-  --red:#ef4444;
-  --amber:#f59e0b;
-  --text:#e8eaf6;
-  --muted:#5a5f80;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'Barlow',sans-serif;
-}
-body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
-
-/* ── HEADER ── */
-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:1.25rem 2rem;
-  border-bottom:1px solid var(--border);
-  background:var(--s1);
-}
-.logo{display:flex;align-items:center;gap:10px}
-.logo-mark{width:28px;height:28px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
-.logo-mark svg{width:16px;height:16px;fill:#fff}
-.logo h1{font-size:1rem;font-weight:600;letter-spacing:.02em;color:var(--text)}
-.logo span{font-family:var(--mono);font-size:.65rem;color:var(--muted);margin-top:1px}
-.header-right{display:flex;align-items:center;gap:12px}
-.live-pill{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.65rem;color:var(--green);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);padding:4px 10px;border-radius:99px}
-.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1.8s infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-#last-update{font-family:var(--mono);font-size:.65rem;color:var(--muted)}
-
-/* ── STAT CARDS ── */
-.stats-row{
-  display:grid;
-  grid-template-columns:repeat(8,minmax(0,1fr));
-  border-bottom:1px solid var(--border);
-}
-.stat{
-  padding:1.25rem 1.5rem;
-  border-right:1px solid var(--border);
-  transition:background .15s;
-}
-.stat:last-child{border-right:none}
-.stat:hover{background:var(--s2)}
-.stat-label{font-family:var(--mono);font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
-.stat-value{font-size:1.65rem;font-weight:600;letter-spacing:-.03em;line-height:1}
-.stat-sub{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.3rem}
-.green{color:var(--green)} .red{color:var(--red)} .blue{color:var(--accent)} .amber{color:var(--amber)} .white{color:var(--text)}
-
-/* ── TOOLBAR ── */
-.toolbar{
-  display:flex;align-items:center;gap:8px;padding:.85rem 2rem;
-  background:var(--s1);border-bottom:1px solid var(--border);
-  flex-wrap:wrap;
-}
-.seg{display:flex;gap:2px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:2px}
-.seg-btn{
-  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
-  padding:5px 12px;border:none;background:transparent;color:var(--muted);
-  border-radius:6px;cursor:pointer;transition:all .15s;
-}
-.seg-btn:hover{color:var(--text)}
-.seg-btn.active{background:var(--accent);color:#fff}
-.spacer{flex:1}
-#search{
-  font-family:var(--mono);font-size:.7rem;padding:7px 12px;
-  background:var(--s2);border:1px solid var(--border);color:var(--text);
-  border-radius:7px;outline:none;width:200px;transition:border-color .15s;
-}
-#search:focus{border-color:var(--accent)}
-#search::placeholder{color:var(--muted)}
-#resolve-btn{
-  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
-  padding:7px 14px;background:rgba(79,110,247,.12);
-  border:1px solid rgba(79,110,247,.3);color:var(--accent);
-  border-radius:7px;cursor:pointer;transition:all .15s;white-space:nowrap;
-}
-#resolve-btn:hover{background:rgba(79,110,247,.2)}
-#resolve-btn:disabled{opacity:.5;cursor:default}
-
-/* ── TABLE ── */
-.table-wrap{overflow-x:auto;min-height:400px}
-table{width:100%;border-collapse:collapse;font-size:.78rem}
-thead th{
-  font-family:var(--mono);font-size:.58rem;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--muted);padding:10px 16px;
-  text-align:left;border-bottom:1px solid var(--border);
-  cursor:pointer;user-select:none;white-space:nowrap;
-  background:var(--s1);position:sticky;top:0;
-}
-thead th:hover{color:var(--text)}
-thead th.sorted{color:var(--accent)}
-thead th.sorted::after{content:' ↓';font-size:.55rem}
-thead th.sorted.asc::after{content:' ↑'}
-tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
-tbody tr:hover{background:var(--s2)}
-tbody td{padding:10px 16px;white-space:nowrap;font-family:var(--mono);font-size:.73rem;vertical-align:middle}
-td.party{font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--text);white-space:normal;min-width:160px}
-td.muted-td{color:var(--muted)}
-
-/* ── BADGES ── */
-.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:.6rem;font-weight:500;letter-spacing:.05em;gap:4px}
-.b-win{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.2)}
-.b-loss{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
-.b-pend{background:rgba(79,110,247,.1);color:var(--accent);border:1px solid rgba(79,110,247,.2)}
-.b-under{background:rgba(56,189,248,.08);color:#38bdf8;border:1px solid rgba(56,189,248,.15)}
-.b-over{background:rgba(251,146,60,.08);color:#fb923c;border:1px solid rgba(251,146,60,.15)}
-.b-dc{background:rgba(167,139,250,.08);color:#a78bfa;border:1px solid rgba(167,139,250,.15)}
-.b-1x2{background:rgba(250,204,21,.08);color:#facc15;border:1px solid rgba(250,204,21,.15)}
-
-.pos{color:var(--green)} .neg{color:var(--red)} .neu{color:var(--muted)}
-.ev-high{color:var(--green)} .ev-mid{color:var(--amber)} .ev-low{color:var(--muted)}
-
-/* ── EMPTY ── */
-.empty{text-align:center;padding:5rem;color:var(--muted);font-family:var(--mono);font-size:.8rem}
-
-/* ── MINI CHART BAR ── */
-.xg-bar{display:flex;gap:3px;align-items:center}
-.xg-seg{height:4px;border-radius:2px;min-width:3px}
-
-/* ── RESPONSIVE ── */
-@media(max-width:900px){
-  .stats-row{grid-template-columns:repeat(4,1fr)}
-  .stat{border-bottom:1px solid var(--border)}
-  header{padding:1rem}
-  .toolbar{padding:.75rem 1rem}
-  tbody td{padding:8px 10px}
-}
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo">
-    <div class="logo-mark">
-      <svg viewBox="0 0 16 16"><path d="M2 12 L8 4 L14 12 Z"/></svg>
-    </div>
-    <div>
-      <h1>V7.2 Quant</h1>
-      <span>Triple League Specialist</span>
-    </div>
-  </div>
-  <div class="header-right">
-    <span id="last-update"></span>
-    <div class="live-pill"><span class="live-dot"></span>LIVE</div>
-  </div>
-</header>
-
-<div class="stats-row">
-  <div class="stat">
-    <div class="stat-label">Picks totales</div>
-    <div class="stat-value white" id="s-total">—</div>
-    <div class="stat-sub" id="s-sub-total"></div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Win</div>
-    <div class="stat-value green" id="s-win">—</div>
-    <div class="stat-sub" id="s-sub-win"></div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Loss</div>
-    <div class="stat-value red" id="s-loss">—</div>
-    <div class="stat-sub" id="s-sub-loss"></div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Pending</div>
-    <div class="stat-value blue" id="s-pend">—</div>
-    <div class="stat-sub">esperando resultado</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Beat Rate</div>
-    <div class="stat-value" id="s-br">—</div>
-    <div class="stat-sub">mín. 52% para live</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Avg EV</div>
-    <div class="stat-value blue" id="s-ev">—</div>
-    <div class="stat-sub">apertura</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">PnL (u)</div>
-    <div class="stat-value" id="s-pnl">—</div>
-    <div class="stat-sub">unidades de bankroll</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Burn-in</div>
-    <div class="stat-value" id="s-burn">—</div>
-    <div class="stat-sub" id="s-burn-sub">picks resueltos</div>
-  </div>
-</div>
-
-<div class="toolbar">
-  <div class="seg" id="filter-seg">
-    <button class="seg-btn active" data-filter="all">Todos</button>
-    <button class="seg-btn" data-filter="WIN">Win</button>
-    <button class="seg-btn" data-filter="LOSS">Loss</button>
-    <button class="seg-btn" data-filter="PENDING">Pending</button>
-  </div>
-  <div class="seg" id="mkt-seg">
-    <button class="seg-btn active" data-mkt="all">Mercados</button>
-    <button class="seg-btn" data-mkt="UNDER">Under</button>
-    <button class="seg-btn" data-mkt="OVER">Over</button>
-    <button class="seg-btn" data-mkt="DC">DC</button>
-    <button class="seg-btn" data-mkt="1X2">1X2</button>
-    <button class="seg-btn" data-mkt="BTTS">BTTS Sí</button>
-    <button class="seg-btn" data-mkt="BTTS_NO">BTTS No</button>
-    <button class="seg-btn" data-mkt="DNB">DNB</button>
-  </div>
-  <div class="spacer"></div>
-  <input id="search" type="text" placeholder="buscar equipo, liga...">
-  <button id="resolve-btn" onclick="resolveData()">resolver picks</button>
-</div>
-
-<div class="table-wrap">
-<table id="picks-table">
-  <thead>
-    <tr>
-      <th data-col="date">Fecha</th>
-      <th data-col="div">Liga</th>
-      <th data-col="match">Partido</th>
-      <th data-col="market">Mkt</th>
-      <th data-col="odd">Cuota</th>
-      <th data-col="ev">EV</th>
-      <th data-col="prob">Prob</th>
-      <th data-col="stake">Stake</th>
-      <th data-col="xg">xG</th>
-      <th data-col="status">Resultado</th>
-      <th data-col="profit">Profit</th>
-    </tr>
-  </thead>
-  <tbody id="picks-body">
-    <tr><td colspan="11" class="empty">cargando...</td></tr>
-  </tbody>
-</table>
-</div>
-
-<div style="border-top:1px solid var(--border);padding:2rem;background:var(--s1)">
-  <p style="font-family:var(--mono);font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:1rem">Analizador de partido</p>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:1.5rem">
-    <div>
-      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">equipo local</p>
-      <input id="an-home" type="text" placeholder="ej. Napoli" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
-    </div>
-    <div>
-      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">equipo visitante</p>
-      <input id="an-away" type="text" placeholder="ej. Milan" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
-    </div>
-    <div>
-      <p style="font-size:.65rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)">liga (opcional)</p>
-      <input id="an-div" type="text" placeholder="ej. I1" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:80px">
-    </div>
-    <button onclick="analyzeMatch()" style="font-family:var(--mono);font-size:.65rem;padding:9px 18px;background:var(--accent);border:none;color:#fff;border-radius:7px;cursor:pointer;letter-spacing:.04em">analizar</button>
-    <span id="an-loading" style="font-family:var(--mono);font-size:.65rem;color:var(--muted);display:none">calculando...</span>
-  </div>
-  <div id="an-result" style="display:none">
-    <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:1rem;align-items:center;margin-bottom:1.5rem">
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:1.25rem;text-align:center">
-        <p id="an-home-name" style="font-size:1rem;font-weight:600;margin-bottom:.5rem"></p>
-        <p style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-bottom:.75rem">xG ofensivo</p>
-        <p id="an-home-xgf" style="font-size:1.8rem;font-weight:600;color:var(--accent)"></p>
-        <div style="margin-top:.75rem;display:flex;justify-content:center;gap:4px" id="an-home-form"></div>
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.5rem">últimos 5</p>
-      </div>
-      <div style="text-align:center">
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.5rem">xG partido</p>
-        <p id="an-xgt" style="font-size:1.4rem;font-weight:600;color:var(--text)"></p>
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.25rem" id="an-league"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:1.25rem;text-align:center">
-        <p id="an-away-name" style="font-size:1rem;font-weight:600;margin-bottom:.5rem"></p>
-        <p style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-bottom:.75rem">xG ofensivo</p>
-        <p id="an-away-xgf" style="font-size:1.8rem;font-weight:600;color:var(--accent)"></p>
-        <div style="margin-top:.75rem;display:flex;justify-content:center;gap:4px" id="an-away-form"></div>
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-top:.5rem">últimos 5</p>
-      </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:1rem">
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">gana local</p>
-        <p id="an-ph" style="font-size:1.4rem;font-weight:600;color:var(--green)"></p>
-        <p id="an-fh" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">empate</p>
-        <p id="an-pd" style="font-size:1.4rem;font-weight:600;color:var(--amber)"></p>
-        <p id="an-fd" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:1rem;text-align:center">
-        <p style="font-size:.6rem;color:var(--muted);font-family:var(--mono);margin-bottom:.4rem">gana visitante</p>
-        <p id="an-pa" style="font-size:1.4rem;font-weight:600;color:var(--red)"></p>
-        <p id="an-fa" style="font-size:.65rem;color:var(--muted);font-family:var(--mono);margin-top:.2rem"></p>
-      </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:1rem">
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
-        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">over 2.5</p>
-        <p id="an-po" style="font-size:1.1rem;font-weight:600;color:#38bdf8"></p>
-        <p id="an-fo" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
-        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">under 2.5</p>
-        <p id="an-pu" style="font-size:1.1rem;font-weight:600;color:#a78bfa"></p>
-        <p id="an-fu" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
-        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">btts sí</p>
-        <p id="an-py" style="font-size:1.1rem;font-weight:600;color:#4ade80"></p>
-        <p id="an-fy" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center">
-        <p style="font-size:.58rem;color:var(--muted);font-family:var(--mono);margin-bottom:.3rem">btts no</p>
-        <p id="an-pn" style="font-size:1.1rem;font-weight:600;color:#f87171"></p>
-        <p id="an-fn" style="font-size:.6rem;color:var(--muted);font-family:var(--mono)"></p>
-      </div>
-    </div>
-
-    <div id="an-h2h-wrap" style="display:none">
-      <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem">H2H últimos 5</p>
-      <div id="an-h2h" style="display:flex;flex-direction:column;gap:4px"></div>
-    </div>
-  </div>
-</div>
-
-<script>
-let allPicks = [], sortCol = 'date', sortDir = -1;
-let activeFlt = 'all', activeMkt = 'all';
-
-const mktBadge = m => {
-  const map = {UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2',BTTS:'b-under',BTTS_NO:'b-over',DNB:'b-dc'};
-  return `<span class="badge ${map[m]||'b-1x2'}">${m}</span>`;
-};
-const statusBadge = s => {
-  const map = {WIN:'b-win',LOSS:'b-loss',PENDING:'b-pend'};
-  const icon = {WIN:'▲',LOSS:'▼',PENDING:'◎'};
-  return `<span class="badge ${map[s]||''}">${icon[s]||''}${s}</span>`;
-};
-const evClass = v => v >= 0.10 ? 'ev-high' : v >= 0.05 ? 'ev-mid' : 'ev-low';
-const fmtDate = d => { if (!d) return '—'; const p = d.split('T')[0].split('-'); return `${p[2]}/${p[1]}/${p[0].slice(2)}`; };
-const xgBar = (h, a) => {
-  const total = (h||0) + (a||0);
-  if (!total) return '—';
-  const hw = Math.round((h/total)*60);
-  return `<div class="xg-bar"><span style="font-size:.6rem;color:var(--muted)">${(h||0).toFixed(1)}</span><div class="xg-seg" style="width:${hw}px;background:var(--accent)"></div><div class="xg-seg" style="width:${60-hw}px;background:var(--red)"></div><span style="font-size:.6rem;color:var(--muted)">${(a||0).toFixed(1)}</span></div>`;
-};
-
-function updateStats(s) {
-  const resolved = s.wins + s.losses;
-  const br = resolved ? s.wins/resolved : 0;
-  document.getElementById('s-total').textContent = s.total;
-  document.getElementById('s-sub-total').textContent = `${resolved} resueltos`;
-  document.getElementById('s-win').textContent = s.wins;
-  document.getElementById('s-sub-win').textContent = resolved ? `${(s.wins/resolved*100).toFixed(1)}%` : '';
-  document.getElementById('s-loss').textContent = s.losses;
-  document.getElementById('s-sub-loss').textContent = resolved ? `${(s.losses/resolved*100).toFixed(1)}%` : '';
-  document.getElementById('s-pend').textContent = s.pending;
-  const brEl = document.getElementById('s-br');
-  brEl.textContent = resolved ? (br*100).toFixed(1)+'%' : '—';
-  brEl.className = 'stat-value ' + (br >= 0.55 ? 'green' : br >= 0.50 ? 'amber' : 'red');
-  document.getElementById('s-ev').textContent = '+' + s.avg_ev.toFixed(1) + '%';
-  const pnlEl = document.getElementById('s-pnl');
-  pnlEl.textContent = (s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(4);
-  pnlEl.className = 'stat-value ' + (s.pnl > 0 ? 'green' : s.pnl < 0 ? 'red' : 'white');
-  const burnEl = document.getElementById('s-burn');
-  burnEl.textContent = s.resolved + '/30';
-  burnEl.className = 'stat-value ' + (s.resolved >= 30 ? 'green' : 'blue');
-  document.getElementById('s-burn-sub').textContent = s.resolved >= 30 ? '¡listo para live!' : `faltan ${30-s.resolved}`;
-  document.getElementById('last-update').textContent = new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-}
-
-function render() {
-  const search = document.getElementById('search').value.toLowerCase();
-  let data = allPicks.filter(p => {
-    if (activeFlt !== 'all' && p.status !== activeFlt) return false;
-    if (activeMkt !== 'all' && p.market !== activeMkt) return false;
-    if (search) {
-      const hay = ((p.home||'') + ' ' + (p.away||'') + ' ' + (p.div||'') + ' ' + (p.market||'')).toLowerCase();
-      if (!hay.includes(search)) return false;
-    }
-    return true;
-  });
-  data.sort((a,b) => {
-    let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
-    if (typeof av === 'string') av = av.toLowerCase();
-    if (typeof bv === 'string') bv = bv.toLowerCase();
-    return av < bv ? sortDir : av > bv ? -sortDir : 0;
-  });
-  if (!data.length) {
-    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">sin picks con ese filtro</td></tr>`;
-    return;
-  }
-  const rows = data.map(p => {
-    const ev = parseFloat(p.ev||0);
-    const prob = parseFloat(p.prob||0)*100;
-    const stake = parseFloat(p.stake||0)*100;
-    const profit = parseFloat(p.profit||0);
-    const profitStr = p.status === 'PENDING'
-      ? `<span class="neu">—</span>`
-      : `<span class="${profit >= 0 ? 'pos' : 'neg'}">${profit >= 0 ? '+' : ''}${profit.toFixed(4)}</span>`;
-    return `<tr>
-      <td class="muted-td">${fmtDate(p.date)}</td>
-      <td class="muted-td">${p.div||'—'}</td>
-      <td class="party">${p.home||''} <span style="color:var(--muted);font-weight:300">vs</span> ${p.away||''}</td>
-      <td>${mktBadge(p.market)}</td>
-      <td>@${parseFloat(p.odd||0).toFixed(2)}</td>
-      <td class="${evClass(ev)}">+${(ev*100).toFixed(1)}%</td>
-      <td class="muted-td">${prob.toFixed(1)}%</td>
-      <td class="muted-td">${stake.toFixed(2)}%</td>
-      <td>${xgBar(p.xg_h, p.xg_a)}</td>
-      <td>${statusBadge(p.status)}</td>
-      <td>${profitStr}</td>
-    </tr>`;
-  }).join('');
-  document.getElementById('picks-body').innerHTML = rows;
-}
-
-async function loadData() {
-  try {
-    const r = await fetch('/api/picks');
-    const data = await r.json();
-    allPicks = data.picks || [];
-    updateStats(data.stats);
-    render();
-  } catch(e) {
-    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">error cargando datos</td></tr>`;
-  }
-}
-
-async function resolveData() {
-  const btn = document.getElementById('resolve-btn');
-  btn.textContent = 'resolviendo...'; btn.disabled = true;
-  try {
-    const r = await fetch('/api/resolve');
-    const d = await r.json();
-    btn.textContent = d.error ? 'error' : `✓ ${d.resolved||0} resueltos (${d.wins||0}W/${d.losses||0}L)`;
-    await loadData();
-  } catch(e) { btn.textContent = 'error'; }
-  setTimeout(() => { btn.textContent = 'resolver picks'; btn.disabled = false; }, 5000);
-}
-
-document.querySelectorAll('#filter-seg .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#filter-seg .seg-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active'); activeFlt = btn.dataset.filter; render();
-  });
-});
-document.querySelectorAll('#mkt-seg .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#mkt-seg .seg-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active'); activeMkt = btn.dataset.mkt; render();
-  });
-});
-document.querySelectorAll('thead th[data-col]').forEach(th => {
-  th.addEventListener('click', () => {
-    const col = th.dataset.col;
-    if (sortCol === col) { sortDir *= -1; th.classList.toggle('asc'); }
-    else { sortCol = col; sortDir = -1; document.querySelectorAll('thead th').forEach(t => { t.classList.remove('sorted','asc'); }); }
-    th.classList.add('sorted'); render();
-  });
-});
-document.getElementById('search').addEventListener('input', render);
-
-async function analyzeMatch() {
-  const home = document.getElementById('an-home').value.trim();
-  const away = document.getElementById('an-away').value.trim();
-  const div  = document.getElementById('an-div').value.trim();
-  if (!home || !away) return;
-  const loading = document.getElementById('an-loading');
-  const result  = document.getElementById('an-result');
-  loading.style.display = 'inline';
-  result.style.display = 'none';
-  try {
-    const url = `/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`;
-    const r = await fetch(url);
-    const d = await r.json();
-    if (d.error) { alert(d.error); loading.style.display='none'; return; }
-
-    document.getElementById('an-home-name').textContent = d.home;
-    document.getElementById('an-away-name').textContent = d.away;
-    document.getElementById('an-league').textContent = d.league || d.div;
-    document.getElementById('an-xgt').textContent = `${d.xg_home} — ${d.xg_away}`;
-
-    document.getElementById('an-home-xgf').textContent = d.home_stats.xgf;
-    document.getElementById('an-away-xgf').textContent = d.away_stats.xgf;
-
-    const formEl = (id, results) => {
-      const el = document.getElementById(id);
-      el.innerHTML = (results||[]).map(r => {
-        const c = r==='W'?'#22c55e':r==='D'?'#f59e0b':'#ef4444';
-        return `<span style="width:18px;height:18px;border-radius:3px;background:${c};display:inline-flex;align-items:center;justify-content:center;font-size:.55rem;font-weight:600;color:#fff">${r}</span>`;
-      }).join('');
-    };
-    formEl('an-home-form', d.home_stats.results);
-    formEl('an-away-form', d.away_stats.results);
-
-    const pct = v => `${(v*100).toFixed(1)}%`;
-    const fairOdd = v => v ? `@${v.toFixed(2)} fair` : '';
-
-    document.getElementById('an-ph').textContent = pct(d.probs.home);
-    document.getElementById('an-pd').textContent = pct(d.probs.draw);
-    document.getElementById('an-pa').textContent = pct(d.probs.away);
-    document.getElementById('an-fh').textContent = fairOdd(d.fair_odds.home);
-    document.getElementById('an-fd').textContent = fairOdd(d.fair_odds.draw);
-    document.getElementById('an-fa').textContent = fairOdd(d.fair_odds.away);
-
-    document.getElementById('an-po').textContent = pct(d.ou.over);
-    document.getElementById('an-pu').textContent = pct(d.ou.under);
-    document.getElementById('an-py').textContent = pct(d.btts.yes);
-    document.getElementById('an-pn').textContent = pct(d.btts.no);
-    document.getElementById('an-fo').textContent = fairOdd(d.fair_odds.over);
-    document.getElementById('an-fu').textContent = fairOdd(d.fair_odds.under);
-    document.getElementById('an-fy').textContent = fairOdd(d.fair_odds.btts_y);
-    document.getElementById('an-fn').textContent = '';
-
-    if (d.h2h && d.h2h.length) {
-      document.getElementById('an-h2h-wrap').style.display = 'block';
-      document.getElementById('an-h2h').innerHTML = d.h2h.map(m =>
-        `<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:.68rem;padding:5px 8px;background:var(--bg);border-radius:5px;color:var(--text)">
-          <span style="color:var(--muted)">${m.date}</span>
-          <span>${m.home} <b>${m.fthg}-${m.ftag}</b> ${m.away}</span>
-        </div>`
-      ).join('');
-    } else {
-      document.getElementById('an-h2h-wrap').style.display = 'none';
-    }
-
-    result.style.display = 'block';
-  } catch(e) { alert('Error: ' + e.message); }
-  finally { loading.style.display = 'none'; }
-}
-
-document.getElementById('an-home').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
-document.getElementById('an-away').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
-
-loadData();
-setInterval(loadData, 60000);
-</script>
-</body>
-</html>
 """
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
+Fleet DQP Audit App
+GroundProbe · Multi-user · SharePoint / Local / Railway
 
-class DashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # silenciar logs HTTP
+Storage modes (set via env var DQP_STORAGE):
+  local      — reads/writes Excel from DQP_EXCEL_PATH (default)
+  sharepoint — reads/writes via Microsoft Graph API
 
-    def do_GET(self):
-        if self.path == "/" or self.path == "/dashboard":
-            self._serve_html()
-        elif self.path == "/api/picks":
-            self._serve_api()
-        elif self.path == "/api/sync":
-            self._serve_sync()
-        elif self.path == "/api/resolve":
-            self._serve_resolve()
-        elif self.path.startswith("/api/analyze"):
-            self._serve_analyze()
-        else:
-            self.send_response(404); self.end_headers()
+SharePoint env vars (only needed for sharepoint mode):
+  SP_TENANT_ID, SP_CLIENT_ID, SP_CLIENT_SECRET, SP_SITE_ID, SP_FILE_PATH
+"""
 
-    def _serve_sync(self):
-        """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
-        try:
-            import csv as csvmod
-            synced = 0
-            if os.path.exists(AUDIT_CSV):
-                with open(AUDIT_CSV, "r", encoding="utf-8") as f:
-                    reader = csvmod.reader(f)
-                    header = next(reader)
-                    rows = list(reader)
-                conn_s = sqlite3.connect(DB_PATH)
-                # Cargar todos los picks PENDING de la DB indexados por equipo+mercado
-                pending = conn_s.execute(
-                    "SELECT id, home_team, away_team, market FROM picks_log WHERE result='PENDING'"
-                ).fetchall()
-                # Construir índice: (home_lower, away_lower, market) → id
-                idx = {}
-                for pid, ht, at, mk in pending:
-                    key = (ht.lower()[:6], at.lower()[:6], mk)
-                    idx[key] = pid
-                for row in rows:
-                    if len(row) < 12: continue
-                    status = row[9]
-                    if status not in ("WIN", "LOSS"): continue
-                    home, away, mkt = row[2], row[3], row[5]
-                    try: profit = float(row[11] or 0)
-                    except: profit = 0.0
-                    key = (home.lower()[:6], away.lower()[:6], mkt)
-                    if key in idx:
-                        conn_s.execute(
-                            "UPDATE picks_log SET result=?, profit=? WHERE id=?",
-                            (status, profit, idx[key])
-                        )
-                        synced += 1
-                conn_s.commit(); conn_s.close()
-            payload = json.dumps({"ok": True, "synced": synced}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
+import streamlit as st
+import pandas as pd
+import openpyxl
+from openpyxl import load_workbook
+from datetime import datetime, date
+import os, re, io, time
 
-    def _serve_html(self):
-        content = DASHBOARD_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(content))
-        self.end_headers()
-        self.wfile.write(content)
+# PDF generation
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    REPORTLAB_OK = True
+except ImportError:
+    REPORTLAB_OK = False
 
-    def _serve_api(self):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("""
-                SELECT pick_time, div, home_team, away_team,
-                       market, selection, odd_open, prob_model, ev_open,
-                       result, stake_pct, profit, xg_home, xg_away
-                FROM picks_log ORDER BY id DESC LIMIT 500
-            """)
-            rows = c.fetchall()
-            conn.close()
+try:
+    from msal import ConfidentialClientApplication
+    import requests as _requests
+    MSAL_AVAILABLE = True
+except ImportError:
+    MSAL_AVAILABLE = False
 
-            picks = []
-            wins = losses = pending = 0
-            total_ev = total_pnl = 0.0
-            resolved = 0
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+STORAGE_MODE = os.environ.get("DQP_STORAGE", "local")
+EXCEL_PATH   = os.environ.get("DQP_EXCEL_PATH", "Fleet_DQP_Master.xlsx")
 
-            for r in rows:
-                status = r[9] or "PENDING"
-                if status == "WIN": wins += 1; resolved += 1
-                elif status == "LOSS": losses += 1; resolved += 1
-                else: pending += 1
-                ev = float(r[8] or 0)
-                total_ev += ev
-                total_pnl += float(r[11] or 0)
-                picks.append({
-                    "date": r[0], "div": r[1], "home": r[2], "away": r[3],
-                    "market": r[4], "pick": r[5],
-                    "odd": r[6], "prob": r[7], "ev": r[8],
-                    "status": status, "stake": r[10], "profit": r[11],
-                    "xg_h": r[12], "xg_a": r[13]
-                })
+# ─────────────────────────────────────────────────────────────────────────────
+# BUSINESS UNIT MAPPING  (Site → BU)
+# Add new sites here as the fleet expands globally
+# ─────────────────────────────────────────────────────────────────────────────
+SITE_BU = {
+    # ── GPNA — North America (USA, Canada, Mexico) ────────────────────────────
+    "Arcelormittal":        "GPNA",
+    "Asarco Mission":       "GPNA",
+    "Asarco Ray":           "GPNA",
+    "Bingham":              "GPNA",
+    "Bloom Lake":           "GPNA",
+    "Buena Vista del Cobre":"GPNA",
+    "Canadian Malartic":    "GPNA",
+    "Chino":                "GPNA",
+    "Copper Mountain":      "GPNA",
+    "Copper mountain":      "GPNA",
+    "Diavik":               "GPNA",
+    "Ekati":                "GPNA",
+    "Elkview":              "GPNA",
+    "Gahcho Kue":           "GPNA",
+    "Gibraltar":            "GPNA",
+    "Grande Cache":         "GPNA",
+    "HVC":                  "GPNA",
+    "La Caridad":           "GPNA",
+    "Libby Dam":            "GPNA",
+    "Magino":               "GPNA",
+    "Meadowbank":           "GPNA",
+    "Meliadine":            "GPNA",
+    "Morenci":              "GPNA",
+    "Mount Milligan":       "GPNA",
+    "Mulatos":              "GPNA",
+    "Murray Pit":           "GPNA",
+    "Origin Mine":          "GPNA",
+    "Peñasquito":           "GPNA",
+    "Pinos Altos":          "GPNA",
+    "Pinto Valley":         "GPNA",
+    "Porcupine":            "GPNA",
+    "Questa":               "GPNA",
+    "Red Chris":            "GPNA",
+    "Sierrita":             "GPNA",
+    "Thiess":               "GPNA",
+    "Thompson Creek":       "GPNA",
+    "Torex":                "GPNA",
+    "Tyrone":               "GPNA",
+    "Victoria Eagle Gold":  "GPNA",
+    # ── GPCL — Chile ─────────────────────────────────────────────────────────
+    "Alumbrera":            "GPCL",
+    "Andina":               "GPCL",
+    "Antucoya":             "GPCL",
+    "CMP":                  "GPCL",
+    "Candelaria":           "GPCL",
+    "Caserones":            "GPCL",
+    "Chuquicamata":         "GPCL",
+    "Collahuasi":           "GPCL",
+    "DMH":                  "GPCL",
+    "El Salvador":          "GPCL",
+    "El Soldado":           "GPCL",
+    "Gaby":                 "GPCL",
+    "Lomas Bayas":          "GPCL",
+    "Mantos Blancos":       "GPCL",
+    "Mantoverde":           "GPCL",
+    "Minera San Cristobal": "GPCL",
+    "Quebrada Blanca":      "GPCL",
+    "Radomiro Tomic":       "GPCL",
+    "Salares Norte":        "GPCL",
+    "Sierra Gorda":         "GPCL",
+    "Zaldivar":             "GPCL",
+    # ── GPPE — Peru ──────────────────────────────────────────────────────────
+    "Alpamarca":            "GPPE",
+    "Antamina":             "GPPE",
+    "Antapaccay":           "GPPE",
+    "Atacocha":             "GPPE",
+    "Cerro Corona":         "GPPE",
+    "Cerro Verde":          "GPPE",
+    "Cerro verde":          "GPPE",
+    "Chinalco Toromocho":   "GPPE",
+    "Coimolache":           "GPPE",
+    "El Brocal":            "GPPE",
+    "Iscaycruz":            "GPPE",
+    "La Arena":             "GPPE",
+    "Marcobre":             "GPPE",
+    "Quellaveco":           "GPPE",
+    "Shahuindo":            "GPPE",
+    "Summa Gold":           "GPPE",
+    "Volcan":               "GPPE",
+    "Yanacocha":            "GPPE",
+    # ── GPCO — Colombia ──────────────────────────────────────────────────────
+    "EPM":                  "GPCO",
+    # ── GPCN — China ─────────────────────────────────────────────────────────
+    "Hami":                 "GPCN",
+    "Hualian":              "GPCN",
+    "Jiama":                "GPCN",
+    "LCRGE":                "GPCN",
+    "Luishia":              "GPCN",
+    "Pacific Mining":       "GPCN",
+    "Zhungeer":             "GPCN",
+    "Zijin Mine":           "GPCN",
+    # ── GPID — Indonesia / India ──────────────────────────────────────────────
+    "Adani GP3":            "GPID",
+    "Adani PEKB":           "GPID",
+    "Dipka":                "GPID",
+    "Gevra":                "GPID",
+    "Kusmunda":             "GPID",
+    "Ostapal":              "GPID",
+    "Rampura Agucha":       "GPID",
+    "Sesa Goa":             "GPID",
+    "Sujyoti MCL":          "GPID",
+    # ── GPPT — Southeast Asia / Pacific ──────────────────────────────────────
+    "AGM":                  "GPPT",
+    "AMM MIFA":             "GPPT",
+    "AMM SBS":              "GPPT",
+    "Adaro":                "GPPT",
+    "Agincourt":            "GPPT",
+    "Arutmin Kintap":       "GPPT",
+    "BAU":                  "GPPT",
+    "BIB":                  "GPPT",
+    "BSS Tabang":           "GPPT",
+    "BSSR":                 "GPPT",
+    "Balangan Coal":        "GPPT",
+    "Bayan Tabang":         "GPPT",
+    "Berau Coal":           "GPPT",
+    "Bukit Asam":           "GPPT",
+    "CK BIB":               "GPPT",
+    "CK BMB":               "GPPT",
+    "CK MHU":               "GPPT",
+    "Carmen Copper":        "GPPT",
+    "EGAT":                 "GPPT",
+    "IMK":                  "GPPT",
+    "JRBM":                 "GPPT",
+    "KIM BBU":              "GPPT",
+    "KPC":                  "GPPT",
+    "KPP Indexim":          "GPPT",
+    "Kideco":               "GPPT",
+    "MAS":                  "GPPT",
+    "Mitrabara Adiperdana": "GPPT",
+    "Oyu Tolgoi":           "GPPT",
+    "PAMA BTSJ":            "GPPT",
+    "PAMA Baya":            "GPPT",
+    "PAMA KPCS":            "GPPT",
+    "PAMA KPCT":            "GPPT",
+    "PAMA Kideco":          "GPPT",
+    "PAMA MTBU":            "GPPT",
+    "PPA BIB":              "GPPT",
+    "PPA Bukit Asam":       "GPPT",
+    "PTFI":                 "GPPT",
+    "Perkasa Inakakerta":   "GPPT",
+    "Petrosea":             "GPPT",
+    "SBS":                  "GPPT",
+    "Semirara":             "GPPT",
+    "Usukh Zoos":           "GPPT",
+    "Wahana Baratama Mining":"GPPT",
+    # ── GPSA — South Africa / Africa & Middle East ────────────────────────────
+    "Agbaou Gold Mine":                  "GPSA",
+    "Amandabelt Mine":                   "GPSA",
+    "Armenia ZCMC Mine":                 "GPSA",
+    "Asanko Gold Mine":                  "GPSA",
+    "Bibiani Gold Mine (Mensin)":        "GPSA",
+    "Chirano Gold Mine":                 "GPSA",
+    "Damang Gold Mine":                  "GPSA",
+    "Damtshaa Mine":                     "GPSA",
+    "Gamsberg Mine":                     "GPSA",
+    "Geita Gold Mine":                   "GPSA",
+    "Ghana Manganese Mine":              "GPSA",
+    "Hounde Gold Mine":                  "GPSA",
+    "ITY Gold Mine":                     "GPSA",
+    "Iduapriem Mine":                    "GPSA",
+    "Ivrindi":                           "GPSA",
+    "Jwaneng Mne":                       "GPSA",
+    "Kamoto Copper - KOV Mine":          "GPSA",
+    "Kao Mine":                          "GPSA",
+    "Karowe Lucara Mine":                "GPSA",
+    "Kimberly":                          "GPSA",
+    "Kolomela Mine":                     "GPSA",
+    "Kudumane Manganese Resources mine": "GPSA",
+    "Lafigue":                           "GPSA",
+    "Lapseki":                           "GPSA",
+    "Letlhakane Mine":                   "GPSA",
+    "Mana Gold Mine":                    "GPSA",
+    "Moatize":                           "GPSA",
+    "Mogalakwena Mine":                  "GPSA",
+    "Mokala Mine":                       "GPSA",
+    "Muruntau Mine Uzberkistan":         "GPSA",
+    "Mutanda Mine":                      "GPSA",
+    "Nchanga Mine":                      "GPSA",
+    "Nkomati Joint Venture":             "GPSA",
+    "Orapa Mine":                        "GPSA",
+    "Rossing Mine":                      "GPSA",
+    "Sabodala Massawa Mine":             "GPSA",
+    "Sandfire Motheo":                   "GPSA",
+    "Siguiri Gold Mine":                 "GPSA",
+    "Sishen Mine":                       "GPSA",
+    "Stevin Rock":                       "GPSA",
+    "Tarkwa Gold Mine":                  "GPSA",
+    "Tenke Mine":                        "GPSA",
+    "Terrafame Aki":                     "GPSA",
+    "Thabazimbi Mine":                   "GPSA",
+    "Tshipi Borwa":                      "GPSA",
+    "UMK":                               "GPSA",
+    "YK Mine Turkey":                    "GPSA",
+    # ── GPNA additions (previously Other) ────────────────────────────────────
+    "Piedras Verdes":        "GPNA",
+    "Buena Vista Del Cobre": "GPNA",
+    "Hvc":                   "GPNA",
 
-            n = len(picks)
-            avg_ev = (total_ev / n * 100) if n else 0
-            payload = json.dumps({
-                "picks": picks,
-                "stats": {
-                    "total": n, "wins": wins, "losses": losses,
-                    "pending": pending, "avg_ev": avg_ev,
-                    "pnl": total_pnl, "resolved": resolved
-                }
-            }).encode("utf-8")
+}
+SP_TENANT_ID = os.environ.get("SP_TENANT_ID", "")
+SP_CLIENT_ID = os.environ.get("SP_CLIENT_ID", "")
+SP_CLIENT_SEC= os.environ.get("SP_CLIENT_SECRET", "")
+SP_SITE_ID   = os.environ.get("SP_SITE_ID", "")
+SP_FILE_PATH = os.environ.get("SP_FILE_PATH", "/DQP/Fleet_DQP_Master.xlsx")
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(payload))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
+# ── Auto-bootstrap: if volume path doesn't exist, seed from repo ─────────────
+# This runs once on first deploy. After that the volume persists across redeploys.
+if STORAGE_MODE == "local" and not os.path.exists(EXCEL_PATH):
+    import glob, shutil
+    # Look for any Excel seed file in the app directory
+    seeds = (
+        glob.glob("Fleet_DQP_Master*.xlsx") +
+        glob.glob("Fleet_DQP_Master*.xlsm") +
+        glob.glob("/app/Fleet_DQP_Master*.xlsx")
+    )
+    if seeds:
+        os.makedirs(os.path.dirname(EXCEL_PATH) or ".", exist_ok=True)
+        shutil.copy(seeds[0], EXCEL_PATH)
+    else:
+        # No seed found — will show a clear error
+        pass
 
-    def _serve_resolve(self):
-        """Resuelve picks PENDING contra los CSVs de co.uk directamente."""
-        try:
-            import pandas as pd
-            resolved = wins = losses = 0
-            conn_r = sqlite3.connect(DB_PATH)
-            pending = conn_r.execute("""
-                SELECT id, div, home_team, away_team, market, selection,
-                       odd_open, stake_pct
-                FROM picks_log WHERE result='PENDING'
-            """).fetchall()
+# ─────────────────────────────────────────────────────────────────────────────
+# DQP MASTER DICTIONARY
+# ─────────────────────────────────────────────────────────────────────────────
+DQP_MASTER = {
+    "System Health | Data Availability": {"common": [
+        "🟢 Live SSR data available at PMP / Checked daily",
+        "⚠️ Intermittent data available",
+        "🔴 No live SSR data available",
+    ]},
+    "System Health | SSR Type & Scan Mode": {
+        "3D": ["🟢 Range<1400m & Short Range","🟢 Range<2800m & Long Range (RPN)","⚠️ Range>2800m but Short","🔴 Wrong Config"],
+        "2D": ["🟢 FX < 3.5 Km & Correct","⚠️ FX > 3.5 Km","🟢 OMNI < 5.6 Km & Correct","⚠️ OMNI > 5.6 Km","🔴 Wrong Config"],
+    },
+    "System Health | Signal Strength": {
+        "3D": ["🟢 Amplitude consistent across wall / No low periods","⚠️ Gradual reduction / Eventual dips","🔴 Similar strength Sky vs Rock / Blue Amplitude"],
+        "2D": ["🟢 Amplitude consistent across wall / No low periods","⚠️ Gradual reduction / Eventual dips","🔴 Similar strength Sky vs Rock / Blue Amplitude"],
+    },
+    "System Health | Return Signal": {
+        "3D": ["🟢 The ΔCoherence image for the rock face is generally clear (white)","⚠️ The ΔCoherence image shows large areas of dark colours","🔴 The ΔCoherence image cannot be improved by filtering"],
+        "2D": ["🟢 Coherence clear / No dark areas","⚠️ Dark areas (filtered out)","🔴 The Coherence image cannot be improved by filtering using the time slider"],
+    },
+    "System Health | Wall %": {
+        "3D": ["⚪ N/A (Applies to 2D)"],
+        "2D": ["🟢 No alarms / Minimal floating pixels","⚠️ Disturbing amount of floating pixels","🔴 Wall % > 30% / False alarms triggering"],
+    },
+    "Scan Area | Selection / Width": {
+        "3D": ["🟢 < 1/8th scan unnecessary","⚠️ ~ 1/4 scan unnecessary","🔴 > 1/4 scan unnecessary","🔴 Area of interest missing from scan"],
+        "2D": ["🟢 Areas minimised (Optimal)","⚠️ Only 60deg or 120deg used (not HD mode)","🔴 Full Scan 60/120deg Used (Unnecessary)","🔴 Area of interest missing from scan"],
+    },
+    "Scan Area | Elevation": {
+        "3D": ["⚪ N/A (Applies to 2D)"],
+        "2D": ["🟢 60deg view used well / STC avoided","⚠️ Too much pit bottom or sky","🔴 Pointing wrong / Missing area"],
+    },
+    "Scan Area | Levelling": {
+        "3D": ["⚪ N/A (Applies to 2D)"],
+        "2D": ["🟢 Properly levelled","🔴 Not properly levelled"],
+    },
+    "Scan Area | Coverage / Angle": {
+        "3D": ["🟢 Good incidence (>75% mag)","⚠️ Poor incidence (50% mag)","🔴 Bad incidence (30% mag)"],
+        "2D": ["🟢 Plan view matches front view","⚠️ Geo shows missing areas (limits of 60deg)","🔴 Geo shows large misalignment"],
+    },
+    "Photographs | Camera Alignment": {"common": [
+        "🟢 Aligned (<= 2px error)","⚠️ Misaligned (3-4px error) / Shifting photos","🔴 Misaligned (>4px / Shift)",
+    ]},
+    "Photographs | Photo Quality": {"common": [
+        "🟢 Clear and usable","⚠️ Hard to interpret / Dirty Lens / Foggy","🔴 Unusable",
+    ]},
+    "Photographs | Geopositioning": {
+        "3D": ["⚪ N/A (Applies to 2D)"],
+        "2D": ["🟢 Accurate / Layers match","⚠️ Inaccurate / Old image","🔴 Not made"],
+    },
+    "Data Visualization | DTM & Geopositioning": {
+        "3D": ["⚪ N/A (Applies to 2D)"],
+        "2D": ["🟢 DTM and Geopositioning applied correctly","⚠️ Only DTM or Geopositioning applied","🔴 DTM and Geopositioning not applied"],
+    },
+    "Masks | Sky & Short Range": {
+        "3D": ["🟢 Only sky/short range (<30m) masked out","⚠️ Sky/short range NOT automatically masked","🔴 Mask amplitude too high / Masking Area of Interest"],
+        "2D": ["🟢 Only sky/short range targets masked out","⚠️ Range wrapped targets triggering false alarms","🔴 Sky mask amplitude too low / Excess pixels","🔴 Mask amplitude too high / Masking Area of Interest"],
+    },
+    "Masks | Manual Mask": {"common": [
+        "🟢 Manual masks used correctly","⚠️ Loose masking of equipment/veg","🔴 Missing manual masks","🔴 Area of interest masked out",
+    ]},
+    "Masks | EDM": {"common": [
+        "🟢 Applied correctly OR Not Required","⚠️ Partially applied","🔴 Not applied (Risk) OR Whole area masked",
+    ]},
+    "Alarming | Watchdog": {"common": [
+        "🟢 Critical Monitoring / Active / Tested",
+        "⚠️ Watchdog active but sounding alarms",
+        "🟢 Not required (Customer Decision)",
+        "🔴 Watchdog Disabled / Setup Mode",
+    ]},
+    "Alarming | Settings": {"common": [
+        "🟢 Alarms set with thresholds/notifications","🟢 No alarms (Customer TARP Decision)","🔴 No alarms / Thresholds without notifications",
+    ]},
+    "Alarming | Tracking": {"common": [
+        "🟢 Alarm set for fast movement","🟢 Configured / Not Necessary","🔴 Not set (Ambiguity risk)",
+    ]},
+    "Alarming | Coherence Area": {
+        "3D": ["🟢 ΔCoherence (0-0.3) White/Light Blue","🔴 ΔCoherence Blue/Dark Blue"],
+        "2D": ["🟢 Alarms on areas of high coherence","🔴 Alarms on areas of consistent low coherence"],
+    },
+    "Alarming | Incidence Angle": {
+        "3D": ["🟢 Vector loss considered","🔴 Vector loss NOT considered"],
+        "2D": ["🟢 Vector loss considered in alarm thresholds","⚠️ 70% magnitude - no alarm adjustment","🔴 >30% vector loss / No alarm adjustment"],
+    },
+    "Atmospheric | Algorithm": {"common": [
+        "🟢 Enhanced Deformation algorithm is selected","⚠️ Standard Deformation algorithm is selected","🔴 Predictive Deformation algorithm is selected",
+    ]},
+    "Atmospheric | Source": {
+        "3D": [
+            "🟢 SRAs / DSRAs Selected",
+            "⚠️ Weather Station (WS) Selected / SSR < 600m from wall",
+            "🔴 WS selected / SSR > 600m from wall",
+            "🔴 No atmospheric correction applied"
+        ],
+        "2D": [
+            "🟢 Precision Atmospherics (PA) selected",
+            "⚠️ DSRAs selected",
+            "⚠️ WS selected / SSR < 600m from wall / SRA selected",
+            "🔴 WS selected / SSR > 600m from wall",
+            "🔴 No atmospheric correction applied"
+        ],
+    },
+    "Atmospheric | Created SRAs": {
+        "3D": ["🟢 2+ SRAs independent domains","⚠️ SRAs on same domain or similar range","🔴 Only 1 SRA created","🔴 None"],
+        "2D": ["🟢 2+ DSRAs/SRAs independent domains & ranges","⚠️ DSRAs/SRAs on same domain or similar range","🔴 Only 1 DSRA/SRA created","🔴 None / Poor quality"],
+    },
+    "Atmospheric | SRA Spread Graph": {"common": [
+        "🟢 Horizontal trend, no steps","⚠️ The data exhibits a stepwise pattern or a regressive line","🔴 The plot shows an increasing deformation spread",
+    ]},
+    "Atmospheric | Stable Reference Pixels": {
+        "3D": ["🟢 All SRP White (DCoherence <0.1)","⚠️ Some SRP in noisy areas (<1/3)","🔴 SRP Dark (DCoh > 0.1)"],
+        "2D": ["🟢 All SRP White (Coherence >0.98)","⚠️ Some SRP low coherence (0.90-0.98)","🔴 SRP Dark (Coh < 0.90)"],
+    },
+    "Atmospheric correction | Graph (1 Day)": {"common": [
+        "🟢 Plots follow same trend","⚠️ The plots exhibit parallel trends, despite minor offsets","🔴 Plots diverge",
+    ]},
+    "Atmospheric | Rejected SRA %": {"common": [
+        "🟢 < 10% Rejected","⚠️ 10-30% Rejected","🔴 > 30% Rejected",
+    ]},
+    "Atmospheric | WS Graph (2 Days)": {
+        "3D": ["⚪ N/A (SRAs used)","🟢 Sinusoidal & Horizontal Trend","⚠️ Sinusoidal & Trend (Temp related)","🔴 Sinusoidal & Trend (Stable Weather)"],
+        "2D": ["⚪ N/A (SRAs/PA used)","🟢 Sinusoidal & Horizontal Trend","⚠️ Sinusoidal & Trend (Temp related)","🔴 Sinusoidal & Trend (Stable Weather)"],
+    },
+    "Atmospheric | Created PA": {
+        "3D": ["⚪ N/A (Applies to 2D PA)"],
+        "2D": [
+            "⚪ N/A (PA not used)",
+            "🟢 Seed Mask at centre / Good coherence / No movement / Several pixels",
+            "🟢 Bulk Areas on independent domains / Different ranges & azimuths / Good coherence / No movement",
+            "⚠️ Bulk Areas all at similar range",
+            "🔴 Bulk Areas on moving / unstable areas"
+        ],
+    },
+    "Atmospheric | PA Refractivity Graph": {
+        "3D": ["⚪ N/A (Applies to 2D PA)"],
+        "2D": [
+            "⚪ N/A (PA not used)",
+            "🟢 WS+PA plots similar trend / WS+SRA plots upside-down reflection (WS mode)",
+            "⚠️ Step due to atmospheric event / General trend still similar (WS mode)",
+            "🔴 WS and PA plots diverging continuously (WS mode)",
+            "🟢 WS, SRA and PA plots all follow similar trend (SRA/DSRA mode)",
+            "⚠️ Step due to atmospheric event / General trend still similar (SRA/DSRA mode)",
+            "🔴 WS, SRA and PA plots diverging from each other (SRA/DSRA mode)"
+        ],
+    },
+    "Atmospheric | PA Deformation Map": {
+        "3D": ["⚪ N/A (Applies to 2D PA)"],
+        "2D": [
+            "⚪ N/A (PA not used)",
+            "🟢 Little or no contamination / All deformations make geotechnical sense",
+            "⚠️ Few regions with minor contamination / Most deformation makes sense",
+            "⚠️ Displacement on Bulk Areas or Seed Mask / Reasonable in short-term windows",
+            "🔴 Deformation impossible kinematically / Does not make geotechnical sense"
+        ],
+    },
+}
 
-            for pid, div, home, away, mkt, pick, odd, stake in pending:
-                path = os.path.join(DATA_DIR, f"{div}.csv")
-                if not os.path.exists(path):
-                    continue
-                try:
-                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
-                    except: df = pd.read_csv(path, encoding="latin-1")
-                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
-                                            "HG":"FTHG","AG":"FTAG"})
-                    played = df.dropna(subset=["FTHG","FTAG"])
-                    teams = pd.concat([played["HomeTeam"],played["AwayTeam"]]).unique()
-                    import difflib as dl
-                    rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
-                    ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
-                    if not rh or not ra:
-                        continue
-                    m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
-                    if m.empty:
-                        continue
-                    fthg = float(m.iloc[-1]["FTHG"])
-                    ftag = float(m.iloc[-1]["FTAG"])
-                    res = check_result(pick, mkt, fthg, ftag,
-                                       home_name=rh[0], away_name=ra[0])
-                    if res not in ("WIN","LOSS"):
-                        continue
-                    profit = round(float(stake or 0)*float(odd or 0) - float(stake or 0)
-                                   if res=="WIN" else -float(stake or 0), 4)
-                    conn_r.execute(
-                        "UPDATE picks_log SET result=?, profit=? WHERE id=?",
-                        (res, profit, pid)
-                    )
-                    resolved += 1
-                    if res=="WIN": wins += 1
-                    else: losses += 1
-                except Exception:
-                    continue
+# ─────────────────────────────────────────────────────────────────────────────
+# PMP HEALTH CHECKPOINTS (separate from DQP score)
+# ─────────────────────────────────────────────────────────────────────────────
+PMP_HEALTH = {
+    "PMP Health | Last Check": {"common": [
+        "🟢 < 30 days ago",
+        "⚠️ 30–90 days ago",
+        "🔴 > 90 days ago / Unknown",
+    ]},
+    "PMP Health | MonitorIQ Version": {"common": [
+        "🟢 Latest version installed",
+        "⚠️ 1 version behind",
+        "🔴 2+ versions behind / Unknown",
+    ]},
+    "PMP Health | Hardware Compliance": {
+        # XT: 16GB RAM rec / 8GB min, 500GB SSD, GPU DirectX11+4GB VRAM
+        "3D": [
+            "🟢 Meets recommended (i5-13600K+, 16GB RAM, 500GB SSD, NVIDIA 1060+)",
+            "⚠️ Meets minimum (i5-12500+, 8GB RAM, 500GB SSD, DirectX11 GPU)",
+            "🔴 Below minimum requirements",
+        ],
+        # FX: 32GB RAM rec / 16GB min, 4TB SSD
+        "FX": [
+            "🟢 Meets recommended (i7-13700K+, 32GB RAM, 4TB SSD, NVIDIA 1060+)",
+            "⚠️ Meets minimum (i5-12500+, 16GB RAM, 4TB SSD, DirectX11 GPU)",
+            "🔴 Below minimum requirements",
+        ],
+        # SOM/OMNI: 32GB RAM rec / 16GB min, 4TB SSD
+        "SOM": [
+            "🟢 Meets recommended (i7-13700K+, 32GB RAM, 4TB SSD, NVIDIA 1060+)",
+            "⚠️ Meets minimum (i5-12500+, 16GB RAM, 4TB SSD, DirectX11 GPU)",
+            "🔴 Below minimum requirements",
+        ],
+        # SAR-X: 32GB RAM rec / 16GB min, 2TB SSD
+        "SAR": [
+            "🟢 Meets recommended (i7-13700K+, 32GB RAM, 2TB SSD, NVIDIA 1060+)",
+            "⚠️ Meets minimum (i5-12500+, 16GB RAM, 2TB SSD, DirectX11 GPU)",
+            "🔴 Below minimum requirements",
+        ],
+    },
+    "PMP Health | PMP Responsiveness": {"common": [
+        "🟢 < 1 second plot delay",
+        "⚠️ 1–3 seconds delay",
+        "🔴 > 3 seconds / Unresponsive",
+    ]},
+    "PMP Health | SSD Space Available": {
+        # XT: 500GB total
+        "3D": [
+            "🟢 > 100 GB free (of 500 GB)",
+            "⚠️ 50–100 GB free",
+            "🔴 < 50 GB free / Critical",
+        ],
+        # FX: 4TB total
+        "FX": [
+            "🟢 > 800 GB free (of 4 TB)",
+            "⚠️ 400–800 GB free",
+            "🔴 < 400 GB free / Critical",
+        ],
+        # SOM: 4TB total
+        "SOM": [
+            "🟢 > 800 GB free (of 4 TB)",
+            "⚠️ 400–800 GB free",
+            "🔴 < 400 GB free / Critical",
+        ],
+        # SAR-X: 2TB total
+        "SAR": [
+            "🟢 > 400 GB free (of 2 TB)",
+            "⚠️ 200–400 GB free",
+            "🔴 < 200 GB free / Critical",
+        ],
+    },
+    "PMP Health | Data Backup": {"common": [
+        "🟢 Active backup within local network",
+        "⚠️ Backup configured but not verified",
+        "🔴 No backup / Not configured",
+    ]},
+    "PMP Health | Webupload Logfiles": {"common": [
+        "🟢 Working correctly",
+        "⚠️ Intermittent / Partial upload",
+        "🔴 Disabled / Not working",
+    ]},
+    "PMP Health | Webupload Production Data": {"common": [
+        "🟢 Wall folders uploading correctly",
+        "⚠️ Partial / Intermittent upload",
+        "🔴 Disabled / Not working",
+    ]},
+}
 
-            conn_r.commit(); conn_r.close()
-            payload = json.dumps({
-                "ok": True, "resolved": resolved,
-                "wins": wins, "losses": losses
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
+# PMP Health header colors (teal/slate — distinct from DQP categories)
+PMP_CAT_COLOR = "#1E6B8C"
 
-def auto_resolve():
-    """Resuelve picks PENDING contra CSVs al arrancar. Sin requests externos."""
-    import difflib as dl
-    import pandas as pd
-    resolved = wins = losses = 0
-    try:
-        conn_r = sqlite3.connect(DB_PATH)
-        pending = conn_r.execute("""
-            SELECT id, div, home_team, away_team, market, selection,
-                   odd_open, stake_pct
-            FROM picks_log WHERE result='PENDING'
-        """).fetchall()
-        for pid, div, home, away, mkt, pick, odd, stake in pending:
-            path = os.path.join(DATA_DIR, f"{div}.csv")
-            if not os.path.exists(path):
-                continue
-            try:
-                try:    df = pd.read_csv(path, encoding="utf-8-sig")
-                except: df = pd.read_csv(path, encoding="latin-1")
-                df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
-                                        "HG":"FTHG","AG":"FTAG"})
-                played = df.dropna(subset=["FTHG","FTAG"])
-                teams = pd.concat([played["HomeTeam"], played["AwayTeam"]]).unique()
-                rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
-                ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
-                if not rh or not ra: continue
-                m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
-                if m.empty: continue
-                fthg = float(m.iloc[-1]["FTHG"])
-                ftag = float(m.iloc[-1]["FTAG"])
-                res = check_result(pick, mkt, fthg, ftag,
-                                   home_name=rh[0], away_name=ra[0])
-                if res not in ("WIN","LOSS"): continue
-                profit = round(
-                    float(stake or 0)*float(odd or 0) - float(stake or 0)
-                    if res=="WIN" else -float(stake or 0), 4)
-                conn_r.execute(
-                    "UPDATE picks_log SET result=?, profit=? WHERE id=?",
-                    (res, profit, pid))
-                resolved += 1
-                if res=="WIN": wins += 1
-                else: losses += 1
-            except Exception:
-                continue
-        conn_r.commit(); conn_r.close()
-        if resolved:
-            Log.ok(f"Auto-resolve: {resolved} picks ({wins}W/{losses}L)", "RESOLVE")
-    except Exception as e:
-        Log.err(f"auto_resolve: {e}", "RESOLVE")
+# PMP FIXES (recommended actions)
+PMP_FIXES = {
+    "Last Check":              "Schedule PMP maintenance visit",
+    "MonitorIQ Version":       "Update MonitorIQ to latest version",
+    "Hardware Compliance":     "Upgrade hardware to meet minimum requirements",
+    "PMP Responsiveness":      "Check CPU/RAM usage, close background processes, consider hardware upgrade",
+    "SSD Space Available":     "Free up disk space or expand storage",
+    "Data Backup":             "Configure automated backup to local network",
+    "Webupload Logfiles":      "Check webupload configuration and network connectivity",
+    "Webupload Production Data":"Check webupload configuration for wall folders",
+}
 
-    def _serve_analyze(self):
-        """Analiza un partido en tiempo real desde la DB y CSVs."""
-        try:
-            from urllib.parse import urlparse, parse_qs
-            import pandas as pd
-            qs = parse_qs(urlparse(self.path).query)
-            home = qs.get("home", [""])[0].strip()
-            away = qs.get("away", [""])[0].strip()
-            div  = qs.get("div",  [""])[0].strip().upper()
+PA_DTM_MANDATORY_2D = [
+    "Data Visualization | DTM & Geopositioning",
+    "Atmospheric | Source",
+    "Atmospheric | Created PA",
+    "Atmospheric | PA Refractivity Graph",
+    "Atmospheric | PA Deformation Map",
+]
 
-            if not home or not away:
-                payload = json.dumps({"error": "Faltan parámetros home/away"}).encode()
-                self.send_response(400)
-                self.send_header("Content-Type","application/json")
-                self.end_headers(); self.wfile.write(payload); return
+FIXES = {
+    "Data Availability":        "Check Link & Power",
+    "SSR Type":                 "Adjust Radar Parameters",
+    "Signal Strength":          "Check RF cables/EC/HPA or filter low amplitudes via time slider",
+    "Wall %":                   "Adjust Sky Mask Filter",
+    "Return Signal":            "Check System",
+    "Selection / Width":        "Optimize Scan Area",
+    "Elevation":                "Adjust Elevation Limits",
+    "Levelling":                "Re-level Radar Platform",
+    "Coverage / Angle":         "Check Positioning / Move Radar",
+    "Camera Alignment":         "Calibrate Camera",
+    "Photo Quality":            "Clean Lens or change time photo",
+    "Geopositioning":           "Apply Geopositioning in PMP",
+    "DTM & Geopositioning":     "Apply DTM and Geopositioning in PMP",
+    "Sky & Short Range":        "Check RF cables/EC/HPA or filter low amplitudes via time slider",
+    "Manual Mask":              "Create or adjust Manual Masks",
+    "EDM":                      "Create or adjust EDM mask properly",
+    "Watchdog":                 "Enable Watchdog",
+    "Settings":                 "Add Notifications to Alarms",
+    "Tracking":                 "Create an alarm with Tracking threshold",
+    "Coherence Area":           "Check alarm mask",
+    "Incidence Angle":          "Review Alarm Vectors",
+    "Algorithm":                "Select Correct Algorithm",
+    "Source":                   "Define SRAs correctly",
+    "Created SRAs":             "Add Independent SRAs or create more than 1",
+    "SRA Spread Graph":         "Ensure SRAs are stable",
+    "Stable Reference Pixels":  "Ensure SRAs are stable",
+    "Graph (1 Day)":            "Ensure SRAs are stable",
+    "Rejected SRA %":           "Redefine SRAs Areas",
+    "WS Graph (2 Days)":        "Check Long Term Weather",
+    "PA Refractivity Graph":    "Review PA Bulk Areas and Seed Mask placement",
+    "Created PA":               "Redefine Seed Mask and Bulk Areas on stable non-moving zones",
+    "PA Deformation Map":       "Redefine Bulk Areas on stable non-moving zones",
+    "Check System":             "Check System",
+}
 
-            result = {"home": home, "away": away, "div": div}
+# ─────────────────────────────────────────────────────────────────────────────
+# STORAGE LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+def _natural_key(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'([0-9]+)', str(s))]
 
-            # ── Buscar div si no se especificó ──────────────────────────
-            if not div:
-                for d in TARGET_LEAGUES:
-                    if d in ("BSA","MEX"): continue
-                    path = os.path.join(DATA_DIR, f"{d}.csv")
-                    if not os.path.exists(path): continue
-                    try:
-                        try:    df = pd.read_csv(path, encoding="utf-8-sig")
-                        except: df = pd.read_csv(path, encoding="latin-1")
-                        teams = pd.concat([df["HomeTeam"],df["AwayTeam"]]).dropna().unique()
-                        rh = difflib.get_close_matches(home, teams, n=1, cutoff=0.55)
-                        ra = difflib.get_close_matches(away, teams, n=1, cutoff=0.55)
-                        if rh and ra:
-                            div = d
-                            home = rh[0]; away = ra[0]
-                            result["home"] = home
-                            result["away"] = away
-                            result["div"]  = div
-                            break
-                    except: continue
+@st.cache_data(ttl=30)
+def _sp_token():
+    app = ConfidentialClientApplication(SP_CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{SP_TENANT_ID}",
+        client_credential=SP_CLIENT_SEC)
+    return app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])["access_token"]
 
-            if not div:
-                payload = json.dumps({"error": f"No se encontraron equipos en ninguna liga"}).encode()
-                self.send_response(404)
-                self.send_header("Content-Type","application/json")
-                self.end_headers(); self.wfile.write(payload); return
+def _sp_download():
+    token = _sp_token()
+    url = f"https://graph.microsoft.com/v1.0/sites/{SP_SITE_ID}/drive/root:{SP_FILE_PATH}:/content"
+    r = _requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    return r.content
 
-            cfg = TARGET_LEAGUES.get(div, {})
-            path = os.path.join(DATA_DIR, f"{div}.csv")
+def _sp_upload(data: bytes):
+    token = _sp_token()
+    url = f"https://graph.microsoft.com/v1.0/sites/{SP_SITE_ID}/drive/root:{SP_FILE_PATH}:/content"
+    _requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}, data=data).raise_for_status()
 
-            # ── Cargar CSV ───────────────────────────────────────────────
-            try:
-                try:    df = pd.read_csv(path, encoding="utf-8-sig")
-                except: df = pd.read_csv(path, encoding="latin-1")
-                df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
-                                        "HG":"FTHG","AG":"FTAG"})
-            except Exception as e:
-                payload = json.dumps({"error": f"CSV no disponible: {e}"}).encode()
-                self.send_response(500)
-                self.send_header("Content-Type","application/json")
-                self.end_headers(); self.wfile.write(payload); return
+@st.cache_data
+def load_wb_bytes() -> bytes:
+    if STORAGE_MODE == "sharepoint":
+        return _sp_download()
+    with open(EXCEL_PATH, "rb") as f:
+        return f.read()
 
-            played = df.dropna(subset=["FTHG","FTAG"])
+def get_workbook():
+    return load_workbook(io.BytesIO(load_wb_bytes()))
 
-            def team_stats(name, depth=8):
-                rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
-                if len(rows) < 2: return None
-                gf,ga,sf,sa,pts,results = [],[],[],[],[],[]
-                for _,row in rows.iterrows():
-                    ih = (row["HomeTeam"]==name)
-                    g  = float(row["FTHG"] if ih else row["FTAG"])
-                    gc = float(row["FTAG"] if ih else row["FTHG"])
-                    gf.append(min(g,3)); ga.append(min(gc,3))
-                    if cfg.get("has_shots"):
-                        try:
-                            h = float(row.get("HST",float("nan")))
-                            a = float(row.get("AST",float("nan")))
-                            if not (h!=h or a!=a):
-                                sf.append(h if ih else a)
-                                sa.append(a if ih else h)
-                        except: pass
-                    if g>gc: pts.append(3); results.append("W")
-                    elif g==gc: pts.append(1); results.append("D")
-                    else: pts.append(0); results.append("L")
-                ff = _form(gf); fa = _form(ga)
-                fp = _form_pts(gf,ga,5)
-                ff_f = ff*0.6 + fp*0.4
-                if sf:
-                    xgf = _wavg(sf)*cfg.get("conv_home",0.30)*ff_f
-                    xga = _wavg(sa)*cfg.get("conv_away",0.31)*(1/ff_f if ff_f>0 else 1)
-                else:
-                    xgf = _wavg(gf)*ff_f
-                    xga = _wavg(ga)
-                return {
-                    "xgf": round(xgf,2), "xga": round(xga,2),
-                    "gf_avg": round(sum(gf)/len(gf),2),
-                    "ga_avg": round(sum(ga)/len(ga),2),
-                    "form_pts": round(fp,3),
-                    "form_xg":  round(ff,3),
-                    "pts_last5": pts[:5],
-                    "results":   results[:5],
-                    "n": len(gf),
-                    "conf": "HIGH" if len(gf)>=6 else "MED" if len(gf)>=3 else "LOW"
-                }
+def save_workbook(wb):
+    buf = io.BytesIO()
+    wb.save(buf)
+    raw = buf.getvalue()
+    if STORAGE_MODE == "sharepoint":
+        _sp_upload(raw)
+    else:
+        with open(EXCEL_PATH, "wb") as f:
+            f.write(raw)
+    load_wb_bytes.clear()
 
-            hs = team_stats(home)
-            as_ = team_stats(away)
-            if not hs or not as_:
-                payload = json.dumps({"error": "Historial insuficiente"}).encode()
-                self.send_response(404)
-                self.send_header("Content-Type","application/json")
-                self.end_headers(); self.wfile.write(payload); return
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def get_audit_matrix(wb):
+    ws = wb["AUDIT MATRIX"]
+    headers = [cell.value for cell in ws[1]]
+    rows = [dict(zip(headers, row)) for row in ws.iter_rows(min_row=2, values_only=True) if row[0]]
+    df = pd.DataFrame(rows)
+    # BU: read from Excel column if it exists, fallback to SITE_BU dict
+    if "BU" in df.columns:
+        df["BU"] = df.apply(
+            lambda r: str(r["BU"]).strip()
+            if pd.notna(r.get("BU")) and str(r.get("BU","")).strip() not in ["","nan"]
+            else SITE_BU.get(str(r.get("Site","")).strip(), "Other"), axis=1
+        )
+    elif "Site" in df.columns:
+        df["BU"] = df["Site"].apply(lambda s: SITE_BU.get(str(s).strip(), "Other"))
+    else:
+        df["BU"] = "Other"
+    return df
 
-            # ── xG del partido ───────────────────────────────────────────
-            xh = round((hs["xgf"] + as_["xga"]) / 2, 2)
-            xa = round((as_["xgf"] + hs["xga"]) / 2, 2)
-            xt = round(xh + xa, 2)
 
-            # ── Dixon-Coles probabilidades ───────────────────────────────
-            ph, pd_, pa = dixon_coles(xh, xa)
-            ph,pd_,pa = round(ph,3),round(pd_,3),round(pa,3)
+def ensure_bu_column(ws):
+    """Ensure AUDIT MATRIX has a BU column. Returns col_index (1-based)."""
+    headers = [cell.value for cell in ws[1]]
+    if "BU" not in headers:
+        ra_idx = headers.index("Remote Access") + 1 if "Remote Access" in headers else len(headers)
+        ws.insert_cols(ra_idx + 1)
+        ws.cell(1, ra_idx + 1).value = "BU"
+        for row in ws.iter_rows(min_row=2):
+            if not row[0].value: continue
+            site_col = headers.index("Site") + 1 if "Site" in headers else 2
+            site_val = str(ws.cell(row[0].row, site_col).value or "").strip()
+            ws.cell(row[0].row, ra_idx + 1).value = SITE_BU.get(site_val, "Other")
+        headers.insert(ra_idx, "BU")
+    return headers.index("BU") + 1
 
-            # ── NegBinom O/U ─────────────────────────────────────────────
-            std = cfg.get("xg_std", 1.55)
-            po_raw, pu_raw = negbinom_ou(xt, std)
-            po = round(shrink(po_raw, a=0.65), 3)
-            pu = round(1-po, 3)
+def get_history(wb):
+    ws = wb["HISTORY_LOG"]
+    cols = ["Radar Name","Site","Audit Date","Auditor","Score Captured","Notes"]
+    rows = [r for r in ws.iter_rows(min_row=2, values_only=True) if r[0]]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    # Pad rows to 6 cols in case Notes column doesn't exist yet
+    rows = [list(r) + [None] * (6 - len(r)) for r in rows]
+    df = pd.DataFrame([r[:6] for r in rows], columns=cols)
+    df["Audit Date"]      = pd.to_datetime(df["Audit Date"], errors="coerce")
+    df["Score Captured"]  = pd.to_numeric(df["Score Captured"], errors="coerce")
+    return df
 
-            # ── BTTS ─────────────────────────────────────────────────────
-            py, pn = btts_prob(xh, xa)
-            py = round(py or 0, 3); pn = round(1-py, 3)
+def is_3d(t): return "XT" in str(t).upper()
 
-            # ── H2H últimos 5 ────────────────────────────────────────────
-            h2h_rows = played[
-                ((played["HomeTeam"]==home)&(played["AwayTeam"]==away)) |
-                ((played["HomeTeam"]==away)&(played["AwayTeam"]==home))
-            ].tail(5)
-            h2h = []
-            for _,row in h2h_rows.iterrows():
-                ih = (row["HomeTeam"]==home)
-                h2h.append({
-                    "home": row["HomeTeam"], "away": row["AwayTeam"],
-                    "fthg": int(row["FTHG"]), "ftag": int(row["FTAG"]),
-                    "date": str(row.get("Date",""))
-                })
+def get_options(key, radar_type, pa_stl="N/A"):
+    data = DQP_MASTER.get(key, {})
+    dim  = "3D" if is_3d(radar_type) else "2D"
+    opts = data.get(dim, data.get("common", ["⚪ N/A"]))
 
-            result.update({
-                "league": cfg.get("name",""),
-                "home_stats": hs,
-                "away_stats": as_,
-                "xg_home": xh, "xg_away": xa, "xg_total": xt,
-                "probs": {"home": ph, "draw": pd_, "away": pa},
-                "ou": {"over": po, "under": pu},
-                "btts": {"yes": py, "no": pn},
-                "h2h": h2h,
-                "fair_odds": {
-                    "home":  round(1/ph, 2) if ph>0 else None,
-                    "draw":  round(1/pd_,2) if pd_>0 else None,
-                    "away":  round(1/pa, 2) if pa>0 else None,
-                    "over":  round(1/po, 2) if po>0 else None,
-                    "under": round(1/pu, 2) if pu>0 else None,
-                    "btts_y":round(1/py, 2) if py>0 else None,
-                }
-            })
+    # PA-specific fields: only hide if radar CANNOT use PA (XT/SAR-X)
+    # FX/SOM always show PA options — pa_stl='Yes' means Albert's rule applies,
+    # pa_stl='No' means PA not configured but fields still visible for auditing
+    if 'PA' in key:
+        if not can_use_pa(radar_type):
+            # XT / SAR-X → always N/A
+            na_opts = [o for o in opts if '⚪' in o]
+            return na_opts if na_opts else ["⚪ N/A"]
+        # FX / SOM → always show full options regardless of pa_stl
+    return opts
 
-            payload = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Access-Control-Allow-Origin","*")
-            self.end_headers(); self.wfile.write(payload)
+def can_use_pa(radar_type: str) -> bool:
+    """Only FX and SOM (OMNI) radars can use Precision Atmospherics."""
+    t = str(radar_type).upper()
+    return 'FX' in t or 'SOM' in t
 
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type","application/json")
-            self.end_headers(); self.wfile.write(err)
+def compute_score(answers, radar_type, pa_stl="N/A"):
+    """
+    Score logic:
+    - System Health 🔴 → score = 0% (data not reliable)
+    - Other categories 🔴 → count in score normally
+    - PA rule: ALL FX/SOM must have PA configured (no exceptions)
+              XT/SAR-X → PA fields are N/A, never penalized
+    """
+    # Check System Health specifically
+    SH_KEYS = ["System Health | Data Availability", "System Health | SSR Type & Scan Mode",
+                "System Health | Signal Strength", "System Health | Return Signal",
+                "System Health | Wall %",
+                "Data Availability", "SSR Type & Scan Mode", "Signal Strength", "Return Signal", "Wall %"]
 
-def start_dashboard(port=8080):
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    Log.ok(f"Dashboard en http://0.0.0.0:{port}", "DASH")
-    return server
+    sh_critical = any("🔴" in str(answers.get(k, "")) for k in SH_KEYS)
 
-if __name__ == "__main__":
-    # Arrancar dashboard web en puerto 8080
-    start_dashboard(port=int(os.getenv("PORT", "8080")))
-    auto_resolve()   # resolver picks PENDING contra CSVs al arrancar
-    bot = TripleLeagueV72()
+    if sh_critical:
+        issues, actions = [], []
+        for key, val in answers.items():
+            if "🔴" in str(val) or "⚠️" in str(val):
+                short   = key.split("|")[-1].strip()
+                fix_key = next((k for k in FIXES if k in key), None)
+                issues.append(short)
+                actions.append(FIXES.get(fix_key, "Contact GroundProbe Support"))
+        return 0.0, issues, actions
 
-    # Registro de última ejecución por tarea (fecha UTC)
-    _last_run = {}
+    green_n = sum(1 for v in answers.values() if "🟢" in str(v))
+    red_n   = sum(1 for v in answers.values() if "🔴" in str(v))
+    na_n    = sum(1 for v in answers.values() if "⚪" in str(v))
+    total   = len(answers) - na_n
 
-    def _ran_today(key):
-        return _last_run.get(key) == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    score = green_n / total if total > 0 else 1.0
 
-    def _mark_ran(key):
-        _last_run[key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # PA rule: ALL FX/SOM must have PA + DTM configured
+    # If PA not properly set → cannot reach 100%, but score still reflects other checks
+    if can_use_pa(radar_type):
+        pa_src  = answers.get("Atmospheric | Source", answers.get("Source", ""))
+        dtm_val = answers.get("Data Visualization | DTM & Geopositioning", answers.get("DTM & Geopositioning", ""))
+        pa_map  = answers.get("Atmospheric | PA Deformation Map", answers.get("PA Deformation Map", ""))
+        pa_ok   = ("Precision Atmospherics" in str(pa_src)
+                   and "🟢" in str(dtm_val)
+                   and "🔴" not in str(pa_map))
+        if not pa_ok:
+            # Cap score just below perfect — real score still shows actual state
+            score = min(score, 0.99)
+    issues, actions = [], []
+    for key, val in answers.items():
+        if "🔴" in str(val) or "⚠️" in str(val):
+            short   = key.split("|")[-1].strip()
+            fix_key = next((k for k in FIXES if k in key), None)
+            issues.append(short)
+            actions.append(FIXES.get(fix_key, "Contact GroundProbe Support"))
+    return round(score, 4), issues, actions
 
-    def _ran_this_week(key):
-        return _last_run.get(key) == datetime.now(timezone.utc).strftime("%Y-W%W")
+def save_audit(radar_name, site, radar_type, auditor, audit_date, answers, score, issues, actions, notes="", pmp_answers=None, is_correction=False):
+    wb       = get_workbook()
+    ws_audit = wb["AUDIT MATRIX"]
+    headers  = [c.value for c in ws_audit[1]]
+    col_map  = {h: i+1 for i, h in enumerate(headers) if h}
 
-    def _mark_ran_week(key):
-        _last_run[key] = datetime.now(timezone.utc).strftime("%Y-W%W")
+    target_row = next((r[0].row for r in ws_audit.iter_rows(min_row=2) if str(r[0].value) == radar_name), None)
+    if not target_row:
+        return False, f"Radar {radar_name} not found"
 
-    if os.getenv("SELF_TEST", "False") == "True":
-        bot.refresh_csvs()
-        bot.run_daily_scan()
+    ws_audit.cell(target_row, col_map["Last Audit"]).value   = audit_date
+    ws_audit.cell(target_row, col_map["Auditor"]).value      = auditor
 
-    CSV_H,  CSV_M  = _hhmm(RUN_TIME_CSV_UPDATE)   # 06:00
-    AUDIT_H,AUDIT_M= _hhmm(RUN_TIME_AUDIT)         # 07:00
-    SCAN_H, SCAN_M = _hhmm(RUN_TIME_SCAN)           # 06:30
-    CLV_H,  CLV_M  = _hhmm(RUN_TIME_CLV)            # 16:00
-    STAND_H,STAND_M= _hhmm(RUN_TIME_STANDINGS)      # 09:00 martes
+    if not is_correction:
+        # Normal save — increment audit count
+        prev = ws_audit.cell(target_row, col_map["Total Audits"]).value or 0
+        ws_audit.cell(target_row, col_map["Total Audits"]).value = int(prev) + 1
 
-    Log.ok("Scheduler UTC activo — 06:00 CSV / 06:30 SCAN / 07:00 AUDIT / 16:00 CLV", "SCHED")
-    while True:
-        now = datetime.now(timezone.utc)
-        hh, mm = now.hour, now.minute
-
-        # 06:00 — refresh CSVs
-        if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
-            _mark_ran("csv")
-            try: bot.refresh_csvs()
-            except Exception as e: Log.err(f"refresh_csvs: {e}", "SCHED")
-
-        # 07:00 — audit + pnl + auto-resolve
-        if (hh, mm) == (AUDIT_H, AUDIT_M) and not _ran_today("audit"):
-            _mark_ran("audit")
-            try: run_audit()
-            except Exception as e: Log.err(f"run_audit: {e}", "SCHED")
-            try: auto_resolve()
-            except Exception as e: Log.err(f"auto_resolve: {e}", "SCHED")
-            try: calc_pnl()
-            except Exception as e: Log.err(f"calc_pnl: {e}", "SCHED")
-            Log.daily_summary()
-
-        # 06:30 — kill-switch check + scan principal
-        if (hh, mm) == (SCAN_H, SCAN_M) and not _ran_today("scan"):
-            _mark_ran("scan")
-            if not kill_switch_check():
-                try: bot.run_daily_scan()
-                except Exception as e: Log.err(f"run_daily_scan: {e}", "SCHED")
+    for key, val in answers.items():
+        short_key = key.split("|")[-1].strip() if "|" in key else key
+        if key in col_map:
+            ws_audit.cell(target_row, col_map[key]).value = val
+        elif short_key in col_map:
+            ws_audit.cell(target_row, col_map[short_key]).value = val
+    if pmp_answers:
+        for key, val in pmp_answers.items():
+            short_key = key.split("|")[-1].strip() if "|" in key else key
+            if key in col_map:
+                ws_audit.cell(target_row, col_map[key]).value = val
+            elif short_key in col_map:
+                ws_audit.cell(target_row, col_map[short_key]).value = val
             else:
-                Log.warn("Scan omitido — kill-switch activo", "SCHED")
+                new_col = max(col_map.values()) + 1
+                ws_audit.cell(1, new_col).value = short_key
+                ws_audit.cell(target_row, new_col).value = val
+                col_map[short_key] = new_col
+    if "SCORE"              in col_map: ws_audit.cell(target_row, col_map["SCORE"]).value              = score
+    if "ISSUES DETECTED"    in col_map: ws_audit.cell(target_row, col_map["ISSUES DETECTED"]).value    = "\n".join(issues)
+    if "RECOMMENDED ACTION" in col_map: ws_audit.cell(target_row, col_map["RECOMMENDED ACTION"]).value = "\n".join(actions)
+    if "HELPER_STATUS"      in col_map: ws_audit.cell(target_row, col_map["HELPER_STATUS"]).value      = "Critical" if score==0 else ("Needs Attention" if score<1 else "Good")
+    if "HELPER_SCORE"       in col_map: ws_audit.cell(target_row, col_map["HELPER_SCORE"]).value       = score
 
-        # 16:00 — capture CLV
-        if (hh, mm) == (CLV_H, CLV_M) and not _ran_today("clv"):
-            _mark_ran("clv")
-            try: bot.capture_clv()
-            except Exception as e: Log.err(f"capture_clv: {e}", "SCHED")
+    ws_hist = wb["HISTORY_LOG"]
+    if is_correction:
+        # Find the last history entry for this radar and overwrite it
+        last_row = None
+        for r in range(2, ws_hist.max_row + 1):
+            if ws_hist.cell(r, 1).value == radar_name:
+                last_row = r
+        if last_row:
+            ws_hist.cell(last_row, 3).value = audit_date
+            ws_hist.cell(last_row, 4).value = auditor
+            ws_hist.cell(last_row, 5).value = score
+            ws_hist.cell(last_row, 6).value = notes
+        # If no history exists yet, treat as normal save
+        else:
+            is_correction = False
 
-        # Martes 09:00 — standings
-        if now.weekday() == 1 and (hh, mm) == (STAND_H, STAND_M) and not _ran_this_week("standings"):
-            _mark_ran_week("standings")
-            try: bot.weekly_standings()
-            except Exception as e: Log.err(f"weekly_standings: {e}", "SCHED")
+    if not is_correction:
+        next_row = next((r for r in range(2, ws_hist.max_row+2) if ws_hist.cell(r,1).value is None), ws_hist.max_row+1)
+        ws_hist.cell(next_row, 1).value = radar_name
+        ws_hist.cell(next_row, 2).value = site
+        ws_hist.cell(next_row, 3).value = audit_date
+        ws_hist.cell(next_row, 4).value = auditor
+        ws_hist.cell(next_row, 5).value = score
+        ws_hist.cell(next_row, 6).value = notes
 
-        time.sleep(30)
+    save_workbook(wb)
+    return True, "OK"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF CLIENT REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_client_pdf(site: str, df_matrix: pd.DataFrame, auditor: str, logo_path: str = None) -> bytes:
+    """Generate a professional client-facing PDF for a given site."""
+    import os
+    from reportlab.platypus import KeepTogether, Image as RLImage
+
+    buf = io.BytesIO()
+
+    GP_ORANGE  = colors.HexColor("#F78F1E")
+    GP_DARK    = colors.HexColor("#393B41")
+    GP_LIGHT   = colors.HexColor("#F5F6F8")
+    GP_MID     = colors.HexColor("#E8EAED")
+    C_GREEN    = colors.HexColor("#00B050")
+    C_YELLOW   = colors.HexColor("#FFC000")
+    C_RED      = colors.HexColor("#C62828")
+    C_GREY     = colors.HexColor("#6B7280")
+    C_LGREY    = colors.HexColor("#9CA3AF")
+    WHITE      = colors.white
+    C_GREEN_BG = colors.HexColor("#F0FDF4")
+    C_YELLOW_BG= colors.HexColor("#FFFBEB")
+    C_RED_BG   = colors.HexColor("#FEF2F2")
+
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=15*mm, rightMargin=15*mm,
+                            topMargin=0*mm, bottomMargin=12*mm)
+    W = A4[0] - 30*mm
+    story = []
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    def ps(name, **kw):
+        base = dict(fontName="Helvetica", fontSize=9, textColor=GP_DARK, leading=13)
+        base.update(kw)
+        return ParagraphStyle(name, **base)
+
+    s_hdr_title = ps("hdr_title", fontName="Helvetica-Bold", fontSize=18, textColor=WHITE, leading=22)
+    s_hdr_sub   = ps("hdr_sub",   fontName="Helvetica",      fontSize=10, textColor=colors.HexColor("#FFE0B2"), leading=14)
+    s_section   = ps("section",   fontName="Helvetica-Bold",  fontSize=11, textColor=GP_DARK, spaceBefore=10, spaceAfter=5)
+    s_body      = ps("body")
+    s_bold      = ps("bold",  fontName="Helvetica-Bold")
+    s_small     = ps("small", fontSize=8, textColor=C_GREY, leading=11)
+    s_center    = ps("center", alignment=TA_CENTER)
+    s_right     = ps("right",  alignment=TA_RIGHT, fontSize=8, textColor=C_GREY)
+    s_card_lbl  = ps("card_lbl", fontName="Helvetica-Bold", fontSize=8, textColor=C_LGREY, alignment=TA_CENTER, leading=10)
+    s_card_val  = ps("card_val", fontName="Helvetica-Bold", fontSize=26, alignment=TA_CENTER, leading=30)
+    s_radar_hdr = ps("radar_hdr", fontName="Helvetica-Bold", fontSize=9, textColor=WHITE, alignment=TA_CENTER)
+    s_radar_cell= ps("radar_cell", fontSize=9, textColor=GP_DARK, alignment=TA_CENTER)
+    s_radar_left= ps("radar_left", fontSize=9, textColor=GP_DARK)
+    s_issue_ok  = ps("issue_ok",  fontSize=8, textColor=C_GREEN)
+    s_issue_warn= ps("issue_warn", fontSize=8, textColor=colors.HexColor("#92400E"))
+    s_issue_crit= ps("issue_crit", fontSize=8, textColor=C_RED)
+    s_tag_green = ps("tag_g", fontName="Helvetica-Bold", fontSize=8, textColor=C_GREEN, alignment=TA_CENTER)
+    s_tag_yellow= ps("tag_y", fontName="Helvetica-Bold", fontSize=8, textColor=colors.HexColor("#92400E"), alignment=TA_CENTER)
+    s_tag_red   = ps("tag_r", fontName="Helvetica-Bold", fontSize=8, textColor=C_RED,   alignment=TA_CENTER)
+    s_foot      = ps("foot",  fontSize=7, textColor=C_LGREY, alignment=TA_CENTER)
+
+    today_str   = date.today().strftime("%B %d, %Y")
+    today_short = date.today().strftime("%d %b %Y")
+
+    # ── Helper: score → status ────────────────────────────────────────────────
+    def score_status(s):
+        if s is None: return ("Not Audited", C_GREY,   GP_LIGHT,   s_card_val)
+        if s == 1.0:  return ("Good",        C_GREEN,  C_GREEN_BG, s_tag_green)
+        if s >= 0.7:  return ("Needs Attention",     C_YELLOW, C_YELLOW_BG,s_tag_yellow)
+        return             ("Critical",      C_RED,    C_RED_BG,   s_tag_red)
+
+    # ── Filter site radars ────────────────────────────────────────────────────
+    site_radars = df_matrix[
+        df_matrix["Site"].astype(str).str.strip().str.lower() == site.strip().lower()
+    ].copy()
+
+    # DQP columns — short names (no pipe), excluding meta/calc columns
+    META_COLS = {
+        'Radar Name','Site','Type','Remote Access','Last Audit','Total Audits','Auditor',
+        'SCORE','ISSUES DETECTED','RECOMMENDED ACTION','HELPER_SCORE','HELPER_DATE',
+        'HELPER_STATUS','PA','_score'
+    }
+    dqp_cols = [c for c in site_radars.columns if c not in META_COLS and c and not str(c).startswith('_')]
+
+    SH_COLS = {"Data Availability", "SSR Type & Scan Mode", "Signal Strength", "Return Signal", "Wall %"}
+
+    def row_score(row):
+        # Use HELPER_SCORE (saved score) first — consistent with what auditor saw
+        saved = row.get("HELPER_SCORE")
+        if saved is not None and str(saved) not in ["", "nan", "None"]:
+            try:
+                return float(saved)
+            except (ValueError, TypeError):
+                pass
+        # Fallback: recalculate from checkpoints only if no saved score
+        vals   = [str(row.get(c, "") or "") for c in dqp_cols]
+        greens = sum(1 for v in vals if "🟢" in v)
+        nas    = sum(1 for v in vals if "⚪" in v)
+        total  = len(dqp_cols) - nas
+        if greens + sum(1 for v in vals if "🔴" in v) + nas == 0:
+            return float('nan')
+        for c in SH_COLS:
+            if "🔴" in str(row.get(c, "") or ""):
+                return 0.0
+        return greens / total if total > 0 else 1.0
+
+    if not site_radars.empty:
+        site_radars["_score"] = site_radars.apply(row_score, axis=1)
+        audited = site_radars[site_radars["_score"].notna()]
+        avg_score = audited["_score"].mean() if not audited.empty else None
+    else:
+        avg_score = None
+
+    n_total    = len(site_radars)
+    n_audited  = int(site_radars["_score"].notna().sum()) if not site_radars.empty else 0
+    n_good     = int((site_radars["_score"] == 1.0).sum())   if not site_radars.empty else 0
+    n_warn     = int(((site_radars["_score"] >= 0.7) & (site_radars["_score"] < 1.0)).sum()) if not site_radars.empty else 0
+    n_crit     = int((site_radars["_score"].notna() & (site_radars["_score"] < 0.7)).sum())  if not site_radars.empty else 0
+    n_not_aud  = n_total - n_audited
+
+    # ── PAGE 1: COVER ─────────────────────────────────────────────────────────
+    lp = logo_path or "/home/claude/gp_logo.png"
+    has_logo = os.path.exists(lp)
+
+    if has_logo:
+        logo_img = RLImage(lp, width=50*mm, height=50*mm * 62/410)
+        logo_cell = logo_img
+    else:
+        logo_cell = Paragraph("<b>GroundProbe</b>",
+            ps("lc", fontName="Helvetica-Bold", fontSize=20, textColor=GP_ORANGE))
+
+    # Dark header — orange logo looks perfect on dark background
+    cover_top = Table([[
+        logo_cell,
+        Paragraph("Proactive Data Quality Review",
+            ps("ct", fontName="Helvetica", fontSize=11, textColor=colors.HexColor("#9CA3AF"), alignment=TA_RIGHT))
+    ]], colWidths=[W*0.5, W*0.5])
+    cover_top.setStyle(TableStyle([
+        ('BACKGROUND',   (0,0),(-1,-1), GP_DARK),
+        ('VALIGN',       (0,0),(-1,-1), 'MIDDLE'),
+        ('LEFTPADDING',  (0,0),(-1,-1), 12),
+        ('RIGHTPADDING', (0,0),(-1,-1), 12),
+        ('TOPPADDING',   (0,0),(-1,-1), 14),
+        ('BOTTOMPADDING',(0,0),(-1,-1), 14),
+    ]))
+    story.append(cover_top)
+    story.append(Spacer(1, 8*mm))
+
+    # Site title
+    story.append(Paragraph(f"<b>{site}</b>",
+        ps("site_title", fontName="Helvetica-Bold", fontSize=28, textColor=GP_DARK, leading=32, spaceAfter=2)))
+    story.append(Paragraph(f"Data Quality Parameters  ·  {today_str}",
+        ps("site_sub", fontName="Helvetica", fontSize=11, textColor=C_GREY, spaceAfter=2)))
+    story.append(Paragraph(f"Prepared by: <b>{auditor}</b>  ·  GroundProbe Advisory Services",
+        ps("site_by", fontName="Helvetica", fontSize=9, textColor=C_GREY)))
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width=W, thickness=2, color=GP_ORANGE, spaceAfter=6*mm))
+
+    # ── Score cards ─────────────────────────────────────────────────────────
+    def make_card(label, value, val_color, bg_color=GP_LIGHT, subtitle=None):
+        rows = [
+            [Paragraph(label, ps("cl", fontName="Helvetica-Bold", fontSize=7.5, textColor=C_LGREY, alignment=TA_CENTER))],
+            [Paragraph(str(value), ps("cv", fontName="Helvetica-Bold", fontSize=22, textColor=val_color, alignment=TA_CENTER, leading=26))],
+        ]
+        if subtitle:
+            rows.append([Paragraph(subtitle, ps("cs", fontSize=7, textColor=C_LGREY, alignment=TA_CENTER))])
+        t = Table(rows, colWidths=[W/6 - 2*mm])
+        t.setStyle(TableStyle([
+            ('BACKGROUND',    (0,0),(-1,-1), bg_color),
+            ('TOPPADDING',    (0,0),(-1,-1), 7),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 7),
+            ('LEFTPADDING',   (0,0),(-1,-1), 3),
+            ('RIGHTPADDING',  (0,0),(-1,-1), 3),
+            ('BOX',           (0,0),(-1,-1), 0.5, colors.HexColor("#E5E7EB")),
+        ]))
+        return t
+
+    _has_score = avg_score is not None and not pd.isna(avg_score)
+    site_score_pct = f"{avg_score:.0%}" if _has_score else "—"
+    site_score_clr = (C_GREEN if avg_score==1.0 else (C_YELLOW if avg_score>=0.7 else C_RED)) if _has_score else C_GREY
+    site_score_bg  = (C_GREEN_BG if avg_score==1.0 else (C_YELLOW_BG if avg_score>=0.7 else C_RED_BG)) if _has_score else GP_LIGHT
+    audited_sub    = f"of {n_audited}/{n_total} audited" if n_audited < n_total else f"{n_audited} radars audited"
+
+    cards = Table([[
+        make_card("SITE SCORE",         site_score_pct, site_score_clr, site_score_bg),
+        make_card("🟢 GOOD",           n_good,         C_GREEN,        C_GREEN_BG),
+        make_card("⚠️ NEEDS ATTENTION", n_warn,         C_YELLOW,       C_YELLOW_BG),
+        make_card("🔴 CRITICAL",        n_crit,         C_RED,          C_RED_BG),
+        make_card("TOTAL RADARS",       n_total,        GP_DARK,        GP_LIGHT),
+    ]], colWidths=[W/5]*5, hAlign="LEFT")
+    cards.setStyle(TableStyle([
+        ('VALIGN',        (0,0),(-1,-1), 'TOP'),
+        ('LEFTPADDING',   (0,0),(-1,-1), 2),
+        ('RIGHTPADDING',  (0,0),(-1,-1), 2),
+    ]))
+    story.append(cards)
+    story.append(Spacer(1, 8*mm))
+
+    # ── Per-radar detail sections ─────────────────────────────────────────────
+    story.append(Paragraph("Radar Detail", ps("rsec", fontName="Helvetica-Bold", fontSize=13, textColor=GP_DARK, spaceAfter=6)))
+
+    if site_radars.empty:
+        story.append(Paragraph("No radars found for this site.", s_body))
+    else:
+        for _, row in site_radars.sort_values("_score", na_position='last').iterrows():
+            sc      = row["_score"]
+            rname   = str(row.get("Radar Name",""))
+            rtype   = str(row.get("Type",""))
+            la      = row.get("Last Audit","")
+            la_str  = pd.to_datetime(la).strftime("%d %b %Y") if pd.notna(la) and str(la) not in ["","nan","NaT"] else "Not audited"
+
+            # Not audited at all — pd.isna catches both None and float('nan')
+            if pd.isna(sc):
+                not_aud_hdr = Table([[
+                    Paragraph(f"<b>{rname}</b>",
+                        ps("rn_na", fontName="Helvetica-Bold", fontSize=12, textColor=GP_DARK)),
+                    Paragraph(f"{rtype}  ·  Not yet audited",
+                        ps("ri_na", fontName="Helvetica", fontSize=9, textColor=C_GREY, alignment=TA_RIGHT)),
+                ]], colWidths=[W*0.35, W*0.65])
+                not_aud_hdr.setStyle(TableStyle([
+                    ('BACKGROUND',    (0,0),(-1,-1), GP_LIGHT),
+                    ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+                    ('LEFTPADDING',   (0,0),(-1,-1), 8),
+                    ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+                    ('TOPPADDING',    (0,0),(-1,-1), 7),
+                    ('BOTTOMPADDING', (0,0),(-1,-1), 7),
+                    ('BOX',           (0,0),(-1,-1), 0.5, colors.HexColor("#D1D5DB")),
+                ]))
+                story.append(KeepTogether([not_aud_hdr, Spacer(1, 3*mm)]))
+                continue
+
+            status_txt, status_clr, status_bg, _ = score_status(sc)
+            sc_str = f"{sc:.0%}"
+
+            # Collect issues — cols are already short names
+            crits, warns = [], []
+            for c in dqp_cols:
+                v = str(row.get(c,""))
+                val_clean = v.replace("🔴","").replace("⚠️","").replace("🟢","").strip()
+                if "🔴" in v: crits.append((c, val_clean))
+                elif "⚠️" in v: warns.append((c, val_clean))
+
+            # Radar header bar — name left, score badge + status right
+            hdr_bg   = C_RED if sc < 0.7 else (C_YELLOW if sc < 1.0 else C_GREEN)
+            txt_clr  = WHITE
+            sub_clr  = colors.HexColor("#FFCDD2" if sc<0.7 else "#FFF8E1" if sc<1.0 else "#C8E6C9")
+            radar_hdr_data = [[
+                Paragraph(f"<b>{rname}</b>",
+                    ps("rn", fontName="Helvetica-Bold", fontSize=12, textColor=WHITE)),
+                Paragraph(f"{rtype}  ·  {la_str}",
+                    ps("ri2", fontName="Helvetica", fontSize=8, textColor=sub_clr, alignment=TA_CENTER)),
+                Paragraph(f"<b>{sc_str}</b>  {status_txt}",
+                    ps("rs", fontName="Helvetica-Bold", fontSize=11, textColor=WHITE, alignment=TA_RIGHT)),
+            ]]
+            radar_hdr_tbl = Table(radar_hdr_data, colWidths=[W*0.35, W*0.35, W*0.30])
+            radar_hdr_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0,0),(-1,-1), hdr_bg),
+                ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+                ('LEFTPADDING',   (0,0),(-1,-1), 8),
+                ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+                ('TOPPADDING',    (0,0),(-1,-1), 7),
+                ('BOTTOMPADDING', (0,0),(-1,-1), 7),
+            ]))
+
+            # Issues body — crits first, then warnings as observations
+            body_rows = []
+            if not crits and not warns:
+                body_rows.append([
+                    Paragraph("✅  All checks passed — no issues found.", s_issue_ok),
+                    Paragraph(""),
+                ])
+            else:
+                for name, val in crits:
+                    body_rows.append([
+                        Paragraph(f"🔴 <b>{name}</b>", ps("ib", fontName="Helvetica-Bold", fontSize=8, textColor=C_RED)),
+                        Paragraph(val, s_small),
+                    ])
+                for name, val in warns:
+                    body_rows.append([
+                        Paragraph(f"⚠️ {name}", ps("iw", fontName="Helvetica", fontSize=8, textColor=colors.HexColor("#92400E"))),
+                        Paragraph(val, s_small),
+                    ])
+
+            body_tbl = Table(body_rows, colWidths=[W*0.3, W*0.7])
+            body_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0,0),(-1,-1), status_bg),
+                ('VALIGN',        (0,0),(-1,-1), 'TOP'),
+                ('LEFTPADDING',   (0,0),(-1,-1), 8),
+                ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+                ('TOPPADDING',    (0,0),(-1,-1), 5),
+                ('BOTTOMPADDING', (0,0),(-1,-1), 5),
+                ('LINEBELOW',     (0,0),(-1,-2), 0.3, colors.HexColor("#E5E7EB")),
+            ]))
+
+            story.append(KeepTogether([radar_hdr_tbl, body_tbl, Spacer(1, 4*mm)]))
+
+    # ── Recommendations section ───────────────────────────────────────────────
+    crits_all = site_radars[site_radars["_score"].notna() & (site_radars["_score"] < 0.7)]  if not site_radars.empty else pd.DataFrame()
+    warns_all = site_radars[site_radars["_score"].notna() & (site_radars["_score"] >= 0.7) & (site_radars["_score"] < 1.0)] if not site_radars.empty else pd.DataFrame()
+
+    # Build action lookup from FIXES (short name → action)
+    def get_action(col_name):
+        for k, v in FIXES.items():
+            if k.lower() in col_name.lower() or col_name.lower() in k.lower():
+                return v
+        return "Contact GroundProbe Geotechnical Support"
+
+    if not crits_all.empty or not warns_all.empty:
+        story.append(HRFlowable(width=W, thickness=0.5, color=GP_MID, spaceBefore=4, spaceAfter=6))
+        story.append(Paragraph("Recommended Actions",
+            ps("rec", fontName="Helvetica-Bold", fontSize=13, textColor=GP_DARK, spaceAfter=3)))
+        story.append(Paragraph(
+            "The following actions are recommended to improve data quality at this site.",
+            ps("rec_sub", fontName="Helvetica", fontSize=9, textColor=C_GREY, spaceAfter=6)))
+
+        # Header row
+        rec_rows = [[
+            Paragraph("<b>#</b>",       ps("rh0", fontName="Helvetica-Bold", fontSize=8, textColor=WHITE, alignment=TA_CENTER)),
+            Paragraph("<b>RADAR</b>",   ps("rh1", fontName="Helvetica-Bold", fontSize=8, textColor=WHITE)),
+            Paragraph("<b>FINDING</b>", ps("rh2", fontName="Helvetica-Bold", fontSize=8, textColor=WHITE)),
+            Paragraph("<b>RECOMMENDED ACTION</b>", ps("rh3", fontName="Helvetica-Bold", fontSize=8, textColor=WHITE)),
+        ]]
+
+        priority = 1
+        n_crit_rows = 0
+
+        for _, row in crits_all.iterrows():
+            for c in dqp_cols:
+                v = str(row.get(c,""))
+                if "🔴" in v:
+                    finding = v.replace("🔴","").strip()
+                    action  = get_action(c)
+                    rec_rows.append([
+                        Paragraph(f"<b>{priority}</b>",
+                            ps(f"pn{priority}", fontName="Helvetica-Bold", fontSize=9, textColor=WHITE, alignment=TA_CENTER)),
+                        Paragraph(f"<b>{row['Radar Name']}</b>",
+                            ps(f"rr{priority}", fontName="Helvetica-Bold", fontSize=8, textColor=GP_DARK)),
+                        Paragraph(f"🔴 {c}: {finding}",
+                            ps(f"rf{priority}", fontName="Helvetica", fontSize=8, textColor=C_RED, leading=11)),
+                        Paragraph(action,
+                            ps(f"ra{priority}", fontName="Helvetica", fontSize=8, textColor=GP_DARK, leading=11)),
+                    ])
+                    priority += 1
+                    n_crit_rows += 1
+                    if priority > 20: break
+            if priority > 20: break
+
+        for _, row in warns_all.iterrows():
+            for c in dqp_cols:
+                v = str(row.get(c,""))
+                if "🔴" in v or "⚠️" in v:
+                    icon    = "🔴" if "🔴" in v else "⚠️"
+                    finding = v.replace("🔴","").replace("⚠️","").strip()
+                    action  = get_action(c)
+                    txt_clr = C_RED if "🔴" in v else colors.HexColor("#92400E")
+                    rec_rows.append([
+                        Paragraph(f"<b>{priority}</b>",
+                            ps(f"pnw{priority}", fontName="Helvetica-Bold", fontSize=9, textColor=WHITE, alignment=TA_CENTER)),
+                        Paragraph(str(row['Radar Name']),
+                            ps(f"rrw{priority}", fontName="Helvetica", fontSize=8, textColor=GP_DARK)),
+                        Paragraph(f"{icon} {c}: {finding}",
+                            ps(f"rfw{priority}", fontName="Helvetica", fontSize=8, textColor=txt_clr, leading=11)),
+                        Paragraph(action,
+                            ps(f"raw{priority}", fontName="Helvetica", fontSize=8, textColor=GP_DARK, leading=11)),
+                    ])
+                    priority += 1
+                    if priority > 30: break
+            if priority > 30: break
+
+        if len(rec_rows) > 1:  # more than just header
+            rec_tbl = Table(rec_rows, colWidths=[7*mm, W*0.15, W*0.38, W*0.38])
+            n_data = len(rec_rows) - 1  # exclude header
+
+            row_styles = [
+                # Header
+                ('BACKGROUND',    (0,0), (-1,0), GP_DARK),
+                ('VALIGN',        (0,0),(-1,-1), 'MIDDLE'),
+                ('LEFTPADDING',   (0,0),(-1,-1), 5),
+                ('RIGHTPADDING',  (0,0),(-1,-1), 5),
+                ('TOPPADDING',    (0,0),(-1,-1), 5),
+                ('BOTTOMPADDING', (0,0),(-1,-1), 5),
+                ('LINEBELOW',     (0,1),(-1,-2), 0.3, colors.HexColor("#E5E7EB")),
+                ('ROWBACKGROUNDS',(0,1),(-1,-1), [WHITE, GP_LIGHT]),
+                # Number badge: red for critical rows, orange for warning
+                ('BACKGROUND', (0,1), (0, n_crit_rows), C_RED),
+            ]
+            if n_crit_rows < n_data:
+                row_styles.append(('BACKGROUND', (0, n_crit_rows+1), (0,-1), GP_ORANGE))
+
+            rec_tbl.setStyle(TableStyle(row_styles))
+            story.append(rec_tbl)
+    # ── Footer ────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width=W, thickness=0.5, color=GP_MID, spaceAfter=4))
+
+    footer_data = [[
+        Paragraph("GroundProbe  ·  groundprobe.com",
+            ps("fl", fontSize=7, textColor=C_LGREY)),
+        Paragraph(f"Proactive DQP Parameters  ·  {site}  ·  {today_short}",
+            ps("fc", fontSize=7, textColor=C_LGREY, alignment=TA_CENTER)),
+        Paragraph("Confidential",
+            ps("fr", fontSize=7, textColor=C_LGREY, alignment=TA_RIGHT)),
+    ]]
+    footer_tbl = Table(footer_data, colWidths=[W*0.33, W*0.34, W*0.33])
+    footer_tbl.setStyle(TableStyle([
+        ('VALIGN',  (0,0),(-1,-1), 'MIDDLE'),
+        ('LEFTPADDING',  (0,0),(-1,-1), 0),
+        ('RIGHTPADDING', (0,0),(-1,-1), 0),
+    ]))
+    story.append(footer_tbl)
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_sidebar(page: str):
+    """Render sidebar header + fleet stats for all non-Audit pages."""
+    with st.sidebar:
+        st.markdown(
+            '<div style="padding:4px 0 10px 0;border-bottom:1px solid #2D4068;margin-bottom:10px">'
+            '<div style="font-size:1.1rem;font-weight:700;color:#F78F1E">🛰️ Fleet DQP</div>'
+            '<div style="font-size:.7rem;color:#7A9BBF;margin-top:2px;letter-spacing:.03em">'
+            'GROUNDPROBE · DATA QUALITY PARAMETERS</div></div>',
+            unsafe_allow_html=True
+        )
+        try:
+            _wb     = get_workbook()
+            _mat    = get_audit_matrix(_wb)
+            _hist   = get_history(_wb)
+            _scored = _hist[_hist["Score Captured"].notna()] if not _hist.empty else pd.DataFrame()
+            _n      = len(_mat)
+            _aud    = int(_scored["Radar Name"].nunique()) if not _scored.empty else 0
+            _cov    = f"{_aud/_n:.0%}" if _n else "0%"
+            _avg    = _scored["Score Captured"].mean() if not _scored.empty else None
+            _avg_s  = f"{_avg:.0%}" if _avg is not None and pd.notna(_avg) else "—"
+            _bus    = int(_mat["BU"].nunique()) if "BU" in _mat.columns else 0
+
+            _grid = (
+                '<div style="font-size:.62rem;color:#7A9BBF;text-transform:uppercase;'
+                'letter-spacing:.06em;margin-bottom:5px">Fleet Status</div>'
+                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:10px">'
+            )
+            for _l, _v in [("Radars", _n), ("BUs", _bus), ("Coverage", _cov), ("Avg Score", _avg_s)]:
+                _grid += (
+                    f'<div style="background:#152236;border-radius:5px;padding:7px 9px">'
+                    f'<div style="font-size:.6rem;color:#7A9BBF">{_l}</div>'
+                    f'<div style="font-size:1rem;font-weight:700;color:#F78F1E">{_v}</div>'
+                    f'</div>'
+                )
+            _grid += '</div>'
+            st.markdown(_grid, unsafe_allow_html=True)
+
+            # Page-specific extras — only what the page itself doesn't already show
+            if "Expir" in page:
+                _now = pd.Timestamp.now()
+                _exp = 0
+                if not _scored.empty:
+                    _exp = int(_scored.groupby("Radar Name")["Audit Date"].max().apply(
+                        lambda d: (_now - pd.to_datetime(d)).days > 180 if pd.notna(d) else False).sum())
+                st.markdown(
+                    f'<div style="font-size:.8rem;line-height:1.9">'
+                    f'🔴 <b style="color:#FF8080">{_exp}</b> expired<br>'
+                    f'⬛ <b style="color:#CDD5E0">{_n - _aud}</b> never audited<br>'
+                    f'🟢 <b style="color:#6BCB77">{_aud - _exp}</b> up to date'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+            elif "History" in page:
+                _tot = len(_hist) if not _hist.empty else 0
+                st.caption(f"📋 {_tot} audit records · {_aud} radars audited")
+            elif "Fleet Management" in page:
+                _no_ra = int((_mat["Remote Access"].isna() | (_mat["Remote Access"].astype(str).str.strip() == "")).sum()) if "Remote Access" in _mat.columns else 0
+                if _no_ra > 0:
+                    st.warning(f"⚠️ {_no_ra} radars missing Remote Access")
+        except Exception:
+            pass
+        st.divider()
+
+st.set_page_config(page_title="Fleet DQP · GroundProbe", page_icon="🛰️", layout="wide", initial_sidebar_state="expanded")
+# Custom favicon injection
+st.markdown("""
+<head>
+<link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAG7UlEQVR4nO2aS2wbxxmA/39md/mUKJKiRMkiRct6MJYjxZKM2ogfstuitwK9GegjbR1bRQtUKNqkCFoUbZK6CNIgNuCmSvNA2jhRmgA9NE6KopfYiG1ZNuRSiiJa1is2SUkwKfFNLndnpgfDhZsY7nEO3u+2cxh882FmZw+Lex49KOABhsgWkI0VQLaAbKwAsgVkYwWQLSAbK4BsAdlYAWQLyMYKIFtANlYA2QKysQLIFpCNFUC2gGysALIFZGMFkC0gGyuAbAHZWAFkC8hGuddgu9ucP9ZXyfc0mA8hcLXeTvDklOPimRX7foWAYXJQEUEgAOcCKEHBBQAIgXcHFQCAdx4ICs4FEkQQQgASFJwimAZH7fEd5bNBm+48ftU3+Ne33kg4XG4HoYSeOfPhzNjLr+67MwfngiiKYmzdGlmqc7sruXzetbi41AUA8M74X1ZOnx5PnPngH3tVVakZhqkRQhjnnCKiYKaZNAw9Y7M7++8boNdnxI7vLXVe3yCVE1dd08ky9Xk1UV6vYBsAgMlBBQAQAlAAUEKAcY707jnuLPLuMX47zn/HuUDCBWgEgXU3sMYbG2yzvq4+uyUUCj/x5C8uO5wO4+lf//LA+fMT07HpmT4AAEVRjOED+64oisJN0ySBpkDJ7/fl4/FrHaG2Le3JZCoHAGAYpnY7GKc2m62i67qDUNqmEXv9/90BTw4Ug/EMXfz5+fp+AAC7Isqf5VHjApSjvaVzPV7WoFHmfG3WXdjfqhcHWnjoVhGzL0y5/HmDeH+/N5c6fsWtuhRR/mFfUfnZxw0dP+4vXm50CIdGuFaoYeU3k/VDIbe5NLqzXPBo3LfVS3o+vAYToXBbUgjhTSST/mhP9yoAgN1hN154/neXXW6XXXAhxl5+1eX1NpQNw6SMMWzwePT9+/bO6npt4AcjjxOPp375xZOnNi5dujw4cuzIR12d21wAAC+ePNWcTKbCn1/vF94BXY2k+aOElgUA+Ma2ytk3v1bIvnJo85ZbFdnBJqNdAIh3rjnTh7srpK/RiDx70Vl1qtz9/d5Syqux9I6A6M7qxN/jNdIBB29mHJRHW/Sh5RzJv7fgLO4P8aGAg6ee2lUgOkPzxFXXhs4EXSuonnA4lAMAeObpX5lHj34vfOoPY2dv3kg07dnzpV2x2EzmzbfG9dj0TF9seqZz4tLkTs4Zmf10rk1RFKFpqu2lsT+JRCKZHjl2xHno4IGLj33nm8Pz1xdKQ0MDD3/3sW/dgNvH8v4B5tI8+fVtekuDja+/v2zf/a/P6IJNEQ6Tg+q3saZ35+36hTXb7pDbDE+saUuLeSVaMaBKEDDiYWvpEquVDKyPek1tIUuXnKooOFXU/rbo6NEZKGsFliMIvLcRI6fjdiW+qfaqBDFVcQQfikb5aiKRGBn50ZbDh78dfHv83QMdW8Orhq7rfxx7ZfjChYld3d1dcc45IQT5wuJSKJlMhYPBJraysrISi830mczg5WJR790erWUymfRcPO549rfPTf39/Q88AP97LO95BJ6ZrCv9dLDMXjqYJ+slXO70iYGPE+onNgrdNhW9q2XaCADw+pxz9sj2ajTqy8eCLhF47pzTF7CLjKYgGX2kcH44xHa+MatNem0szQW4M1US/HKoGs/VyOZ6mUTenlPPPTVU7shUYf5WSbTkUQt0dnaszS8uJytVPXTHJxRur+QKxSwhpPGrXzk0wThHv99XoISISrWqZrM5X3Nzs9rYGPCdPPH8VDgUCo3+5AndNE3/8PCB6q6hIb2uzk1fe/3PXzj/AAB4rz9EWl1suT9gJrw2zmoccSlLXSUDHREP27iepQHGUalxULs8ZrLdI2pT69S7qROPSsHc7jNSXCDWGJDNKnHUOChtbpaLb6otrS6W0YhgKwWliQmg231mIuhiLFGg6mJOaY5Gu9fy+YK2urrmJQiCcUHCba2ZGnXRyU+WhsKhtpWH+3YkioWiSigVdXVu48qVqUikAVPbIuEKEAL/vhrzpjMZDyKK1taWzODO/tLN1TT558SnezjnVAiB9w3gUkVu9JFi3EaBVk1gBASxKaBQBFJlWHMqQgMhEBBQZ1irMjRdKtdUBIUDioqJOgAAQYEKCooAqHNiOCm31TiaAkDYiFARAUsm6gZHZqOC2onQKpVKjVKFaJqqiNtXiXAQxt67RmsX057dAAB+v389EgmnCKK4cTMRzGXWPaO9mRkNdFIzhXC5HDZN1SgAQFXXa8TUzbmsVhlfCQwjCv65q/reO+BB4oH/ErQCyBaQjRVAtoBsrACyBWRjBZAtIBsrgGwB2VgBZAvIxgogW0A2VgDZArKxAsgWkI0VQLaAbKwAsgVkYwWQLSAbK4BsAdn8B9HwG7oXs3PoAAAAAElFTkSuQmCC">
+<link rel="shortcut icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAG7UlEQVR4nO2aS2wbxxmA/39md/mUKJKiRMkiRct6MJYjxZKM2ogfstuitwK9GegjbR1bRQtUKNqkCFoUbZK6CNIgNuCmSvNA2jhRmgA9NE6KopfYiG1ZNuRSiiJa1is2SUkwKfFNLndnpgfDhZsY7nEO3u+2cxh882FmZw+Lex49KOABhsgWkI0VQLaAbKwAsgVkYwWQLSAbK4BsAdlYAWQLyMYKIFtANlYA2QKysQLIFpCNFUC2gGysALIFZGMFkC0gGyuAbAHZWAFkC8hGuddgu9ucP9ZXyfc0mA8hcLXeTvDklOPimRX7foWAYXJQEUEgAOcCKEHBBQAIgXcHFQCAdx4ICs4FEkQQQgASFJwimAZH7fEd5bNBm+48ftU3+Ne33kg4XG4HoYSeOfPhzNjLr+67MwfngiiKYmzdGlmqc7sruXzetbi41AUA8M74X1ZOnx5PnPngH3tVVakZhqkRQhjnnCKiYKaZNAw9Y7M7++8boNdnxI7vLXVe3yCVE1dd08ky9Xk1UV6vYBsAgMlBBQAQAlAAUEKAcY707jnuLPLuMX47zn/HuUDCBWgEgXU3sMYbG2yzvq4+uyUUCj/x5C8uO5wO4+lf//LA+fMT07HpmT4AAEVRjOED+64oisJN0ySBpkDJ7/fl4/FrHaG2Le3JZCoHAGAYpnY7GKc2m62i67qDUNqmEXv9/90BTw4Ug/EMXfz5+fp+AAC7Isqf5VHjApSjvaVzPV7WoFHmfG3WXdjfqhcHWnjoVhGzL0y5/HmDeH+/N5c6fsWtuhRR/mFfUfnZxw0dP+4vXm50CIdGuFaoYeU3k/VDIbe5NLqzXPBo3LfVS3o+vAYToXBbUgjhTSST/mhP9yoAgN1hN154/neXXW6XXXAhxl5+1eX1NpQNw6SMMWzwePT9+/bO6npt4AcjjxOPp375xZOnNi5dujw4cuzIR12d21wAAC+ePNWcTKbCn1/vF94BXY2k+aOElgUA+Ma2ytk3v1bIvnJo85ZbFdnBJqNdAIh3rjnTh7srpK/RiDx70Vl1qtz9/d5Syqux9I6A6M7qxN/jNdIBB29mHJRHW/Sh5RzJv7fgLO4P8aGAg6ee2lUgOkPzxFXXhs4EXSuonnA4lAMAeObpX5lHj34vfOoPY2dv3kg07dnzpV2x2EzmzbfG9dj0TF9seqZz4tLkTs4Zmf10rk1RFKFpqu2lsT+JRCKZHjl2xHno4IGLj33nm8Pz1xdKQ0MDD3/3sW/dgNvH8v4B5tI8+fVtekuDja+/v2zf/a/P6IJNEQ6Tg+q3saZ35+36hTXb7pDbDE+saUuLeSVaMaBKEDDiYWvpEquVDKyPek1tIUuXnKooOFXU/rbo6NEZKGsFliMIvLcRI6fjdiW+qfaqBDFVcQQfikb5aiKRGBn50ZbDh78dfHv83QMdW8Orhq7rfxx7ZfjChYld3d1dcc45IQT5wuJSKJlMhYPBJraysrISi830mczg5WJR790erWUymfRcPO549rfPTf39/Q88AP97LO95BJ6ZrCv9dLDMXjqYJ+slXO70iYGPE+onNgrdNhW9q2XaCADw+pxz9sj2ajTqy8eCLhF47pzTF7CLjKYgGX2kcH44xHa+MatNem0szQW4M1US/HKoGs/VyOZ6mUTenlPPPTVU7shUYf5WSbTkUQt0dnaszS8uJytVPXTHJxRur+QKxSwhpPGrXzk0wThHv99XoISISrWqZrM5X3Nzs9rYGPCdPPH8VDgUCo3+5AndNE3/8PCB6q6hIb2uzk1fe/3PXzj/AAB4rz9EWl1suT9gJrw2zmoccSlLXSUDHREP27iepQHGUalxULs8ZrLdI2pT69S7qROPSsHc7jNSXCDWGJDNKnHUOChtbpaLb6otrS6W0YhgKwWliQmg231mIuhiLFGg6mJOaY5Gu9fy+YK2urrmJQiCcUHCba2ZGnXRyU+WhsKhtpWH+3YkioWiSigVdXVu48qVqUikAVPbIuEKEAL/vhrzpjMZDyKK1taWzODO/tLN1TT558SnezjnVAiB9w3gUkVu9JFi3EaBVk1gBASxKaBQBFJlWHMqQgMhEBBQZ1irMjRdKtdUBIUDioqJOgAAQYEKCooAqHNiOCm31TiaAkDYiFARAUsm6gZHZqOC2onQKpVKjVKFaJqqiNtXiXAQxt67RmsX057dAAB+v389EgmnCKK4cTMRzGXWPaO9mRkNdFIzhXC5HDZN1SgAQFXXa8TUzbmsVhlfCQwjCv65q/reO+BB4oH/ErQCyBaQjRVAtoBsrACyBWRjBZAtIBsrgGwB2VgBZAvIxgogW0A2VgDZArKxAsgWkI0VQLaAbKwAsgVkYwWQLSAbK4BsAdn8B9HwG7oXs3PoAAAAAElFTkSuQmCC">
+</head>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
+  /* ── GroundProbe Brand Theme ── */
+  /* Navy #1B2A4A | Orange #F78F1E | Dark navy #112038 | Light bg #F4F6F9 */
+
+  .block-container{padding-top:1rem;max-width:1400px}
+
+  /* Sidebar — GroundProbe navy */
+  [data-testid="stSidebar"]{background:#1B2A4A!important}
+  [data-testid="stSidebar"] p,
+  [data-testid="stSidebar"] span,
+  [data-testid="stSidebar"] label,
+  [data-testid="stSidebar"] div{color:#E8EDF5!important}
+  [data-testid="stSidebar"] h1,
+  [data-testid="stSidebar"] h2,
+  [data-testid="stSidebar"] h3{color:#F78F1E!important;font-weight:700!important}
+  [data-testid="stSidebar"] hr{border-color:#2D4068!important;opacity:1!important}
+  [data-testid="stSidebar"] [data-baseweb="select"] *{background:#243D63!important;color:#E8EDF5!important;border-color:#3D5585!important}
+  [data-testid="stSidebar"] [data-baseweb="select"] svg{color:#A8BBCF!important;fill:#A8BBCF!important}
+  [data-testid="stSidebar"] input{background:#243D63!important;border-color:#3D5585!important;color:#E8EDF5!important}
+  [data-testid="stSidebar"] input::placeholder{color:#7A9BBF!important}
+  [data-testid="stSidebar"] [data-testid="stExpander"]{background:#152236!important;border:1px solid #2D4068!important}
+  [data-testid="stSidebar"] [data-testid="stExpander"] summary p{color:#E8EDF5!important}
+  [data-testid="stSidebar"] .stMarkdown code{background:#243D63!important;color:#F78F1E!important;border:none!important}
+  [data-testid="stSidebar"] strong{color:#FFFFFF!important}
+  [data-testid="stSidebar"] small, [data-testid="stSidebar"] .stCaption{color:#7A9BBF!important}
+  [data-testid="stSidebar"] [data-testid="stMetricValue"]{color:#FFFFFF!important}
+  [data-testid="stSidebar"] [role="option"]{background:#1B2A4A!important;color:#E8EDF5!important}
+  [data-testid="stSidebar"] [role="option"]:hover{background:#2D4068!important}
+  [data-testid="stSidebar"] [data-testid="stCheckbox"] span{color:#E8EDF5!important}
+  [data-testid="stSidebar"] button{background:#243D63!important;border-color:#3D5585!important;color:#E8EDF5!important}
+  [data-testid="stSidebar"] button:hover{background:#2D4068!important}
+  /* Status indicators stay colored */
+  [data-testid="stSidebar"] .stAlert{background:#243D63!important}
+
+  /* Main area */
+  .main .block-container{background:#F4F6F9}
+
+  /* Page headers — orange accent */
+  h1,h2{color:#1B2A4A!important;font-weight:700!important;border-left:4px solid #F78F1E;padding-left:12px}
+  h3,h4{color:#1B2A4A!important;font-weight:600!important}
+
+  /* Radio buttons */
+  .stRadio>div{flex-direction:row;gap:.4rem;flex-wrap:wrap}
+  .stRadio label{font-size:.82rem!important}
+  div[data-testid="stRadio"]>label{font-weight:600;font-size:.9rem;color:#1B2A4A}
+
+  /* Tab active indicator — orange */
+  .stTabs [data-baseweb="tab-highlight"]{background:#F78F1E!important}
+  .stTabs [data-baseweb="tab"]{font-weight:500;color:#4A5568}
+  .stTabs [aria-selected="true"]{color:#1B2A4A!important;font-weight:700!important}
+
+  /* Primary buttons — GroundProbe orange */
+  .stButton button[kind="primary"]{background:#F78F1E!important;border-color:#F78F1E!important;color:white!important;font-weight:600!important}
+  .stButton button[kind="primary"]:hover{background:#E07A0A!important;border-color:#E07A0A!important}
+
+  /* Metric cards */
+  [data-testid="stMetric"]{background:white;border-radius:8px;padding:12px 16px;border:1px solid #E2E8F0;box-shadow:0 1px 3px rgba(27,42,74,.06)}
+  [data-testid="stMetricLabel"]{color:#64748B!important;font-size:.75rem!important;font-weight:600!important;text-transform:uppercase!important;letter-spacing:.04em!important}
+  [data-testid="stMetricValue"]{color:#1B2A4A!important;font-weight:800!important}
+
+  /* Dataframes */
+  [data-testid="stDataFrame"] thead tr th{background:#1B2A4A!important;color:white!important;font-weight:600!important;font-size:.78rem!important;text-transform:uppercase!important;letter-spacing:.04em!important}
+
+  /* Dividers */
+  hr{border-color:#E2E8F0}
+
+  /* Expanders */
+  [data-testid="stExpander"]{border:1px solid #E2E8F0!important;border-radius:8px!important;background:white!important}
+  [data-testid="stExpander"] summary{font-weight:600;color:#1B2A4A}
+
+  /* Info/warning/success boxes */
+  [data-testid="stAlert"]{border-radius:8px!important}
+
+  /* Custom components */
+  .cat-header{background:#1B2A4A;color:white;padding:5px 14px;border-radius:6px;font-weight:700;font-size:.95rem;margin:1rem 0 .4rem 0}
+  .score-green{background:#00875A;color:white;padding:12px 20px;border-radius:8px;font-size:2rem;font-weight:700;text-align:center}
+  .score-yellow{background:#F78F1E;color:white;padding:12px 20px;border-radius:8px;font-size:2rem;font-weight:700;text-align:center}
+  .score-red{background:#D32F2F;color:white;padding:12px 20px;border-radius:8px;font-size:2rem;font-weight:700;text-align:center}
+  .na-field{opacity:.5;padding:3px 10px;border-radius:4px;font-size:.8rem;display:inline-block;margin:2px 0;border:1px solid currentColor}
+  .albert-banner{border-left:4px solid #F78F1E;background:#FFF8F0;padding:9px 14px;border-radius:4px;margin:6px 0;font-size:.84rem}
+  .hist-entry{font-size:.8rem;opacity:.75;padding:1px 0}
+
+  /* KPI cards with brand colors */
+  .dqp-kpi{border-left:4px solid var(--kpi-color,#F78F1E);border-radius:8px;padding:14px 18px;margin:2px 0;background:white;box-shadow:0 1px 3px rgba(27,42,74,.06)}
+  .dqp-kpi .kpi-label{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--kpi-color,#F78F1E)}
+  .dqp-kpi .kpi-value{font-size:2rem;font-weight:800;line-height:1.1;color:#1B2A4A}
+  .dqp-kpi .kpi-sub{font-size:.78rem;color:#64748B;margin-top:2px}
+
+  /* Page title accent bar */
+  .gp-page-header{border-left:4px solid #F78F1E;padding-left:12px;margin-bottom:4px}
+</style>
+""", unsafe_allow_html=True)
+
+page = st.sidebar.selectbox("", ["🏠 Executive Dashboard", "🛰️ Audit Radar", "📊 History & Trends", "⏰ Expirations", "📄 Client PDF Report", "⚙️ Fleet Management"], label_visibility="collapsed")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 0 — EXECUTIVE DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+if "Executive" in page or "Dashboard" in page:
+    _render_sidebar(page)
+    wb     = get_workbook()
+    df_mat = get_audit_matrix(wb)
+    df_hist = get_history(wb)
+
+    st.markdown('## 🏠 Fleet Executive Dashboard')
+    st.caption(f"GroundProbe · {len(df_mat)} radars · {df_mat['Site'].nunique()} sites · {df_mat['BU'].nunique() if 'BU' in df_mat.columns else '—'} Business Units")
+    st.divider()
+
+    # ── Build last audit — HISTORY_LOG only, scored entries only ──────────────────
+    if not df_hist.empty:
+        _hist_sc = df_hist[df_hist["Score Captured"].notna()].dropna(subset=["Audit Date"])
+        if not _hist_sc.empty:
+            _last = (_hist_sc.sort_values("Audit Date", ascending=False)
+                     .groupby("Radar Name").first().reset_index()
+                     [["Radar Name","Audit Date","Score Captured","Auditor"]])
+        else:
+            _last = pd.DataFrame(columns=["Radar Name","Audit Date","Score Captured","Auditor"])
+    else:
+        _last = pd.DataFrame(columns=["Radar Name","Audit Date","Score Captured","Auditor"])
+
+    _today  = pd.Timestamp.now()
+    _merged = df_mat.copy()
+    _merged = _merged.merge(_last, on="Radar Name", how="left")
+    _merged["Days Since"] = _merged["Audit Date"].apply(
+        lambda d: (_today - pd.to_datetime(d)).days if pd.notna(d) else None)
+
+    def _status(row):
+        ds = row["Days Since"]
+        sc = row.get("Score Captured")
+        if ds is None:             return "⬛ Never Audited"
+        if ds > 180:               return "🔴 Expired"
+        if ds >= 150:              return "⚠️ Expiring Soon"
+        if pd.isna(sc):            return "🟢 Audited"
+        if sc == 1.0:              return "🟢 Good"
+        if sc >= 0.7:              return "⚠️ Needs Attention"
+        return "🔴 Critical"
+
+    _merged["Status"] = _merged.apply(_status, axis=1)
+
+    n_total    = len(_merged)
+    n_audited  = _merged["Audit Date"].notna().sum()
+    n_expired  = (_merged["Days Since"] > 180).sum()
+    n_never    = _merged["Audit Date"].isna().sum()
+    n_expiring = ((_merged["Days Since"] >= 150) & (_merged["Days Since"] <= 180)).sum()
+    coverage   = n_audited / n_total if n_total else 0
+    avg_sc     = _last["Score Captured"].mean() if not _last.empty else None
+
+    # ── Global KPIs ───────────────────────────────────────────────────────────
+    g1,g2,g3,g4,g5,g6 = st.columns(6)
+    g1.metric("Total Radars",    n_total)
+    g2.metric("Fleet Coverage",  f"{coverage:.0%}", help="% radars with at least one audit")
+    g3.metric("Avg Score",       f"{avg_sc:.0%}" if avg_sc and pd.notna(avg_sc) else "—")
+    g4.metric("🔴 Expired",      n_expired,  help=">180 days since last audit")
+    g5.metric("⚠️ Expiring Soon", n_expiring, help="150–180 days")
+    g6.metric("⬛ Never Audited", n_never)
+
+    st.divider()
+
+    # ── BU Breakdown ──────────────────────────────────────────────────────────
+    if "BU" in _merged.columns:
+        st.markdown("#### Business Unit Overview")
+        bu_rows = []
+        for _bu in sorted(_merged["BU"].dropna().unique()):
+            _sub       = _merged[_merged["BU"] == _bu]
+            _n         = len(_sub)
+            _aud       = _sub["Audit Date"].notna().sum()
+            _exp       = (_sub["Days Since"] > 180).sum()
+            _nev       = _sub["Audit Date"].isna().sum()
+            _cov       = _aud / _n if _n else 0
+            _scores    = _sub["Score Captured"].dropna()
+            _avg_bu    = _scores.mean() if len(_scores) else None
+            _crit      = (_scores < 0.7).sum() if len(_scores) else 0
+            _warn      = ((_scores >= 0.7) & (_scores < 1.0)).sum() if len(_scores) else 0
+            _good      = (_scores == 1.0).sum() if len(_scores) else 0
+            bu_rows.append({
+                "BU":            _bu,
+                "Radars":        _n,
+                "Audited":       _aud,
+                "Coverage":      f"{_cov:.0%}",
+                "Avg Score":     f"{_avg_bu:.0%}" if _avg_bu and pd.notna(_avg_bu) else "—",
+                "🟢 Good":        _good,
+                "⚠️ Attention":   _warn,
+                "🔴 Critical":    _crit,
+                "🔴 Expired":     _exp,
+                "⚫ Never":       _nev,
+            })
+        _bu_df = pd.DataFrame(bu_rows)
+        st.dataframe(_bu_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("#### Coverage & Score by BU")
+        _bc1, _bc2 = st.columns(2)
+
+        with _bc1:
+            st.markdown("**Coverage %**")
+            _cov_data = {r["BU"]: int(r["Coverage"].strip("%")) for r in bu_rows}
+            _cov_df   = pd.DataFrame({"BU": list(_cov_data.keys()), "Coverage %": list(_cov_data.values())})
+            st.bar_chart(_cov_df.set_index("BU"), use_container_width=True, height=250)
+
+        with _bc2:
+            st.markdown("**Avg Score %**")
+            _sc_data = {r["BU"]: int(r["Avg Score"].strip("%")) if r["Avg Score"] != "—" else 0 for r in bu_rows}
+            _sc_df   = pd.DataFrame({"BU": list(_sc_data.keys()), "Avg Score %": list(_sc_data.values())})
+            st.bar_chart(_sc_df.set_index("BU"), use_container_width=True, height=250)
+
+    st.divider()
+
+    # ── Radar Health Heatmap by BU ────────────────────────────────────────────
+    st.markdown("#### Radar Status Summary")
+    _s1,_s2,_s3,_s4 = st.columns(4)
+    _s1.metric("🟢 Good / Audited",   (_merged["Status"].isin(["🟢 Good","🟢 Audited"])).sum())
+    _s2.metric("⚠️ Needs Attention",  (_merged["Status"] == "⚠️ Needs Attention").sum())
+    _s3.metric("🔴 Critical",         (_merged["Status"] == "🔴 Critical").sum())
+    _s4.metric("🔴 Expired",          (_merged["Status"] == "🔴 Expired").sum())
+
+    st.divider()
+
+    # ── Top 10 sites needing attention ───────────────────────────────────────
+    st.markdown("#### Sites Needing Attention")
+    _at_risk = _merged[_merged["Status"].isin(["🔴 Critical","🔴 Expired","⚠️ Needs Attention","⚠️ Expiring Soon"])]
+    if _at_risk.empty:
+        st.success("✅ All audited radars are in good standing.")
+    else:
+        _site_risk = (_at_risk.groupby(["Site","BU"] if "BU" in _at_risk.columns else ["Site"])
+                     .size().reset_index(name="At-Risk Radars")
+                     .sort_values("At-Risk Radars", ascending=False)
+                     .head(15))
+        st.dataframe(_site_risk, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.caption(f"Last refreshed: {_today.strftime('%d %b %Y %H:%M')} · Data from Fleet_DQP_Master.xlsx")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — AUDIT
+# ═══════════════════════════════════════════════════════════════════════════════
+elif "Audit" in page:
+    with st.sidebar:
+        st.markdown("""
+        <div style="padding:4px 0 12px 0;border-bottom:1px solid #2D4068;margin-bottom:12px">
+            <div style="font-size:1.1rem;font-weight:700;color:#F78F1E;letter-spacing:.02em">🛰️ Fleet DQP</div>
+            <div style="font-size:.72rem;color:#7A9BBF;margin-top:2px;letter-spacing:.03em">GROUNDPROBE · DATA QUALITY PARAMETERS</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        wb        = get_workbook()
+        df_matrix = get_audit_matrix(wb)
+        radar_list = sorted(df_matrix["Radar Name"].dropna().astype(str).tolist(), key=_natural_key)
+
+        # Build label: "SSR126 · XT", "SSR539 · FX", "SAR407 · SAR-X", "SOM505 · SOM"
+        def radar_label(r):
+            row_data = df_matrix[df_matrix["Radar Name"]==r]
+            t = str(row_data["Type"].values[0]).strip() if len(row_data) > 0 else ""
+            s = str(row_data["Site"].values[0]).strip() if len(row_data) > 0 else ""
+            parts = [r]
+            if t and t != "nan": parts.append(t)
+            if s and s != "nan": parts.append(s)
+            return " · ".join(parts)
+        label_map  = {r: radar_label(r) for r in radar_list}
+        label_to_r = {v: k for k, v in label_map.items()}
+
+        search = st.text_input("🔍 Search radar or site", placeholder="SSR329 / Arcelormittal")
+
+        # BU filter
+        all_bus = sorted(df_matrix["BU"].dropna().unique().tolist())
+        if len(all_bus) > 1:
+            bu_filter = st.selectbox("🌎 Business Unit", ["All"] + all_bus, key="bu_filter")
+        else:
+            bu_filter = "All"
+
+        if search:
+            s = search.upper()
+            filtered = [r for r in radar_list if s in r.upper() or
+                        s in str(df_matrix.loc[df_matrix["Radar Name"]==r,"Site"].values[0]).upper()]
+        else:
+            filtered = radar_list
+
+        if bu_filter != "All":
+            filtered = [r for r in filtered
+                        if df_matrix.loc[df_matrix["Radar Name"]==r,"BU"].values[0] == bu_filter]
+
+        if not filtered:
+            st.warning("No radars found.")
+            st.stop()
+
+        filtered_labels = [label_map[r] for r in filtered]
+        selected_label  = st.selectbox("Select Radar", filtered_labels)
+        selected        = label_to_r[selected_label]
+        radar_row = df_matrix[df_matrix["Radar Name"]==selected].iloc[0]
+        site_val  = str(radar_row.get("Site",""))
+        type_val  = str(radar_row.get("Type","")).upper()
+        pa_stl    = str(radar_row.get("PA","N/A") or "N/A").strip()
+        dim_label = "3D · XT" if is_3d(type_val) else "2D · FX/SOM/SAR"
+
+        st.divider()
+        bu_val = str(radar_row.get("BU","") or "")
+        # Load history early — needed for the Never Audited badge
+        df_hist = get_history(wb)
+        _rname_check = str(radar_row.get("Radar Name",""))
+        _has_audit   = (not df_hist.empty and _rname_check in df_hist["Radar Name"].values)
+        if not _has_audit:
+            st.markdown(
+                '<div style="background:#F78F1E;color:#fff;border-radius:6px;'
+                'padding:3px 10px;font-size:.75rem;font-weight:700;letter-spacing:.03em;'
+                'display:inline-block;margin-bottom:4px">⬛ NEVER AUDITED</div>',
+                unsafe_allow_html=True)
+        st.markdown(f"**📍 Site:** {site_val}")
+        if bu_val and bu_val != "Other":
+            st.markdown(f"**🌎 BU:** `{bu_val}`")
+        st.markdown(f"**📡 Type:** `{type_val}` — {dim_label}")
+
+        # Remote Access badge
+        remote = str(radar_row.get("Remote Access","") or "").strip()
+        if remote == "Customer":
+            st.markdown(f"**📞 Access:** 🟡 `Customer` — Teams call required")
+        elif remote:
+            st.markdown(f"**🌐 Access:** 🟢 `{remote}`")
+
+        # ── Real audit stats from HISTORY_LOG (already loaded above) ───────────
+        radar_hist = df_hist[df_hist["Radar Name"]==selected].sort_values("Audit Date", ascending=False)
+
+        real_total = len(radar_hist)
+        if not radar_hist.empty and pd.notna(radar_hist.iloc[0]["Audit Date"]):
+            real_last = pd.to_datetime(radar_hist.iloc[0]["Audit Date"])
+            days_ago  = (datetime.now() - real_last).days
+            icon      = "🟢" if days_ago <= 180 else "🔴"
+            st.markdown(f"**{icon} Last Audit:** {real_last.strftime('%d %b %Y')} ({days_ago}d ago)")
+            if days_ago > 180:
+                st.markdown("**⚠️ EXPIRED** — audit overdue (>180 days)")
+        else:
+            st.markdown("**⚪ Last Audit:** Never audited")
+
+        st.markdown(f"**📊 Total Audits:** {real_total}")
+
+        if not radar_hist.empty:
+            st.divider()
+            st.markdown("**📋 Audit History**")
+            for _, h in radar_hist.head(5).iterrows():
+                d  = h["Audit Date"].strftime("%d/%m/%y") if pd.notna(h["Audit Date"]) else "?"
+                sc = f"{h['Score Captured']:.0%}" if pd.notna(h["Score Captured"]) else "?"
+                au = h.get("Auditor","?") or "?"
+                icon = "🟢" if h["Score Captured"]==1 else ("⚠️" if (h["Score Captured"] or 0)>=0.7 else "🔴") if pd.notna(h["Score Captured"]) else "⚪"
+                st.markdown(f"<div class='hist-entry'>{icon} {d} · {au} · {sc}</div>", unsafe_allow_html=True)
+
+        st.divider()
+        st.caption("🟢 Connected · GroundProbe Advisory Services")
+
+
+    # ── Main ──────────────────────────────────────────────────────────────────
+    st.markdown(f"## 🛰️ `{selected}` — {site_val}")
+    st.caption(f"Type: **{type_val}** · {dim_label}")
+
+    # Pre-fill info banner — based on real HISTORY_LOG (load early, used for auditor dropdown too)
+    df_hist_pf    = get_history(wb)
+    radar_hist_pf = df_hist_pf[df_hist_pf["Radar Name"]==selected].sort_values("Audit Date", ascending=False)
+
+    c1, c2 = st.columns(2)
+    # Suggest known auditors from history
+    _known_auditors = []
+    if not df_hist_pf.empty:
+        _known_auditors = sorted(df_hist_pf["Auditor"].dropna().unique().tolist())
+    with c1:
+        if _known_auditors:
+            _aud_opts = [""] + _known_auditors + ["Other (type below)"]
+            _aud_sel  = st.selectbox("👤 Auditor", _aud_opts,
+                                      format_func=lambda x: "Select auditor..." if x == "" else x)
+            if _aud_sel == "Other (type below)" or _aud_sel == "":
+                auditor_input = st.text_input("Type auditor name", placeholder="Your name")
+            else:
+                auditor_input = _aud_sel
+        else:
+            auditor_input = st.text_input("👤 Auditor", placeholder="Your name")
+    with c2:
+        audit_date_input = st.date_input("📅 Date", value=date.today())
+    notes_input = st.text_area("📝 Notes / Observations", placeholder="Optional — describe any field conditions, access issues, or context for this audit...", height=80)
+
+    # Pre-fill banner
+    has_prev = not radar_hist_pf.empty
+    if has_prev:
+        prev_date  = radar_hist_pf.iloc[0]["Audit Date"]
+        prev_score = radar_hist_pf.iloc[0]["Score Captured"]
+        days_ago   = (datetime.now() - pd.to_datetime(prev_date)).days if pd.notna(prev_date) else None
+        days_str   = f"{days_ago}d ago" if days_ago is not None else "?"
+        score_str  = f"{prev_score:.0%}" if pd.notna(prev_score) else "?"
+        date_str   = prev_date.strftime('%d %b %Y') if pd.notna(prev_date) else "?"
+        st.info(f"📋 **Pre-filled from last audit** ({date_str}, {days_str}, score {score_str}). Change only what's different.")
+    else:
+        st.info("⚪ **First audit for this radar** — all fields start at default. Fill in what you see.")
+
+    st.divider()
+
+    answers     = {}
+    current_cat = None
+    for key in DQP_MASTER:
+        cat   = key.split("|")[0].strip()
+        param = key.split("|")[1].strip() if "|" in key else key
+        opts  = get_options(key, type_val, pa_stl)
+
+        if cat != current_cat:
+            current_cat = cat
+            st.markdown(f"<div class='cat-header'>📂 {cat}</div>", unsafe_allow_html=True)
+
+        if len(opts)==1 and "⚪" in opts[0]:
+            st.markdown(f"<span class='na-field'>⚪ {param}</span>", unsafe_allow_html=True)
+            answers[key] = opts[0]
+            continue
+
+        # Try long key first, then short name (AUDIT MATRIX uses short column names)
+        short_key = key.split("|")[-1].strip() if "|" in key else key
+        if key in radar_row.index and str(radar_row[key]) not in ["", "nan", "None"]:
+            existing = str(radar_row[key])
+        elif short_key in radar_row.index and str(radar_row[short_key]) not in ["", "nan", "None"]:
+            existing = str(radar_row[short_key])
+        else:
+            existing = ""
+        # Pre-fill: use value from AUDIT MATRIX (which already has last audit data)
+        default_idx = opts.index(existing) if existing in opts else 0
+        is_mand     = (not is_3d(type_val)) and (key in PA_DTM_MANDATORY_2D)
+        label       = f"**{param}**" + (" 🔒" if is_mand else "")
+
+        answers[key] = st.radio(label, options=opts, index=default_idx, key=f"chk_{key}", horizontal=True)
+
+    st.divider()
+
+    pmp_answers = {}  # kept for save_audit signature compatibility
+    score_live, issues_live, actions_live = compute_score(answers, type_val, pa_stl)
+    s1, s2, s3 = st.columns([1,1,2])
+    with s1:
+        css = "score-green" if score_live==1.0 else ("score-yellow" if score_live>=0.7 else "score-red")
+        st.markdown(f"<div class='{css}'>🩺 {score_live:.0%}</div>", unsafe_allow_html=True)
+    with s2:
+        st.metric("🔴 Critical", sum(1 for v in answers.values() if "🔴" in str(v)))
+        st.metric("⚠️ Warnings", sum(1 for v in answers.values() if "⚠️" in str(v)))
+    with s3:
+        if issues_live:
+            st.markdown("**Issues & Recommended Actions:**")
+            for iss, act in zip(issues_live, actions_live):
+                st.markdown(f"- **{iss}:** _{act}_")
+        else:
+            st.success("✅ All checks passed")
+
+    st.divider()
+
+    if not auditor_input.strip():
+        st.warning("⚠️ Enter your name before saving.")
+    else:
+        # Correction mode toggle
+        is_correction = st.checkbox(
+            "✏️ This is a correction to the last audit — do not count as a new audit",
+            value=False,
+            help="Check this if you made a mistake and want to overwrite the last audit without adding a new entry to the history."
+        )
+        if is_correction:
+            st.info("ℹ️ Correction mode — this will overwrite the last audit entry for this radar. Total audit count will not change.")
+
+        btn_label = "✏️ Save Correction" if is_correction else "💾 Save Audit to Excel"
+        if st.button(btn_label, type="primary", use_container_width=True):
+            with st.spinner("Writing to Excel..."):
+                ok, msg = save_audit(selected, site_val, type_val, auditor_input.strip(),
+                                     audit_date_input, answers, score_live, issues_live, actions_live,
+                                     notes=notes_input.strip(), pmp_answers=pmp_answers,
+                                     is_correction=is_correction)
+            if ok:
+                verb = "Correction saved" if is_correction else "Saved"
+                st.success(f"✅ {verb}! **{selected}** · Score: **{score_live:.0%}** · {audit_date_input.strftime('%d %b %Y')} · {auditor_input}")
+                if not is_correction:
+                    st.balloons()
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error(f"❌ {msg}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — HISTORY & TRENDS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif "History" in page:
+    _render_sidebar(page)
+
+    wb      = get_workbook()
+    df_hist = get_history(wb)
+    df_mat  = get_audit_matrix(wb)
+
+    if df_hist.empty:
+        st.markdown("## 📊 Fleet Analytics")
+        st.info("📭 No audit history yet. Complete your first audit to see analytics here.")
+        st.stop()
+
+    df_hist = df_hist.dropna(subset=["Audit Date"])
+    fleet_size    = len(df_mat)
+    unique_radars = df_hist["Radar Name"].nunique()
+    avg_score     = df_hist["Score Captured"].mean()
+    n_perfect     = (df_hist["Score Captured"] == 1.0).sum()
+    n_warn        = ((df_hist["Score Captured"] >= 0.7) & (df_hist["Score Captured"] < 1.0)).sum()
+    n_crit        = (df_hist["Score Captured"] < 0.7).sum()
+    coverage_pct  = unique_radars / fleet_size if fleet_size else 0
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown('## 📊 Fleet Analytics')
+    st.caption(f"Based on {len(df_hist)} audits across {unique_radars} radars · {fleet_size - unique_radars} not yet audited")
+    st.divider()
+
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    def kpi_card(label, value, sub, color):
+        st.markdown(f"""
+        <div class="dqp-kpi" style="--kpi-color:{color}">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-sub">{sub}</div>
+        </div>""", unsafe_allow_html=True)
+
+    k1,k2,k3,k4,k5 = st.columns(5)
+    with k1: kpi_card("Fleet Coverage",   f"{coverage_pct:.0%}",
+                       f"{unique_radars} of {fleet_size} radars", "#F78F1E")
+    with k2: kpi_card("Avg Score",        f"{avg_score:.0%}" if pd.notna(avg_score) else "—",
+                       f"{len(df_hist)} total audits", "#3B82F6")
+    with k3: kpi_card("🟢 Good",          str(int(n_perfect)),
+                       "100% score audits", "#00B050")
+    with k4: kpi_card("⚠️ Needs Attention",str(int(n_warn)),
+                       "70–99% score audits", "#F59E0B")
+    with k5: kpi_card("🔴 Critical",      str(int(n_crit)),
+                       "<70% score audits", "#DC2626")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Internal tabs ─────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Trends", "🌎 BU Comparison", "🏆 Site Ranking", "🛰️ Radar Performance", "📋 Audit Log"])
+
+    # ── TAB 1: TRENDS ─────────────────────────────────────────────────────────
+    with tab1:
+        df_hist["Month"] = df_hist["Audit Date"].dt.to_period("M").dt.to_timestamp()
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("#### Score Trend Over Time")
+            score_trend = df_hist.groupby("Month")["Score Captured"].mean().reset_index()
+            score_trend["Score Captured"] = (score_trend["Score Captured"] * 100).round(1)
+            st.line_chart(score_trend.set_index("Month")["Score Captured"],
+                          color="#F78F1E", use_container_width=True)
+            st.caption("Average score per month across all audits")
+
+        with col_b:
+            st.markdown("#### Audit Activity")
+            monthly = df_hist.groupby("Month").size().reset_index(name="Audits")
+            st.bar_chart(monthly.set_index("Month")["Audits"],
+                         color="#393B41", use_container_width=True)
+            st.caption("Number of audits completed per month")
+
+        st.markdown("#### Score Distribution")
+        dist_cols = st.columns(3)
+        total_aud = len(df_hist)
+        with dist_cols[0]:
+            pct = n_perfect/total_aud if total_aud else 0
+            st.markdown(f"""
+            <div style="background:#F0FDF4;border-radius:10px;padding:20px;text-align:center">
+                <div style="font-size:2.5rem;font-weight:800;color:#00B050">{pct:.0%}</div>
+                <div style="font-size:.9rem;font-weight:600;color:#166534">🟢 Perfect (100%)</div>
+                <div style="font-size:.8rem;color:#6B7280">{int(n_perfect)} audits</div>
+            </div>""", unsafe_allow_html=True)
+        with dist_cols[1]:
+            pct = n_warn/total_aud if total_aud else 0
+            st.markdown(f"""
+            <div style="background:#FFFBEB;border-radius:10px;padding:20px;text-align:center">
+                <div style="font-size:2.5rem;font-weight:800;color:#D97706">{pct:.0%}</div>
+                <div style="font-size:.9rem;font-weight:600;color:#92400E">⚠️ Needs Attention</div>
+                <div style="font-size:.8rem;color:#6B7280">{int(n_warn)} audits</div>
+            </div>""", unsafe_allow_html=True)
+        with dist_cols[2]:
+            pct = n_crit/total_aud if total_aud else 0
+            st.markdown(f"""
+            <div style="background:#FEF2F2;border-radius:10px;padding:20px;text-align:center">
+                <div style="font-size:2.5rem;font-weight:800;color:#DC2626">{pct:.0%}</div>
+                <div style="font-size:.9rem;font-weight:600;color:#991B1B">🔴 Critical</div>
+                <div style="font-size:.8rem;color:#6B7280">{int(n_crit)} audits</div>
+            </div>""", unsafe_allow_html=True)
+
+        # Auditor breakdown
+        st.markdown("<br>#### Audits by Auditor", unsafe_allow_html=True)
+        by_aud = df_hist.groupby("Auditor").agg(
+            Audits=("Score Captured","count"),
+            Avg_Score=("Score Captured","mean")
+        ).reset_index().sort_values("Audits", ascending=False)
+        by_aud["Avg Score"] = by_aud["Avg_Score"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+        st.dataframe(
+            by_aud[["Auditor","Audits","Avg Score"]],
+            use_container_width=True, hide_index=True
+        )
+
+        # ── Top failing checkpoints ────────────────────────────────────────
+        st.markdown("<br>#### 🔍 Most Common Issues Across Fleet", unsafe_allow_html=True)
+        st.caption("Checkpoints most frequently marked 🔴 Critical or ⚠️ Needs Attention across all audits")
+
+        wb_top   = get_workbook()
+        df_top   = get_audit_matrix(wb_top)
+        META_TOP = {"Radar Name","Site","Type","Remote Access","Last Audit","Total Audits",
+                    "Auditor","SCORE","ISSUES DETECTED","RECOMMENDED ACTION",
+                    "HELPER_SCORE","HELPER_DATE","HELPER_STATUS","PA","BU"}
+        dqp_top  = [c for c in df_top.columns if c not in META_TOP and c and not str(c).startswith("_")]
+
+        fail_counts = {}
+        warn_counts = {}
+        for c in dqp_top:
+            fail_counts[c] = df_top[c].apply(lambda v: "🔴" in str(v)).sum()
+            warn_counts[c] = df_top[c].apply(lambda v: "⚠️" in str(v)).sum()
+
+        # Combine and sort
+        all_issues = {c: fail_counts[c] + warn_counts[c] for c in dqp_top if fail_counts[c] + warn_counts[c] > 0}
+        top10 = sorted(all_issues.items(), key=lambda x: -x[1])[:10]
+
+        if not top10:
+            st.info("No issues found yet — audit some radars first.")
+        else:
+            max_count = top10[0][1]
+            for rank, (checkpoint, total) in enumerate(top10):
+                crits = fail_counts[checkpoint]
+                warns = warn_counts[checkpoint]
+                bar_pct = int(total / max_count * 100)
+                crit_pct = int(crits / total * 100) if total > 0 else 0
+                warn_pct = 100 - crit_pct
+                color = "#DC2626" if crits > warns else "#D97706"
+
+                st.markdown(f"""
+                <div style="margin:6px 0;padding:10px 14px;background:#F9FAFB;
+                            border-radius:8px;border-left:4px solid {color}">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                        <span style="font-weight:700;color:#1F2937;font-size:.9rem">
+                            {rank+1}. {checkpoint}
+                        </span>
+                        <span style="font-size:.8rem;color:#6B7280">
+                            🔴 {crits} critical &nbsp;·&nbsp; ⚠️ {warns} attention &nbsp;·&nbsp;
+                            <b style="color:{color}">{total} total</b>
+                        </span>
+                    </div>
+                    <div style="background:#E5E7EB;border-radius:4px;height:6px">
+                        <div style="background:{color};width:{bar_pct}%;height:6px;border-radius:4px"></div>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+    # ── TAB: BU COMPARISON ───────────────────────────────────────────────────
+    with tab2:
+        st.markdown("#### BU Performance Comparison")
+        if "BU" not in df_mat.columns:
+            st.info("BU data not available.")
+        else:
+            _bu_hist = df_mat[["Radar Name","BU"]].merge(
+                df_hist[["Radar Name","Audit Date","Score Captured"]],
+                on="Radar Name", how="left"
+            )
+            _bu_summary = []
+            for _bu in sorted(df_mat["BU"].dropna().unique()):
+                _sub_mat  = df_mat[df_mat["BU"] == _bu]
+                _sub_hist = _bu_hist[_bu_hist["BU"] == _bu].dropna(subset=["Audit Date"])
+                _n_radars = len(_sub_mat)
+                _n_aud    = _sub_mat["Last Audit"].notna().sum()
+                _cov      = _n_aud / _n_radars if _n_radars else 0
+                _scores   = _sub_hist["Score Captured"].dropna()
+                _avg      = _scores.mean() if len(_scores) else None
+                _n_crit   = (_scores < 0.7).sum() if len(_scores) else 0
+                _n_warn   = ((_scores >= 0.7) & (_scores < 1.0)).sum() if len(_scores) else 0
+                _n_good   = (_scores == 1.0).sum() if len(_scores) else 0
+                _bu_summary.append({
+                    "BU": _bu, "Radars": _n_radars,
+                    "Audited": _n_aud, "Coverage": _cov,
+                    "Avg Score": _avg, "Total Audits": len(_sub_hist),
+                    "Good": _n_good, "Attention": _n_warn, "Critical": _n_crit
+                })
+            _bu_df = pd.DataFrame(_bu_summary)
+            _cc1, _cc2 = st.columns(2)
+            with _cc1:
+                st.markdown("**Fleet Coverage by BU**")
+                _cov_chart = _bu_df[["BU","Coverage"]].copy()
+                _cov_chart["Coverage %"] = (_cov_chart["Coverage"] * 100).round(0)
+                st.bar_chart(_cov_chart.set_index("BU")["Coverage %"], use_container_width=True, height=220)
+            with _cc2:
+                st.markdown("**Avg Score by BU**")
+                _sc_chart = _bu_df[["BU","Avg Score"]].copy()
+                _sc_chart["Avg Score %"] = (_sc_chart["Avg Score"] * 100).round(0).fillna(0)
+                st.bar_chart(_sc_chart.set_index("BU")["Avg Score %"], use_container_width=True, height=220)
+            st.divider()
+            _disp = _bu_df.copy()
+            _disp["Coverage"]  = _disp["Coverage"].apply(lambda x: f"{x:.0%}")
+            _disp["Avg Score"] = _disp["Avg Score"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+            _disp_cols = ["BU","Radars","Audited","Coverage","Avg Score","Total Audits","Good","Attention","Critical"]
+            st.dataframe(_disp[[c for c in _disp_cols if c in _disp.columns]], use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.markdown("#### Site Performance Ranking")
+        st.caption("Ranked by average score across all audits. Sites with more audits are more reliable.")
+
+        # Build site stats
+        site_stats = df_hist.groupby("Site").agg(
+            Audits=("Score Captured","count"),
+            Avg=("Score Captured","mean"),
+            Last=("Audit Date","max"),
+            Radars=("Radar Name","nunique"),
+        ).reset_index().sort_values("Avg", ascending=False)
+
+        # Render as visual cards
+        for i, (_, row) in enumerate(site_stats.iterrows()):
+            avg    = row["Avg"]
+            medal  = ["🥇","🥈","🥉"][i] if i < 3 else f"{i+1}."
+            color  = "#00B050" if avg==1.0 else ("#F59E0B" if avg>=0.7 else "#DC2626")
+            bg     = "#F0FDF4" if avg==1.0 else ("#FFFBEB" if avg>=0.7 else "#FEF2F2")
+            bar_w  = int(avg * 100)
+            last_d = pd.to_datetime(row["Last"]).strftime("%d %b %Y") if pd.notna(row["Last"]) else "—"
+            n_fleet= len(df_mat[df_mat["Site"]==row["Site"]]) if not df_mat.empty else "?"
+
+            st.markdown(f"""
+            <div style="background:{bg};border-radius:10px;padding:14px 18px;margin:6px 0;
+                        border-left:5px solid {color}">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <div>
+                        <span style="font-size:1.1rem;font-weight:800;color:#1F2937">
+                            {medal} {row['Site']}
+                        </span>
+                        <span style="font-size:.8rem;color:#6B7280;margin-left:10px">
+                            {row['Audits']} audits · {row['Radars']}/{n_fleet} radars · Last: {last_d}
+                        </span>
+                    </div>
+                    <div style="font-size:1.6rem;font-weight:800;color:{color}">{avg:.0%}</div>
+                </div>
+                <div style="background:#E5E7EB;border-radius:4px;height:6px;margin-top:8px">
+                    <div style="background:{color};width:{bar_w}%;height:6px;border-radius:4px"></div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+    # ── TAB 4: RADAR PERFORMANCE ──────────────────────────────────────────────
+    with tab4:
+        st.markdown("#### Fleet Status & Radar Performance")
+
+        # ── Fleet status table ─────────────────────────────────────────────
+        # Get last audit per radar from history
+        if not df_hist.empty:
+            last_by_radar = (
+                df_hist.sort_values("Audit Date", ascending=False)
+                .groupby("Radar Name").first()
+                .reset_index()[["Radar Name","Audit Date","Score Captured","Auditor","Site"]]
+            )
+        else:
+            last_by_radar = pd.DataFrame(columns=["Radar Name","Audit Date","Score Captured","Auditor","Site"])
+
+        # Merge with full fleet
+        fleet = df_mat[["Radar Name","Site","Type","Remote Access"]].copy()
+        fleet = fleet.merge(last_by_radar[["Radar Name","Audit Date","Score Captured","Auditor"]],
+                            on="Radar Name", how="left")
+
+        def fleet_status(sc):
+            if pd.isna(sc): return "⚫ Not Audited"
+            if sc == 1.0:   return "🟢 Good"
+            if sc >= 0.7:   return "⚠️ Needs Attention"
+            return "🔴 Critical"
+
+        fleet["Status"] = fleet["Score Captured"].apply(fleet_status)
+        fleet["Score"]  = fleet["Score Captured"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+        fleet["Days Since"] = fleet["Audit Date"].apply(
+            lambda d: (pd.Timestamp.now() - pd.to_datetime(d)).days if pd.notna(d) else None
+        )
+
+        # ── Filters ────────────────────────────────────────────────────────
+        fa_col, fb_col, fc_col, fd_col = st.columns(4)
+        search_r = fa_col.text_input("🔍 Search radar or site", placeholder="SSR126 / Arcelormittal")
+        filter_s = fb_col.selectbox("Status",
+            ["All", "🟢 Good", "⚠️ Needs Attention", "🔴 Critical", "⚫ Not Audited"])
+        filter_t = fc_col.selectbox("Type",
+            ["All"] + sorted(fleet["Type"].dropna().unique().tolist()))
+        _bu_opts = ["All"] + sorted(fleet["BU"].dropna().unique().tolist()) if "BU" in fleet.columns else ["All"]
+        filter_bu = fd_col.selectbox("🌎 BU", _bu_opts)
+
+        # Apply filters
+        df_fleet = fleet.copy()
+        if search_r:
+            s = search_r.upper()
+            df_fleet = df_fleet[
+                df_fleet["Radar Name"].str.upper().str.contains(s) |
+                df_fleet["Site"].str.upper().str.contains(s)
+            ]
+        if filter_s != "All":
+            df_fleet = df_fleet[df_fleet["Status"] == filter_s]
+        if filter_t != "All":
+            df_fleet = df_fleet[df_fleet["Type"] == filter_t]
+        if filter_bu != "All" and "BU" in df_fleet.columns:
+            df_fleet = df_fleet[df_fleet["BU"] == filter_bu]
+
+        # Sort: Critical first, then Needs Attention, then Not Audited, then Good
+        order = {"🔴 Critical": 0, "⚠️ Needs Attention": 1, "⚫ Not Audited": 2, "🟢 Good": 3}
+        df_fleet["_sort"] = df_fleet["Status"].map(order)
+        df_fleet = df_fleet.sort_values(["_sort","Score Captured"], ascending=[True, True])
+
+        # ── Mini KPI strip ─────────────────────────────────────────────────
+        n_good_f  = (fleet["Status"] == "🟢 Good").sum()
+        n_warn_f  = (fleet["Status"] == "⚠️ Needs Attention").sum()
+        n_crit_f  = (fleet["Status"] == "🔴 Critical").sum()
+        n_na_f    = (fleet["Status"] == "⚫ Not Audited").sum()
+
+        strip = st.columns(4)
+        for col, label, val, clr, bg in [
+            (strip[0], "🟢 Good",           n_good_f, "#00B050", "#F0FDF4"),
+            (strip[1], "⚠️ Needs Attention", n_warn_f, "#D97706", "#FFFBEB"),
+            (strip[2], "🔴 Critical",        n_crit_f, "#DC2626", "#FEF2F2"),
+            (strip[3], "⚫ Not Audited",     n_na_f,   "#6B7280", "#F9FAFB"),
+        ]:
+            col.markdown(f"""
+            <div style="background:{bg};border-radius:8px;padding:10px 14px;text-align:center;
+                        border:1px solid {clr}30">
+                <div style="font-size:.75rem;font-weight:700;color:{clr}">{label}</div>
+                <div style="font-size:1.8rem;font-weight:800;color:{clr};line-height:1.1">{val}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Fleet table ────────────────────────────────────────────────────
+        display_cols = {
+            "Radar Name": "Radar",
+            "Site":       "Site",
+            "Type":       "Type",
+            "Status":     "Status",
+            "Score":      "Score",
+            "Days Since": "Days Since Audit",
+            "Auditor":    "Last Auditor",
+        }
+        df_display = df_fleet[list(display_cols.keys())].rename(columns=display_cols)
+        df_display["Days Since Audit"] = df_display["Days Since Audit"].apply(
+            lambda x: f"{int(x)}d ago" if pd.notna(x) and x == x else "Never"
+        )
+
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Status": st.column_config.TextColumn("Status", width="medium"),
+                "Score":  st.column_config.TextColumn("Score",  width="small"),
+                "Days Since Audit": st.column_config.TextColumn("Days Since Audit", width="medium"),
+            }
+        )
+        st.caption(f"Showing {len(df_fleet)} of {len(fleet)} radars")
+
+        # ── Export fleet to Excel ──────────────────────────────────────────
+        def build_fleet_export(fleet_df, df_hist_full):
+            """Build a clean Excel export of all radars with their latest audit data."""
+            import io as _io
+            output = _io.BytesIO()
+
+            # Get last audit per radar
+            if not df_hist_full.empty:
+                last = (
+                    df_hist_full.sort_values("Audit Date", ascending=False)
+                    .groupby("Radar Name").first()
+                    .reset_index()[["Radar Name","Audit Date","Score Captured","Auditor"]]
+                )
+                export = fleet_df.merge(last, on="Radar Name", how="left")
+
+            # Ensure Score Captured column always exists
+            if "Score Captured" not in export.columns:
+                export["Score Captured"] = None
+            if "Audit Date" not in export.columns:
+                export["Audit Date"] = None
+            if "Auditor" not in export.columns:
+                export["Auditor"] = None
+            else:
+                export = fleet_df.copy()
+                export["Audit Date"] = None
+                export["Score Captured"] = None
+                export["Auditor"] = None
+
+            # Format columns
+            export["Score"] = export["Score Captured"].apply(
+                lambda x: f"{x:.0%}" if pd.notna(x) else "Not Audited"
+            )
+            export["Status"] = export["Score Captured"].apply(
+                lambda x: "Good" if x==1.0 else ("Needs Attention" if x>=0.7 else "Critical") if pd.notna(x) else "Not Audited"
+            )
+            export["Days Since Audit"] = export["Audit Date"].apply(
+                lambda d: int((pd.Timestamp.now()-pd.to_datetime(d)).days) if pd.notna(d) else None
+            )
+            export["Last Audit Date"] = export["Audit Date"].apply(
+                lambda d: pd.to_datetime(d).strftime("%d %b %Y") if pd.notna(d) else "Never"
+            )
+
+            cols = ["Radar Name","Site","BU","Type","Remote Access","Status","Score",
+                    "Last Audit Date","Days Since Audit","Auditor"]
+            export = export[[c for c in cols if c in export.columns]]
+
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                export.to_excel(writer, sheet_name="Fleet DQP Status", index=False)
+                wb_x = writer.book
+                ws_x = writer.sheets["Fleet DQP Status"]
+
+                # Formats
+                hdr_fmt = wb_x.add_format({
+                    "bold": True, "bg_color": "#393B41", "font_color": "#FFFFFF",
+                    "border": 1, "align": "center"
+                })
+                green_fmt  = wb_x.add_format({"bg_color": "#C6EFCE", "font_color": "#276221"})
+                yellow_fmt = wb_x.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500"})
+                red_fmt    = wb_x.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
+                grey_fmt   = wb_x.add_format({"bg_color": "#F2F2F2", "font_color": "#666666"})
+
+                # Header row
+                for col_num, col_name in enumerate(export.columns):
+                    ws_x.write(0, col_num, col_name, hdr_fmt)
+
+                # Column widths
+                widths = [12, 20, 8, 14, 16, 8, 16, 16, 16]
+                for i, w in enumerate(widths[:len(export.columns)]):
+                    ws_x.set_column(i, i, w)
+
+                # Color status column
+                status_col = list(export.columns).index("Status") if "Status" in export.columns else None
+                if status_col is not None:
+                    for row_num, status in enumerate(export["Status"], 1):
+                        fmt = (green_fmt  if status == "Good" else
+                               yellow_fmt if status == "Needs Attention" else
+                               red_fmt    if status == "Critical" else grey_fmt)
+                        ws_x.write(row_num, status_col, status, fmt)
+
+            return output.getvalue()
+
+        col_exp1, col_exp2 = st.columns([3, 1])
+        with col_exp2:
+            export_bytes = build_fleet_export(fleet, df_hist)
+            st.download_button(
+                label="⬇️ Export to Excel",
+                data=export_bytes,
+                file_name=f"Fleet_DQP_Status_{date.today().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        st.divider()
+        st.markdown("#### 🔎 Radar Audit History")
+        st.caption("Select a radar to see its full audit history and score evolution")
+
+        all_radars = sorted(df_mat["Radar Name"].dropna().tolist())
+        radar_labels = []
+        for r in all_radars:
+            t = df_mat.loc[df_mat["Radar Name"]==r, "Type"].values
+            t = str(t[0]) if len(t) > 0 else ""
+            radar_labels.append(f"{r} · {t}" if t else r)
+
+        label_to_name = {lbl: name for lbl, name in zip(radar_labels, all_radars)}
+
+        sel_label = st.selectbox("Select Radar", radar_labels, key="history_radar_sel")
+        sel_radar = label_to_name[sel_label]
+        radar_info = df_mat[df_mat["Radar Name"] == sel_radar].iloc[0] if not df_mat.empty else None
+
+        radar_audits = df_hist[df_hist["Radar Name"] == sel_radar].sort_values("Audit Date")
+
+        if radar_info is not None:
+            ri1, ri2, ri3 = st.columns(3)
+            ri1.markdown(f"**Site:** {radar_info.get('Site','—')}")
+            ri2.markdown(f"**Type:** `{radar_info.get('Type','—')}`")
+            ri3.markdown(f"**Access:** {radar_info.get('Remote Access','—')}")
+
+        if radar_audits.empty:
+            st.info(f"⚪ No audits recorded for {sel_radar} yet.")
+        else:
+            # Score trend for this radar
+            n_aud = len(radar_audits)
+            last_sc = radar_audits.iloc[-1]["Score Captured"]
+            last_dt = radar_audits.iloc[-1]["Audit Date"]
+            avg_sc  = radar_audits["Score Captured"].mean()
+
+            m1, m2, m3 = st.columns(3)
+            sc_color = "#00B050" if last_sc==1.0 else ("#D97706" if last_sc>=0.7 else "#DC2626") if pd.notna(last_sc) else "#6B7280"
+            m1.markdown(f"""<div style="background:#F5F6F8;border-radius:8px;padding:12px 16px;
+                text-align:center;border-left:4px solid {sc_color}">
+                <div style="font-size:.75rem;font-weight:700;color:{sc_color};text-transform:uppercase">Latest Score</div>
+                <div style="font-size:2rem;font-weight:800;color:{sc_color}">{f"{last_sc:.0%}" if pd.notna(last_sc) else "—"}</div>
+                <div style="font-size:.75rem;color:#6B7280">{pd.to_datetime(last_dt).strftime("%d %b %Y") if pd.notna(last_dt) else "—"}</div>
+            </div>""", unsafe_allow_html=True)
+            m2.markdown(f"""<div style="background:#F5F6F8;border-radius:8px;padding:12px 16px;text-align:center">
+                <div style="font-size:.75rem;font-weight:700;color:#3B82F6;text-transform:uppercase">Avg Score</div>
+                <div style="font-size:2rem;font-weight:800;color:#3B82F6">{f"{avg_sc:.0%}" if pd.notna(avg_sc) else "—"}</div>
+                <div style="font-size:.75rem;color:#6B7280">across {n_aud} audits</div>
+            </div>""", unsafe_allow_html=True)
+            m3.markdown(f"""<div style="background:#F5F6F8;border-radius:8px;padding:12px 16px;text-align:center">
+                <div style="font-size:.75rem;font-weight:700;color:#393B41;text-transform:uppercase">Total Audits</div>
+                <div style="font-size:2rem;font-weight:800;color:#393B41">{n_aud}</div>
+                <div style="font-size:.75rem;color:#6B7280">since first audit</div>
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Score trend chart
+            if n_aud > 1:
+                st.markdown("**Score History**")
+                trend = radar_audits.copy()
+                trend["Score %"] = (trend["Score Captured"] * 100).round(1)
+                trend["Date"]    = trend["Audit Date"].dt.strftime("%d %b %Y")
+                st.line_chart(
+                    trend.set_index("Date")["Score %"],
+                    color="#F78F1E", use_container_width=True, height=180
+                )
+
+            # Full audit log for this radar with comparison
+            st.markdown("**Audit History**")
+            log = radar_audits.sort_values("Audit Date", ascending=False).copy().reset_index(drop=True)
+            log["Date"]   = log["Audit Date"].dt.strftime("%d %b %Y")
+            log["Score"]  = log["Score Captured"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+            log["Status"] = log["Score Captured"].apply(
+                lambda x: "🟢 Good" if x==1.0 else ("⚠️ Needs Attention" if x>=0.7 else "🔴 Critical") if pd.notna(x) else "—"
+            )
+
+            # Add delta vs previous audit
+            def score_delta(i, log_df):
+                if i >= len(log_df) - 1: return "—"
+                curr = log_df.loc[i, "Score Captured"]
+                prev = log_df.loc[i+1, "Score Captured"]
+                if pd.isna(curr) or pd.isna(prev): return "—"
+                diff = curr - prev
+                if abs(diff) < 0.01: return "➡️ Same"
+                return f"↑ +{diff:.0%}" if diff > 0 else f"↓ {diff:.0%}"
+
+            log["vs Previous"] = [score_delta(i, log) for i in range(len(log))]
+
+            # Show notes if present
+            has_notes = "Notes" in log.columns and log["Notes"].notna().any()
+            show_cols = ["Date","Score","Status","vs Previous","Auditor"]
+            if has_notes:
+                show_cols.append("Notes")
+
+            st.dataframe(
+                log[show_cols],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Score":       st.column_config.TextColumn("Score",       width="small"),
+                    "Status":      st.column_config.TextColumn("Status",      width="medium"),
+                    "Date":        st.column_config.TextColumn("Date",        width="small"),
+                    "vs Previous": st.column_config.TextColumn("vs Previous", width="medium"),
+                    "Notes":       st.column_config.TextColumn("Notes",       width="large"),
+                }
+            )
+
+            # If 2+ audits, show what changed between last two
+            if len(log) >= 2:
+                curr_sc = log.loc[0, "Score Captured"]
+                prev_sc = log.loc[1, "Score Captured"]
+                if pd.notna(curr_sc) and pd.notna(prev_sc):
+                    diff = curr_sc - prev_sc
+                    if abs(diff) >= 0.01:
+                        diff_clr = "#00B050" if diff > 0 else "#DC2626"
+                        diff_icon = "↑" if diff > 0 else "↓"
+                        diff_txt  = "improved" if diff > 0 else "declined"
+                        st.markdown(f"""
+                        <div style="background:{'#F0FDF4' if diff>0 else '#FEF2F2'};border-radius:8px;
+                                    padding:10px 16px;margin-top:8px;border-left:4px solid {diff_clr}">
+                            <span style="font-weight:700;color:{diff_clr}">{diff_icon} {abs(diff):.0%} {diff_txt}</span>
+                            <span style="color:#6B7280;font-size:.85rem;margin-left:8px">
+                                vs previous audit ({log.loc[1,'Date']})
+                            </span>
+                        </div>""", unsafe_allow_html=True)
+
+    # ── TAB 5: AUDIT LOG ──────────────────────────────────────────────────────
+    with tab5:
+        st.markdown("#### Full Audit Log")
+
+        f1, f2, f3 = st.columns(3)
+        fa  = f1.selectbox("Auditor", ["All"] + sorted(df_hist["Auditor"].dropna().unique().tolist()))
+        fs  = f2.selectbox("Site",    ["All"] + sorted(df_hist["Site"].dropna().unique().tolist()))
+        fst = f3.selectbox("Status",  ["All", "🟢 Perfect", "⚠️ Needs Attention", "🔴 Critical"])
+
+        df_show = df_hist.copy()
+        if fa != "All": df_show = df_show[df_show["Auditor"] == fa]
+        if fs != "All": df_show = df_show[df_show["Site"] == fs]
+        if "Perfect"   in fst: df_show = df_show[df_show["Score Captured"] == 1.0]
+        elif "Needs"   in fst: df_show = df_show[(df_show["Score Captured"] >= 0.7) & (df_show["Score Captured"] < 1.0)]
+        elif "Critical" in fst: df_show = df_show[df_show["Score Captured"] < 0.7]
+
+        df_show = df_show.sort_values("Audit Date", ascending=False).copy()
+
+        # Add status column
+        def status_label(sc):
+            if pd.isna(sc): return "—"
+            if sc == 1.0:   return "🟢 Perfect"
+            if sc >= 0.7:   return "⚠️ Needs Attention"
+            return "🔴 Critical"
+
+        df_show["Status"] = df_show["Score Captured"].apply(status_label)
+        df_show["Score"]  = df_show["Score Captured"].apply(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
+        df_show["Date"]   = df_show["Audit Date"].dt.strftime("%d %b %Y")
+
+        _log_cols = ["Date","Radar Name","Site","Auditor","Score","Status"]
+        if "Notes" in df_show.columns:
+            df_show["Notes"] = df_show["Notes"].fillna("")
+            _log_cols.append("Notes")
+        st.dataframe(
+            df_show[_log_cols],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Score":  st.column_config.TextColumn("Score",  width="small"),
+                "Status": st.column_config.TextColumn("Status", width="medium"),
+                "Date":   st.column_config.TextColumn("Date",   width="small"),
+                "Notes":  st.column_config.TextColumn("Notes",  width="large"),
+            }
+        )
+        st.caption(f"{len(df_show)} of {len(df_hist)} records")
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — EXPIRATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif "Expir" in page:
+    _render_sidebar(page)
+    st.markdown('## ⏰ Audit Expirations')
+
+    wb      = get_workbook()
+    df_mat  = get_audit_matrix(wb)
+    df_hist = get_history(wb)
+
+    today         = datetime.now()
+    EXPIRY_DAYS   = 180
+    WARNING_DAYS  = 30
+
+    # Filters row
+    fc1, fc2, fc3, fc4 = st.columns([2,1,1,1])
+    exp_search = fc1.text_input("🔍 Search radar or site", placeholder="SSR171 / Sishen Mine", label_visibility="collapsed")
+    _exp_bus   = ["All BUs"] + sorted(df_mat["BU"].dropna().unique().tolist()) if "BU" in df_mat.columns else ["All BUs"]
+    exp_bu     = fc2.selectbox("BU", _exp_bus, label_visibility="collapsed")
+    _exp_types = ["All Types"] + sorted(df_mat["Type"].dropna().unique().tolist())
+    exp_type   = fc3.selectbox("Type", _exp_types, label_visibility="collapsed")
+    exp_status = fc4.selectbox("Status", ["All","🔴 Expired","⬛ Never Audited","⚠️ Expiring Soon","🟢 Up to Date"], label_visibility="collapsed")
+
+    # Build last audit — HISTORY_LOG only, only entries with a real Score ────────
+    if not df_hist.empty:
+        _hist_scored = df_hist[df_hist["Score Captured"].notna()].dropna(subset=["Audit Date"]).copy()
+        if not _hist_scored.empty:
+            last_by_radar = (
+                _hist_scored
+                .sort_values("Audit Date", ascending=False)
+                .groupby("Radar Name").first().reset_index()
+                [["Radar Name","Audit Date","Score Captured","Auditor"]]
+            )
+        else:
+            last_by_radar = pd.DataFrame(columns=["Radar Name","Audit Date","Score Captured","Auditor"])
+    else:
+        last_by_radar = pd.DataFrame(columns=["Radar Name","Audit Date","Score Captured","Auditor"])
+
+    _hist_count = len(last_by_radar)
+
+    # Only take identity fields from AUDIT MATRIX — never Last Audit (may have demo dates)
+    keep_cols = ["Radar Name","Site","Type","Remote Access"]
+    if "BU" in df_mat.columns:
+        keep_cols.append("BU")
+    _df_status_base = df_mat[[c for c in keep_cols if c in df_mat.columns]].copy()
+    # Ensure no Last Audit leaks from AUDIT MATRIX
+    for _drop_col in ["Last Audit","Total Audits","Auditor","SCORE","HELPER_SCORE"]:
+        if _drop_col in _df_status_base.columns:
+            _df_status_base = _df_status_base.drop(columns=[_drop_col])
+    df_status = _df_status_base.merge(last_by_radar, on="Radar Name", how="left")
+    df_status["Days Since"] = df_status["Audit Date"].apply(
+        lambda d: (today - pd.to_datetime(d)).days if pd.notna(d) else None)
+    df_status["Expires In"] = df_status["Days Since"].apply(
+        lambda d: EXPIRY_DAYS - d if d is not None else None)
+
+    def _exp_status(row):
+        ds = row["Days Since"]
+        if ds is None:                         return "⬛ Never Audited"
+        if ds > EXPIRY_DAYS:                   return "🔴 Expired"
+        if ds >= EXPIRY_DAYS - WARNING_DAYS:   return "⚠️ Expiring Soon"
+        return "🟢 Up to Date"
+
+    df_status["Status"] = df_status.apply(_exp_status, axis=1)
+
+    # Apply filters
+    df_filt = df_status.copy()
+    if exp_search:
+        s = exp_search.upper()
+        df_filt = df_filt[df_filt["Radar Name"].str.upper().str.contains(s, na=False) |
+                          df_filt["Site"].str.upper().str.contains(s, na=False)]
+    if exp_bu != "All BUs" and "BU" in df_filt.columns:
+        df_filt = df_filt[df_filt["BU"] == exp_bu]
+    if exp_type != "All Types":
+        df_filt = df_filt[df_filt["Type"] == exp_type]
+    if exp_status != "All":
+        df_filt = df_filt[df_filt["Status"] == exp_status]
+
+    # KPI row — reflects BU/Type filter
+    _base = df_status.copy()
+    if exp_bu != "All BUs" and "BU" in _base.columns:
+        _base = _base[_base["BU"] == exp_bu]
+    if exp_type != "All Types":
+        _base = _base[_base["Type"] == exp_type]
+
+    k1,k2,k3,k4 = st.columns(4)
+    k1.metric("🔴 Expired",      (_base["Status"]=="🔴 Expired").sum(),      help=">180 days")
+    k2.metric("⬛ Never Audited", (_base["Status"]=="⬛ Never Audited").sum(), help="No audit on record")
+    k3.metric("⚠️ Expiring Soon", (_base["Status"]=="⚠️ Expiring Soon").sum(),help="Within 30 days")
+    k4.metric("🟢 Up to Date",   (_base["Status"]=="🟢 Up to Date").sum(),   help="Within 150 days")
+
+    st.caption(f"Showing {len(df_filt)} of {len(df_status)} radars · {_hist_count} with real audit history")
+    st.divider()
+
+    def render_exp_table(df_sub, label, icon):
+        if df_sub.empty:
+            with st.expander(f"{icon} {label} — 0 radars", expanded=False):
+                st.success(f"✅ No radars in this category.")
+            return
+        with st.expander(f"{icon} {label} — {len(df_sub)} radars", expanded=True):
+            rows = []
+            for _, r in df_sub.sort_values("Days Since", ascending=False, na_position="last").iterrows():
+                ds  = r["Days Since"]
+                ei  = r["Expires In"]
+                la  = pd.to_datetime(r["Audit Date"]).strftime("%d %b %Y") if pd.notna(r.get("Audit Date")) else "—"
+                sc  = f"{r['Score Captured']:.0%}" if pd.notna(r.get("Score Captured")) else "—"
+                row_d = {
+                    "Radar":      str(r["Radar Name"]),
+                    "Site":       str(r["Site"]),
+                    "Type":       str(r["Type"]),
+                    "Access":     str(r.get("Remote Access","") or ""),
+                    "Last Audit": la,
+                    "Days Since": f"{int(ds)}d" if ds is not None and pd.notna(ds) else "—",
+                    "Expires In": f"{int(ei)}d" if ei is not None and pd.notna(ei) else "—",
+                    "Last Score": sc,
+                }
+                if "BU" in r.index:
+                    row_d["BU"] = str(r.get("BU","") or "")
+                rows.append(row_d)
+            df_out = pd.DataFrame(rows)
+            if "BU" in df_out.columns:
+                cols = ["BU","Radar","Site","Type","Access","Last Audit","Days Since","Expires In","Last Score"]
+                df_out = df_out[[c for c in cols if c in df_out.columns]]
+            st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+    if exp_status in ("All","🔴 Expired"):
+        render_exp_table(df_filt[df_filt["Status"]=="🔴 Expired"],       "Expired (>180 days)",      "🔴")
+    if exp_status in ("All","⚠️ Expiring Soon"):
+        render_exp_table(df_filt[df_filt["Status"]=="⚠️ Expiring Soon"], "Expiring Within 30 Days",  "⚠️")
+    if exp_status in ("All","⬛ Never Audited"):
+        render_exp_table(df_filt[df_filt["Status"]=="⬛ Never Audited"],  "Never Audited",            "⚫")
+    if exp_status in ("All","🟢 Up to Date"):
+        render_exp_table(df_filt[df_filt["Status"]=="🟢 Up to Date"],    "Up to Date",               "🟢")
+
+
+# PAGE 4 — CLIENT PDF REPORT
+# ═══════════════════════════════════════════════════════════════════════════════
+elif "PDF" in page:
+    _render_sidebar(page)
+    st.markdown("## 📄 Client PDF Report")
+    st.caption("Generate a professional Proactive Data Quality Review for your client.")
+
+    wb       = get_workbook()
+    df_mat   = get_audit_matrix(wb)
+    df_hist  = get_history(wb)
+
+    # Site selector
+    sites = sorted(df_mat["Site"].dropna().unique().tolist())
+    # BU filter for PDF page
+    _pdf_bus = ["All BUs"] + sorted(set(
+        v for v in df_mat["BU"].dropna().unique().tolist()
+        if v and v != "Other"
+    )) if "BU" in df_mat.columns else ["All BUs"]
+
+    fc1, fc2, fc3 = st.columns([1, 2, 1])
+    with fc1:
+        pdf_bu_filter = st.selectbox("🌎 Business Unit", _pdf_bus)
+    with fc2:
+        if pdf_bu_filter != "All BUs":
+            _bu_sites = sorted(df_mat[df_mat["BU"] == pdf_bu_filter]["Site"].dropna().unique().tolist())
+        else:
+            _bu_sites = sites
+        site_sel = st.selectbox("📍 Select Site", _bu_sites)
+    with fc3:
+        auditor_pdf = st.text_input("👤 Reviewed by", placeholder="Your name")
+
+    # Site preview
+    site_radars = df_mat[df_mat["Site"].str.strip().str.lower() == site_sel.strip().lower()]
+    n = len(site_radars)
+    st.markdown(f"**{n} radar{'s' if n!=1 else ''}** at {site_sel}")
+
+    # Quick score preview — use same column detection as PDF function
+    _META = {'Radar Name','Site','Type','Remote Access','Last Audit','Total Audits','Auditor',
+             'SCORE','ISSUES DETECTED','RECOMMENDED ACTION','HELPER_SCORE','HELPER_DATE',
+             'HELPER_STATUS','PA','_score'}
+    if not site_radars.empty:
+        dqp_cols_prev = [c for c in site_radars.columns if c not in _META and c and not str(c).startswith('_')]
+        _SH_PREV = {"Data Availability", "SSR Type & Scan Mode", "Signal Strength", "Return Signal", "Wall %"}
+        scores = []
+        for _, row in site_radars.iterrows():
+            vals  = [str(row.get(c,"") or "") for c in dqp_cols_prev]
+            reds  = sum(1 for v in vals if "🔴" in v)
+            grs   = sum(1 for v in vals if "🟢" in v)
+            nas   = sum(1 for v in vals if "⚪" in v)
+            total = len(dqp_cols_prev) - nas
+            if grs + reds + nas == 0:
+                scores.append(float('nan'))
+            elif any("🔴" in str(row.get(c,"") or "") for c in _SH_PREV):
+                scores.append(0.0)
+            else:
+                scores.append(grs / total if total > 0 else 1.0)
+
+        preview_data = {
+            "Radar":  site_radars["Radar Name"].tolist(),
+            "Type":   site_radars["Type"].tolist(),
+            "Score":  [f"{s:.0%}" if not pd.isna(s) else "—" for s in scores],
+            "Status": ["⚫ Not Audited" if pd.isna(s) else ("🟢 Good" if s==1.0 else ("⚠️ Warning" if s>=0.7 else "🔴 Critical")) for s in scores]
+        }
+        st.dataframe(preview_data, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    if not REPORTLAB_OK:
+        st.error("❌ reportlab not installed. Add `reportlab` to requirements.txt and redeploy.")
+    elif not auditor_pdf.strip():
+        st.warning("⚠️ Enter your name before generating the report.")
+    else:
+        if st.button("📄 Generate PDF Report", type="primary", use_container_width=True):
+            with st.spinner("Generating PDF..."):
+                pdf_bytes = generate_client_pdf(site_sel, df_mat, auditor_pdf.strip(), logo_path="/home/claude/gp_logo.png")
+            fname = f"DQP_Review_{site_sel.replace(' ','_')}_{date.today().strftime('%Y-%m-%d')}.pdf"
+            st.download_button(
+                label=f"⬇️ Download {fname}",
+                data=pdf_bytes,
+                file_name=fname,
+                mime="application/pdf",
+                use_container_width=True
+            )
+            st.success(f"✅ Report ready — {site_sel} · {len(site_radars)} radars · {date.today().strftime('%d %b %Y')}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 5 — FLEET MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+elif "Fleet Management" in page:
+    _render_sidebar(page)
+    st.markdown('## ⚙️ Fleet Management')
+    st.caption("Manage radars, import fleet updates, and backup your data.")
+
+    wb     = get_workbook()
+    df_mat = get_audit_matrix(wb)
+
+    tab_fleet, tab_add, tab_edit, tab_delete, tab_import, tab_admin = st.tabs([
+        "📡 Fleet Overview", "➕ Add Radar", "✏️ Edit Radar", "🗑️ Remove Radar", "📥 Import / Backup", "🔧 Admin"
+    ])
+
+    # ── TAB: FLEET OVERVIEW ───────────────────────────────────────────────────
+    with tab_fleet:
+        st.markdown("#### Fleet Overview")
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Total Radars",   len(df_mat))
+        m2.metric("Sites",          df_mat["Site"].nunique())
+        m3.metric("Business Units", df_mat["BU"].nunique() if "BU" in df_mat.columns else "—")
+        m4.metric("Audited",        df_mat["Last Audit"].notna().sum(), help="At least one audit on record")
+        st.divider()
+        ov1,ov2,ov3 = st.columns([2,1,1])
+        ov_search = ov1.text_input("🔍 Search", placeholder="Radar or site", label_visibility="collapsed")
+        _ov_bus   = ["All BUs"] + sorted(df_mat["BU"].dropna().unique().tolist()) if "BU" in df_mat.columns else ["All BUs"]
+        ov_bu     = ov2.selectbox("BU",   _ov_bus,   label_visibility="collapsed", key="ov_bu")
+        _ov_types = ["All Types"] + sorted(df_mat["Type"].dropna().unique().tolist())
+        ov_type   = ov3.selectbox("Type", _ov_types, label_visibility="collapsed", key="ov_type")
+        df_ov = df_mat.copy()
+        if ov_search:
+            s = ov_search.upper()
+            df_ov = df_ov[df_ov["Radar Name"].str.upper().str.contains(s,na=False)|
+                          df_ov["Site"].str.upper().str.contains(s,na=False)]
+        if ov_bu   != "All BUs"   and "BU"   in df_ov.columns: df_ov = df_ov[df_ov["BU"]   == ov_bu]
+        if ov_type != "All Types" and "Type" in df_ov.columns: df_ov = df_ov[df_ov["Type"] == ov_type]
+        st.caption(f"{len(df_ov)} radars shown")
+
+        # BU summary strip
+        if "BU" in df_ov.columns:
+            _bu_counts = df_ov["BU"].value_counts()
+            _bu_strip  = "  ·  ".join(f"**{bu}** {cnt}" for bu, cnt in _bu_counts.items())
+            st.caption(_bu_strip)
+
+        disp_cols = [c for c in ["Radar Name","Site","BU","Type","Remote Access","Last Audit","Total Audits"] if c in df_ov.columns]
+        # Replace NaN/None with — for display
+        _df_display = df_ov[disp_cols].reset_index(drop=True).copy()
+        for _col in ["Last Audit","Total Audits"]:
+            if _col in _df_display.columns:
+                _df_display[_col] = _df_display[_col].apply(
+                    lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) or str(x) in ["nan","None","NaT"] else x)
+        st.dataframe(
+            _df_display,
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Last Audit":    st.column_config.TextColumn("Last Audit"),
+                "Total Audits":  st.column_config.TextColumn("Audits"),
+                "Remote Access": st.column_config.TextColumn("Access"),
+            }
+        )
+
+        # Quick stats below table
+        _no_access = df_ov["Remote Access"].isna().sum() + (df_ov["Remote Access"] == "").sum() if "Remote Access" in df_ov.columns else 0
+        _no_audit  = df_ov["Last Audit"].isna().sum() if "Last Audit" in df_ov.columns else 0
+        if _no_access > 0 or _no_audit > 0:
+            _warn_parts = []
+            if _no_access > 0: _warn_parts.append(f"⚠️ {_no_access} missing Remote Access")
+            if _no_audit  > 0: _warn_parts.append(f"⚫ {_no_audit} never audited")
+            st.warning("  ·  ".join(_warn_parts))
+
+    # ── TAB: ADD RADAR ────────────────────────────────────────────────────────
+    with tab_add:
+        st.markdown("#### Add a new radar to the fleet")
+        st.info("The new radar will appear immediately in the Audit Radar page.")
+        col1,col2 = st.columns(2)
+        with col1:
+            new_name  = st.text_input("Radar Name *", placeholder="e.g. SSR999")
+            new_site  = st.text_input("Site *",        placeholder="e.g. Arcelormittal")
+            new_type  = st.selectbox("Type *", ["XT","FX","SOM","SAR-X"])
+        with col2:
+            _ebus = sorted(set(v for v in df_mat["BU"].dropna().unique() if v and v!="Other")) if "BU" in df_mat.columns else []
+            _bu_choices = _ebus + (["➕ New BU (type below)"] if _ebus else [])
+            if _bu_choices:
+                _bu_sel = st.selectbox("Business Unit *", [""]+_bu_choices,
+                    format_func=lambda x: "Select or add BU..." if x=="" else x, key="new_bu_sel")
+                new_bu = st.text_input("Type new BU", placeholder="e.g. GPSA", key="new_bu_custom")                     if _bu_sel in ("➕ New BU (type below)","") else _bu_sel
+            else:
+                new_bu = st.text_input("Business Unit *", placeholder="e.g. GPNA")
+            st.markdown("**Remote Access**")
+            _ra_std_opts = ["GSS","VPN","Bomgar","TeamViewer","Anydesk","Customer","Other..."]
+            _ra_sel = st.radio("", _ra_std_opts, horizontal=True, key="new_access_radio")
+            if _ra_sel == "Other...":
+                new_access = st.text_input("Specify access method", placeholder="e.g. RDP, Citrix, VNC", key="new_access_custom")
+                if not new_access.strip():
+                    new_access = "Other"
+            else:
+                new_access = _ra_sel
+        new_pa = "Yes" if new_type in ["FX","SOM"] else "N/A"
+        if st.button("➕ Add Radar", type="primary"):
+            if not new_name.strip() or not new_site.strip() or not new_bu.strip():
+                st.error("❌ Radar Name, Site and BU are required.")
+            elif new_name.strip() in df_mat["Radar Name"].astype(str).tolist():
+                st.error(f"❌ **{new_name.strip()}** already exists.")
+            else:
+                try:
+                    ws_am   = wb["AUDIT MATRIX"]
+                    headers = [c.value for c in ws_am[1]]
+                    next_r  = next((r for r in range(2, ws_am.max_row+2) if ws_am.cell(r,1).value is None), ws_am.max_row+1)
+                    col_map = {h:i+1 for i,h in enumerate(headers) if h}
+                    ws_am.cell(next_r, col_map.get("Radar Name",1)).value = new_name.strip()
+                    ws_am.cell(next_r, col_map.get("Site",2)).value       = new_site.strip()
+                    ws_am.cell(next_r, col_map.get("Type",3)).value       = new_type
+                    if "Remote Access" in col_map: ws_am.cell(next_r, col_map["Remote Access"]).value = new_access
+                    if "PA"            in col_map: ws_am.cell(next_r, col_map["PA"]).value            = new_pa
+                    bu_col = ensure_bu_column(ws_am)
+                    ws_am.cell(next_r, bu_col).value = new_bu.strip().upper()
+                    save_workbook(wb); load_wb_bytes.clear()
+                    st.success(f"✅ **{new_name.strip()}** added — {new_site.strip()} · {new_type} · {new_bu.strip().upper()}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+    # ── TAB: EDIT RADAR ───────────────────────────────────────────────────────
+    with tab_edit:
+        st.markdown("#### Edit radar details")
+        st.info("💡 To correct audit answers — go to Audit Radar, select the radar, fix values and Save again.")
+        st.caption("Only edits Site, Type, Remote Access and BU. Audit data is not affected.")
+        _edit_bu_opts = ["All BUs"] + sorted(df_mat["BU"].dropna().unique().tolist()) if "BU" in df_mat.columns else ["All BUs"]
+        ed_bu_filt    = st.selectbox("Filter by BU", _edit_bu_opts, key="edit_bu_filt")
+        _edit_df      = df_mat if ed_bu_filt=="All BUs" else df_mat[df_mat["BU"]==ed_bu_filt]
+        _edit_list    = sorted(_edit_df["Radar Name"].dropna().astype(str).tolist())
+        if not _edit_list:
+            st.warning("No radars in this BU.")
+        else:
+            def _rlabel_e(r):
+                rows=df_mat[df_mat["Radar Name"]==r]; t=str(rows["Type"].values[0] if len(rows)>0 else ""); s=str(rows["Site"].values[0] if len(rows)>0 else "")
+                return " · ".join(p for p in [r,t,s] if p and p!="nan")
+            sel_lbl_e = st.selectbox("Select Radar to Edit", [_rlabel_e(r) for r in _edit_list], key="edit_sel")
+            sel_r_e   = _edit_list[[_rlabel_e(r) for r in _edit_list].index(sel_lbl_e)]
+            row_e     = df_mat[df_mat["Radar Name"]==sel_r_e].iloc[0]
+            cur_site   = str(row_e["Site"])   if pd.notna(row_e.get("Site"))         else ""
+            cur_type   = str(row_e["Type"])   if pd.notna(row_e.get("Type"))         else "XT"
+            cur_access = str(row_e["Remote Access"]) if pd.notna(row_e.get("Remote Access")) else "GSS"
+            _bfe = str(row_e.get("BU","") or "") if "BU" in row_e.index else ""
+            cur_bu = _bfe if _bfe and _bfe!="nan" else SITE_BU.get(cur_site.strip(),"")
+            ec1,ec2 = st.columns(2)
+            with ec1:
+                edit_site  = st.text_input("Site", value=cur_site, key=f"e_site_{sel_r_e}")
+                _type_opts = ["XT","FX","SOM","SAR-X"]
+                edit_type  = st.selectbox("Type", _type_opts, index=_type_opts.index(cur_type) if cur_type in _type_opts else 0, key=f"e_type_{sel_r_e}")
+                _ebus2 = sorted(set(v for v in df_mat["BU"].dropna().unique() if v and v!="Other")) if "BU" in df_mat.columns else []
+                _ebu_choices = _ebus2 + (["➕ New BU (type below)"] if _ebus2 else [])
+                if _ebu_choices:
+                    _ebu_sel = st.selectbox("Business Unit", [""]+_ebu_choices,
+                        index=([""]+_ebu_choices).index(cur_bu) if cur_bu in _ebu_choices else 0,
+                        format_func=lambda x:"Select BU..." if x=="" else x, key=f"e_bu_sel_{sel_r_e}")
+                    edit_bu = st.text_input("Type new BU", value=cur_bu if cur_bu not in _ebu_choices else "",
+                                            placeholder="e.g. GPSA", key=f"e_bu_{sel_r_e}")                         if _ebu_sel in ("➕ New BU (type below)","") else _ebu_sel
+                else:
+                    edit_bu = st.text_input("Business Unit", value=cur_bu, key=f"e_bu_{sel_r_e}")
+            with ec2:
+                _acc_opts = ["GSS","VPN","Bomgar","TeamViewer","Anydesk","Customer","Other..."]
+                st.markdown("**Remote Access**")
+                _cur_ra_idx = _acc_opts.index(cur_access) if cur_access in _acc_opts else len(_acc_opts)-1
+                _ra_edit_sel = st.radio("", _acc_opts, horizontal=True,
+                                        index=_cur_ra_idx,
+                                        key=f"e_access_{sel_r_e}")
+                if _ra_edit_sel == "Other...":
+                    edit_access = st.text_input("Specify access method",
+                                                value=cur_access if cur_access not in _acc_opts[:-1] else "",
+                                                placeholder="e.g. RDP, Citrix, VNC",
+                                                key=f"e_access_custom_{sel_r_e}")
+                    if not edit_access.strip():
+                        edit_access = "Other"
+                else:
+                    edit_access = _ra_edit_sel
+            edit_pa = "Yes" if edit_type in ["FX","SOM"] else "N/A"
+            if st.button("💾 Save Changes", type="primary", key="save_edit"):
+                try:
+                    ws_am        = wb["AUDIT MATRIX"]
+                    bu_col_idx_e = ensure_bu_column(ws_am)
+                    headers      = [c.value for c in ws_am[1]]
+                    col_map      = {h:i+1 for i,h in enumerate(headers) if h}
+                    target       = next((r[0].row for r in ws_am.iter_rows(min_row=2) if str(r[0].value)==sel_r_e), None)
+                    if target:
+                        if "Site"          in col_map: ws_am.cell(target,col_map["Site"]).value          = edit_site.strip()
+                        if "Type"          in col_map: ws_am.cell(target,col_map["Type"]).value          = edit_type
+                        if "Remote Access" in col_map: ws_am.cell(target,col_map["Remote Access"]).value = edit_access
+                        if "PA"            in col_map: ws_am.cell(target,col_map["PA"]).value            = edit_pa
+                        if edit_bu.strip():            ws_am.cell(target,bu_col_idx_e).value             = edit_bu.strip().upper()
+                        save_workbook(wb); load_wb_bytes.clear()
+                        st.success(f"✅ **{sel_r_e}** updated."); st.rerun()
+                    else:
+                        st.error("Radar not found.")
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+    # ── TAB: REMOVE RADAR ─────────────────────────────────────────────────────
+    with tab_delete:
+        st.markdown("#### Remove a radar from the fleet")
+        st.warning("⚠️ This removes the radar from AUDIT MATRIX. Audit history is preserved in HISTORY_LOG.")
+        _del_bu_opts = ["All BUs"] + sorted(df_mat["BU"].dropna().unique().tolist()) if "BU" in df_mat.columns else ["All BUs"]
+        del_bu_filt  = st.selectbox("Filter by BU", _del_bu_opts, key="del_bu_filt")
+        _del_df      = df_mat if del_bu_filt=="All BUs" else df_mat[df_mat["BU"]==del_bu_filt]
+        all_radars_del = sorted(_del_df["Radar Name"].dropna().astype(str).tolist())
+        if not all_radars_del:
+            st.info("No radars in this BU.")
+        else:
+            def _rlabel_d(r):
+                rows=df_mat[df_mat["Radar Name"]==r]; t=str(rows["Type"].values[0] if len(rows)>0 else ""); s=str(rows["Site"].values[0] if len(rows)>0 else "")
+                return " · ".join(p for p in [r,t,s] if p and p!="nan")
+            sel_lbl_d   = st.selectbox("Select Radar to Remove", [_rlabel_d(r) for r in all_radars_del], key="del_sel")
+            sel_r_d     = all_radars_del[[_rlabel_d(r) for r in all_radars_del].index(sel_lbl_d)]
+            row_d       = df_mat[df_mat["Radar Name"]==sel_r_d].iloc[0]
+            st.markdown(f"""<div style="border-left:4px solid #DC2626;border-radius:4px;padding:10px 14px;margin:8px 0;
+                background:rgba(220,38,38,.08)"><b style="color:#DC2626">About to remove:</b><br>
+                <b>{sel_r_d}</b> · {row_d.get("Type","")} · {row_d.get("Site","")} · {row_d.get("BU","")}</div>""",
+                unsafe_allow_html=True)
+            confirm_del = st.text_input("Type the radar name to confirm", placeholder=sel_r_d, key="del_confirm")
+            if st.button("🗑️ Remove Radar", type="secondary", key="btn_delete"):
+                if confirm_del.strip() != sel_r_d:
+                    st.error(f"❌ Type exactly **{sel_r_d}** to confirm.")
+                else:
+                    try:
+                        ws_am      = wb["AUDIT MATRIX"]
+                        target_del = next((r[0].row for r in ws_am.iter_rows(min_row=2) if str(r[0].value)==sel_r_d), None)
+                        if target_del:
+                            ws_am.delete_rows(target_del); save_workbook(wb); load_wb_bytes.clear()
+                            st.success(f"✅ **{sel_r_d}** removed."); st.rerun()
+                        else:
+                            st.error("Radar not found.")
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+
+    # ── TAB: IMPORT / BACKUP ──────────────────────────────────────────────────
+    with tab_import:
+        st.markdown("#### 📥 Import & Backup")
+        imp_col, bak_col = st.columns([3,2])
+
+        with bak_col:
+            st.markdown("**💾 Backup current Master**")
+            st.caption("Download before making changes.")
+            try:
+                with open(EXCEL_PATH,"rb") as _bf: _bk_bytes = _bf.read()
+                st.download_button("⬇️ Download Backup", data=_bk_bytes,
+                    file_name=f"Fleet_DQP_Master_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True)
+                st.caption(f"{len(df_mat)} radars · {len(_bk_bytes)//1024} KB")
+            except Exception as _be:
+                st.error(f"❌ {_be}")
+
+        with imp_col:
+            st.markdown("**📥 Import new Master**")
+            st.caption("Only adds new radars (Radar Name / Site / Type / BU / Access). Audit history and scores from the uploaded file are **never imported** — your existing audit data is always preserved.")
+            uploaded_master = st.file_uploader("Select Fleet_DQP_Master.xlsx", type=["xlsx"], key="master_upload")
+            if uploaded_master is not None:
+                try:
+                    import io as _io
+                    _raw  = uploaded_master.read()
+                    _wb_n = load_workbook(_io.BytesIO(_raw))
+                    if "AUDIT MATRIX" not in _wb_n.sheetnames:
+                        st.error("❌ Missing AUDIT MATRIX sheet.")
+                    else:
+                        _ws_n    = _wb_n["AUDIT MATRIX"]
+                        _hdrs_n  = [c.value for c in _ws_n[1]]
+                        _missing_c = {"Radar Name","Site","Type","BU"} - set(_hdrs_n)
+                        if _missing_c:
+                            st.error(f"❌ Missing columns: {', '.join(_missing_c)}")
+                        else:
+                            _ra_idx = _hdrs_n.index("Remote Access") if "Remote Access" in _hdrs_n else None
+                            _bu_idx = _hdrs_n.index("BU")
+                            _uploaded = []
+                            for _r in range(2, _ws_n.max_row+1):
+                                _rn = _ws_n.cell(_r,1).value
+                                if not _rn: continue
+                                _ra = str(_ws_n.cell(_r,_ra_idx+1).value or "").strip() if _ra_idx is not None else ""
+                                _bu = str(_ws_n.cell(_r,_bu_idx+1).value or "").strip()
+                                _uploaded.append({"row":_r,"Radar Name":str(_rn).strip(),
+                                    "Site":str(_ws_n.cell(_r,_hdrs_n.index("Site")+1).value or "").strip(),
+                                    "Type":str(_ws_n.cell(_r,_hdrs_n.index("Type")+1).value or "").strip(),
+                                    "BU":_bu,"Remote Access":_ra})
+                            _existing  = set(df_mat["Radar Name"].astype(str).str.strip())
+                            _new_ones  = [r for r in _uploaded if r["Radar Name"] not in _existing]
+                            _dupes     = [r for r in _uploaded if r["Radar Name"] in _existing]
+                            _ACCESS    = ["GSS","VPN","Bomgar","TeamViewer","Anydesk","Customer"]
+                            _miss_ra   = [r for r in _new_ones if r["Remote Access"] not in _ACCESS]
+                            s1,s2,s3   = st.columns(3)
+                            s1.metric("New radars",    len(_new_ones), help="Will be added")
+                            s2.metric("Already exist", len(_dupes),    help="Skipped — data preserved")
+                            s3.metric("Missing Access",len(_miss_ra),  help="Need Remote Access")
+                            if _miss_ra:
+                                st.warning(f"⚠️ {len(_miss_ra)} radar(s) need Remote Access.")
+                                if "import_ra_edits" not in st.session_state:
+                                    st.session_state["import_ra_edits"] = {}
+                                for _bu_name, _bu_rows in sorted({r["BU"]:[rr for rr in _miss_ra if rr["BU"]==r["BU"]] for r in _miss_ra}.items()):
+                                    with st.expander(f"🌎 {_bu_name} — {len(_bu_rows)} radars", expanded=True):
+                                        _ch = st.columns([2,2,1,2])
+                                        _ch[0].markdown("**Radar**"); _ch[1].markdown("**Site**")
+                                        _ch[2].markdown("**Type**");  _ch[3].markdown("**Remote Access**")
+                                        for _ri in _bu_rows:
+                                            _key = f"ra_{_ri['Radar Name']}"
+                                            _c0,_c1,_c2,_c3 = st.columns([2,2,1,2])
+                                            _c0.markdown(f"`{_ri['Radar Name']}`"); _c1.markdown(_ri["Site"]); _c2.markdown(f"`{_ri['Type']}`")
+                                            _cur = st.session_state["import_ra_edits"].get(_key,"")
+                                            _sel = _c3.selectbox("",[""] + _ACCESS,
+                                                index=([""] + _ACCESS).index(_cur) if _cur in _ACCESS else 0,
+                                                key=_key, label_visibility="collapsed")
+                                            st.session_state["import_ra_edits"][_key] = _sel
+                                _still_empty = [r for r in _miss_ra if not st.session_state["import_ra_edits"].get(f"ra_{r['Radar Name']}","")]
+                            else:
+                                _still_empty = []
+                                if "import_ra_edits" in st.session_state: del st.session_state["import_ra_edits"]
+                            if _still_empty:
+                                st.error(f"❌ {len(_still_empty)} radar(s) still need Remote Access.")
+                            elif _new_ones:
+                                st.divider()
+                                if st.button("➕ Add New Radars to Fleet", type="primary", key="btn_merge_master"):
+                                    try:
+                                        ws_am   = wb["AUDIT MATRIX"]
+                                        headers = [c.value for c in ws_am[1]]
+                                        col_map = {h:i+1 for i,h in enumerate(headers) if h}
+                                        bu_col  = ensure_bu_column(ws_am)
+                                        for _nr in _new_ones:
+                                            nr  = ws_am.max_row+1
+                                            ws_am.cell(nr,col_map.get("Radar Name",1)).value = _nr["Radar Name"]
+                                            ws_am.cell(nr,col_map.get("Site",2)).value       = _nr["Site"]
+                                            ws_am.cell(nr,col_map.get("Type",3)).value       = _nr["Type"]
+                                            ws_am.cell(nr,bu_col).value                      = _nr["BU"]
+                                            _ra_f = st.session_state.get("import_ra_edits",{}).get(f"ra_{_nr['Radar Name']}", _nr["Remote Access"])
+                                            if "Remote Access" in col_map: ws_am.cell(nr,col_map["Remote Access"]).value = _ra_f
+                                            if "PA"            in col_map: ws_am.cell(nr,col_map["PA"]).value            = "N/A" if _nr["Type"] in ("XT","SAR-X") else "Yes"
+                                        save_workbook(wb); load_wb_bytes.clear()
+                                        if "import_ra_edits" in st.session_state: del st.session_state["import_ra_edits"]
+                                        st.success(f"✅ {len(_new_ones)} radars added. Existing data preserved."); st.rerun()
+                                    except Exception as _e:
+                                        st.error(f"❌ {_e}")
+                            else:
+                                st.info("✅ No new radars to add — all already exist.")
+                except Exception as e:
+                    st.error(f"❌ {e}")
+            st.divider()
+            st.caption("💡 Always download a backup before importing.")
+
+    # ── TAB: ADMIN ────────────────────────────────────────────────────────────
+    with tab_admin:
+        st.markdown("#### 🔧 Data Administration")
+        st.caption("Manage audit history — delete specific records or clean seed data.")
+
+        # Reload wb/df for admin context
+        wb     = get_workbook()
+        df_mat = get_audit_matrix(wb)
+
+        admin_tab1, admin_tab2, admin_tab3 = st.tabs([
+            "🗑️ Delete by Radar", "🏭 Delete by Site", "💣 Reset / Clean"
+        ])
+
+        with admin_tab1:
+            st.caption("Delete all audit history for one radar — keeps the radar in the fleet.")
+            df_hist_adm = get_history(wb)
+            if df_hist_adm.empty:
+                st.info("No audit history yet.")
+            else:
+                audited_radars = sorted(df_hist_adm["Radar Name"].dropna().unique().tolist())
+                del_radar = st.selectbox("Select radar to clear", audited_radars, key="admin_del_radar")
+                n_entries = len(df_hist_adm[df_hist_adm["Radar Name"] == del_radar])
+                last_score = df_hist_adm[df_hist_adm["Radar Name"] == del_radar]["Score Captured"].iloc[-1] if n_entries else None
+                st.markdown(f"""<div style="background:#FEF2F2;border-radius:6px;padding:8px 12px;
+                    border-left:3px solid #DC2626;font-size:.85rem">
+                    <b>{del_radar}</b> — {n_entries} record(s) will be deleted · Last score: {f"{last_score:.0%}" if pd.notna(last_score) else "—"}
+                </div>""", unsafe_allow_html=True)
+                if st.button(f"🗑️ Clear audits for {del_radar}", key="btn_del_radar", type="secondary"):
+                    try:
+                        wb_d = get_workbook()
+                        ws_hl = wb_d["HISTORY_LOG"]
+                        rows_to_delete = [r for r in ws_hl.iter_rows(min_row=2) if r[0].value == del_radar]
+                        for row in rows_to_delete:
+                            for c in row: c.value = None
+                        all_rows = [list(r) for r in ws_hl.iter_rows(min_row=2, values_only=True)]
+                        non_empty = [r for r in all_rows if any(v is not None for v in r)]
+                        for i, row in enumerate(ws_hl.iter_rows(min_row=2)):
+                            if i < len(non_empty):
+                                for j, c in enumerate(row): c.value = non_empty[i][j]
+                            else:
+                                for c in row: c.value = None
+                        ws_am2 = wb_d["AUDIT MATRIX"]
+                        hdrs2 = [c.value for c in ws_am2[1]]
+                        META_R2 = {"Radar Name","Site","Type","Remote Access","PA","BU","Last Audit","Total Audits","Auditor"}
+                        for row in ws_am2.iter_rows(min_row=2):
+                            if str(row[0].value) == del_radar:
+                                for c in row:
+                                    h = hdrs2[c.column-1] if c.column <= len(hdrs2) else ""
+                                    if h not in META_R2: c.value = None
+                        save_workbook(wb_d); load_wb_bytes.clear()
+                        st.success(f"✅ Audit data cleared for {del_radar}."); st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+
+        with admin_tab2:
+            st.caption("Delete all audit history for every radar at one site.")
+            df_hist_adm2 = get_history(wb)
+            if df_hist_adm2.empty:
+                st.info("No audit history yet.")
+            else:
+                audited_sites = sorted(df_hist_adm2["Site"].dropna().unique().tolist())
+                del_site = st.selectbox("Select site to clear", audited_sites, key="admin_del_site")
+                site_entries = df_hist_adm2[df_hist_adm2["Site"] == del_site]
+                n_site_radars = site_entries["Radar Name"].nunique()
+                n_site_entries = len(site_entries)
+                st.markdown(f"""<div style="background:#FEF2F2;border-radius:6px;padding:8px 12px;
+                    border-left:3px solid #DC2626;font-size:.85rem">
+                    <b>{del_site}</b> — {n_site_entries} record(s) across {n_site_radars} radar(s) will be deleted
+                </div>""", unsafe_allow_html=True)
+                confirm_site = st.text_input("Type the site name to confirm", placeholder=del_site, key="admin_confirm_site")
+                if st.button(f"🗑️ Clear all audits for {del_site}", key="btn_del_site", type="secondary"):
+                    if confirm_site.strip() != del_site:
+                        st.error(f"Type exactly: **{del_site}**")
+                    else:
+                        try:
+                            wb_d2 = get_workbook()
+                            site_radars_list = site_entries["Radar Name"].unique().tolist()
+                            ws_hl2 = wb_d2["HISTORY_LOG"]
+                            all_rows2 = [list(r) for r in ws_hl2.iter_rows(min_row=2, values_only=True)]
+                            non_empty2 = [r for r in all_rows2 if any(v is not None for v in r) and r[1] != del_site]
+                            for i, row in enumerate(ws_hl2.iter_rows(min_row=2)):
+                                if i < len(non_empty2):
+                                    for j, c in enumerate(row): c.value = non_empty2[i][j]
+                                else:
+                                    for c in row: c.value = None
+                            ws_am3 = wb_d2["AUDIT MATRIX"]
+                            hdrs3 = [c.value for c in ws_am3[1]]
+                            META_R3 = {"Radar Name","Site","Type","Remote Access","PA","BU","Last Audit","Total Audits","Auditor"}
+                            for row in ws_am3.iter_rows(min_row=2):
+                                if str(row[0].value) in site_radars_list:
+                                    for c in row:
+                                        h = hdrs3[c.column-1] if c.column <= len(hdrs3) else ""
+                                        if h not in META_R3: c.value = None
+                            save_workbook(wb_d2); load_wb_bytes.clear()
+                            st.success(f"✅ All audit data cleared for {del_site}."); st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ {e}")
+
+        with admin_tab3:
+            st.markdown("**🧹 Fix phantom 'Up to Date' radars**")
+            st.info(
+                "If radars appear as 'Up to Date' but you haven't audited them, "
+                "it means the AUDIT MATRIX has old demo/seed dates in the Last Audit column. "
+                "Click below to clear those fields — **does not affect HISTORY_LOG or real audit scores.**"
+            )
+            if st.button("🧹 Clear Last Audit dates from AUDIT MATRIX", key="btn_clear_matrix_dates", type="primary"):
+                try:
+                    wb_cm = get_workbook()
+                    ws_cm = wb_cm["AUDIT MATRIX"]
+                    hdrs_cm = [c.value for c in ws_cm[1]]
+                    AUDIT_FIELDS = {"Last Audit","Total Audits","Auditor","SCORE","ISSUES DETECTED",
+                                    "RECOMMENDED ACTION","HELPER_SCORE","HELPER_DATE","HELPER_STATUS"}
+                    cleared = 0
+                    for row in ws_cm.iter_rows(min_row=2):
+                        if not row[0].value: continue
+                        for cell in row:
+                            h = hdrs_cm[cell.column-1] if cell.column <= len(hdrs_cm) else ""
+                            if h in AUDIT_FIELDS and cell.value is not None:
+                                cell.value = None
+                                cleared += 1
+                    save_workbook(wb_cm); load_wb_bytes.clear()
+                    st.success(f"✅ Cleared {cleared} audit date fields from AUDIT MATRIX. Expirations will now show correctly."); st.rerun()
+                except Exception as _e:
+                    st.error(f"❌ {_e}")
+
+            st.divider()
+            st.markdown("**🧹 Clear seed/demo data from HISTORY_LOG**")
+            st.info("Removes HISTORY_LOG entries with no Score — clears fake seed data without touching real audits.")
+            if st.button("🧹 Clear HISTORY_LOG seed data (no score)", key="btn_clear_seed"):
+                try:
+                    wb_cs = get_workbook()
+                    ws_cs = wb_cs["HISTORY_LOG"]
+                    rows_del = [row[0].row for row in ws_cs.iter_rows(min_row=2)
+                                if row[0].value and (row[4].value is None or str(row[4].value).strip() in ["","nan","None"])]
+                    for r in sorted(rows_del, reverse=True):
+                        ws_cs.delete_rows(r)
+                    save_workbook(wb_cs); load_wb_bytes.clear()
+                    st.success(f"✅ Removed {len(rows_del)} seed entries from HISTORY_LOG."); st.rerun()
+                except Exception as _e:
+                    st.error(f"❌ {_e}")
+            st.divider()
+            st.markdown("**💣 Reset ALL audit data**")
+            st.warning("⚠️ Permanently deletes ALL audit history and DQP answers for the entire fleet.")
+            confirm = st.text_input("Type RESET to confirm", key="reset_confirm")
+            if st.button("💣 Clear All Audit Data", type="secondary", key="btn_reset_all"):
+                if confirm == "RESET":
+                    try:
+                        wb_r = get_workbook()
+                        ws_h = wb_r["HISTORY_LOG"]
+                        for row in ws_h.iter_rows(min_row=2):
+                            for c in row: c.value = None
+                        ws_a = wb_r["AUDIT MATRIX"]
+                        hdrs = [c.value for c in ws_a[1]]
+                        META_R = {"Radar Name","Site","Type","Remote Access","PA","BU"}
+                        for row in ws_a.iter_rows(min_row=2):
+                            for c in row:
+                                if hdrs[c.column-1] not in META_R: c.value = None
+                        save_workbook(wb_r); load_wb_bytes.clear()
+                        st.success("✅ All audit data cleared."); st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+                else:
+                    st.error("Type RESET exactly to confirm.")
+
+    st.divider()
+    _n_bus = df_mat["BU"].nunique() if "BU" in df_mat.columns else "—"
+    _fc1, _fc2 = st.columns([3,1])
+    _fc1.markdown(f"**Fleet: {len(df_mat)} radars · {df_mat['Site'].nunique()} sites · {_n_bus} BUs**")
+    # CSV export of full fleet
+    _export_cols = [c for c in ["Radar Name","Site","BU","Type","Remote Access","Last Audit","Total Audits"] if c in df_mat.columns]
+    _csv = df_mat[_export_cols].to_csv(index=False).encode("utf-8")
+    _fc2.download_button("⬇️ Export CSV", data=_csv,
+        file_name=f"Fleet_DQP_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv", use_container_width=True)
