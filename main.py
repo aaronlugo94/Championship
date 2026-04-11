@@ -1884,6 +1884,320 @@ def _hhmm(t_str):
 # DASHBOARD WEB — servidor HTTP en hilo separado
 # ============================================================
 
+STATS_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>V7.2 · Stats</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07080d;--s1:#0c0e17;--s2:#11141f;
+  --border:#1c2035;--border2:#252840;
+  --accent:#4f6ef7;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
+  --text:#e8eaf6;--muted:#5a5f80;
+  --mono:'IBM Plex Mono',monospace;--sans:'Barlow',sans-serif;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh}
+a{color:inherit;text-decoration:none}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:1.25rem 2rem;border-bottom:1px solid var(--border);background:var(--s1)}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-mark{width:28px;height:28px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
+.logo-mark svg{width:16px;height:16px;fill:#fff}
+.logo h1{font-size:1rem;font-weight:600}
+.logo span{font-family:var(--mono);font-size:.62rem;color:var(--muted)}
+.nav-link{font-family:var(--mono);font-size:.65rem;color:var(--muted);padding:6px 12px;border:1px solid var(--border);border-radius:6px;transition:all .15s}
+.nav-link:hover{color:var(--text);border-color:var(--border2)}
+
+.league-bar{display:flex;gap:6px;padding:1rem 2rem;background:var(--s1);border-bottom:1px solid var(--border);overflow-x:auto;flex-wrap:wrap}
+.league-btn{font-family:var(--mono);font-size:.62rem;padding:5px 11px;border:1px solid var(--border);background:transparent;color:var(--muted);border-radius:5px;cursor:pointer;white-space:nowrap;transition:all .15s}
+.league-btn:hover{color:var(--text)}
+.league-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+.main{padding:1.5rem 2rem;display:grid;gap:1.5rem}
+
+/* Liga stats cards */
+.league-cards{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
+.lcard{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:.75rem;text-align:center}
+.lcard-label{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:.35rem}
+.lcard-val{font-size:1.1rem;font-weight:600}
+
+/* Secciones */
+.section-title{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.75rem}
+
+/* Tabla de posiciones */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.75rem}
+thead th{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);background:var(--s1);cursor:pointer;white-space:nowrap}
+thead th:hover{color:var(--text)}
+thead th.sorted{color:var(--accent)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:hover{background:var(--s2)}
+tbody td{padding:9px 12px;font-family:var(--mono);font-size:.72rem;vertical-align:middle;white-space:nowrap}
+td.team-name{font-family:var(--sans);font-size:.82rem;font-weight:500;min-width:140px}
+td.pos-num{color:var(--muted);width:32px;text-align:center}
+td.num{text-align:right}
+td.green{color:var(--green)} td.red{color:var(--red)} td.amber{color:var(--amber)} td.muted{color:var(--muted)}
+
+/* Forma */
+.form-row{display:flex;gap:3px;align-items:center}
+.f-dot{width:17px;height:17px;border-radius:3px;display:inline-flex;align-items:center;justify-content:center;font-size:.55rem;font-weight:600}
+.f-w{background:rgba(34,197,94,.15);color:var(--green)}
+.f-d{background:rgba(245,158,11,.15);color:var(--amber)}
+.f-l{background:rgba(239,68,68,.15);color:var(--red)}
+
+/* Próximos partidos */
+.fixtures-grid{display:grid;gap:6px}
+.fixture-row{display:grid;grid-template-columns:60px 1fr auto 1fr 180px;gap:12px;align-items:center;padding:10px 14px;background:var(--s1);border:1px solid var(--border);border-radius:8px;transition:border-color .15s}
+.fixture-row:hover{border-color:var(--border2)}
+.fix-date{font-family:var(--mono);font-size:.6rem;color:var(--muted)}
+.fix-home{text-align:right;font-weight:500;font-size:.82rem}
+.fix-away{text-align:left;font-weight:500;font-size:.82rem}
+.fix-vs{font-family:var(--mono);font-size:.65rem;color:var(--muted);text-align:center}
+.fix-odds{display:flex;gap:6px;justify-content:flex-end}
+.odd-pill{font-family:var(--mono);font-size:.62rem;padding:3px 8px;border-radius:4px;border:1px solid var(--border)}
+.odd-h{color:var(--green);border-color:rgba(34,197,94,.2);background:rgba(34,197,94,.05)}
+.odd-d{color:var(--amber);border-color:rgba(245,158,11,.2);background:rgba(245,158,11,.05)}
+.odd-a{color:var(--red);border-color:rgba(239,68,68,.2);background:rgba(239,68,68,.05)}
+
+/* xG chart bars */
+.xg-bar-wrap{display:flex;align-items:center;gap:6px}
+.xg-bar-fill{height:6px;border-radius:3px;background:var(--accent);min-width:2px}
+.xg-val{font-family:var(--mono);font-size:.62rem;color:var(--muted)}
+
+.tabs{display:flex;gap:2px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:2px;width:fit-content;margin-bottom:1rem}
+.tab-btn{font-family:var(--mono);font-size:.62rem;padding:5px 14px;border:none;background:transparent;color:var(--muted);border-radius:6px;cursor:pointer;transition:all .15s}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{background:var(--accent);color:#fff}
+
+.loading{text-align:center;padding:3rem;font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+
+@media(max-width:800px){
+  .league-cards{grid-template-columns:repeat(3,1fr)}
+  .fixture-row{grid-template-columns:1fr;gap:4px}
+  header{padding:1rem}
+  .main{padding:1rem}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M2 12 L8 4 L14 12 Z"/></svg></div>
+    <div>
+      <h1>V7.2 Stats</h1>
+      <span>Triple League Specialist</span>
+    </div>
+  </div>
+  <a href="/" class="nav-link">← dashboard</a>
+</header>
+
+<div class="league-bar" id="league-bar"></div>
+
+<div class="main">
+  <div id="league-cards" class="league-cards"></div>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="showTab('table')">Tabla</button>
+    <button class="tab-btn" onclick="showTab('xg')">xG</button>
+    <button class="tab-btn" onclick="showTab('fixtures')">Próximos</button>
+  </div>
+
+  <div id="tab-table">
+    <p class="section-title">Tabla de posiciones</p>
+    <div class="table-wrap">
+      <table id="standings-table">
+        <thead>
+          <tr>
+            <th class="pos-num">#</th>
+            <th>Equipo</th>
+            <th class="num" data-col="pj">PJ</th>
+            <th class="num" data-col="pg">PG</th>
+            <th class="num" data-col="pe">PE</th>
+            <th class="num" data-col="pp">PP</th>
+            <th class="num" data-col="gf">GF</th>
+            <th class="num" data-col="ga">GA</th>
+            <th class="num" data-col="gd">DG</th>
+            <th class="num" data-col="pts">PTS</th>
+            <th>Forma</th>
+            <th class="num" data-col="btts_pct">BTTS%</th>
+            <th class="num" data-col="over25_pct">O2.5%</th>
+            <th class="num" data-col="avg_gf">xGF</th>
+            <th class="num" data-col="avg_ga">xGA</th>
+          </tr>
+        </thead>
+        <tbody id="standings-body"><tr><td colspan="15" class="loading">cargando...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-xg" style="display:none">
+    <p class="section-title">xG por equipo — últimos 8 partidos</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>Equipo</th>
+            <th class="num">xGF</th><th style="min-width:120px">ataque</th>
+            <th class="num">xGA</th><th style="min-width:120px">defensa</th>
+            <th class="num">neto</th>
+          </tr>
+        </thead>
+        <tbody id="xg-body"><tr><td colspan="7" class="loading">cargando...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-fixtures" style="display:none">
+    <p class="section-title">Próximos partidos</p>
+    <div class="fixtures-grid" id="fixtures-grid"><div class="loading">cargando...</div></div>
+  </div>
+</div>
+
+<script>
+const LEAGUES = {
+  "E0":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier","E1":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship","E2":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 League One",
+  "SP1":"🇪🇸 La Liga","SP2":"🇪🇸 Segunda",
+  "D1":"🇩🇪 Bundesliga","D2":"🇩🇪 Bundesliga 2",
+  "I1":"🇮🇹 Serie A","I2":"🇮🇹 Serie B",
+  "F1":"🇫🇷 Ligue 1","F2":"🇫🇷 Ligue 2",
+  "N1":"🇳🇱 Eredivisie","P1":"🇵🇹 Primeira",
+  "B1":"🇧🇪 Jupiler","SC0":"🏴󠁧󠁢󠁳󠁣󠁴 Premiership",
+  "T1":"🇹🇷 Süper Lig","G1":"🇬🇷 Super League",
+};
+let currentLeague = "E1", tableData = [], sortCol = "pts", sortDir = -1;
+
+// Build league bar
+const bar = document.getElementById("league-bar");
+Object.entries(LEAGUES).forEach(([code, name]) => {
+  const btn = document.createElement("button");
+  btn.className = "league-btn" + (code===currentLeague?" active":"");
+  btn.textContent = name;
+  btn.onclick = () => { currentLeague=code; loadLeague(code);
+    document.querySelectorAll(".league-btn").forEach(b=>b.classList.remove("active"));
+    btn.classList.add("active");
+  };
+  bar.appendChild(btn);
+});
+
+function showTab(t) {
+  ["table","xg","fixtures"].forEach(id=>{
+    document.getElementById("tab-"+id).style.display = id===t?"block":"none";
+  });
+  document.querySelectorAll(".tab-btn").forEach((b,i)=>{
+    b.classList.toggle("active", ["table","xg","fixtures"][i]===t);
+  });
+}
+
+function formDot(r){ const c=r==="W"?"f-w":r==="D"?"f-d":"f-l"; return `<span class="f-dot ${c}">${r}</span>`; }
+function pctColor(v,lo,hi){ return v>=hi?"green":v>=lo?"amber":"red"; }
+
+function renderTable(data) {
+  const sorted = [...data].sort((a,b)=>{
+    let av=a[sortCol]??0, bv=b[sortCol]??0;
+    return av<bv?sortDir:av>bv?-sortDir:0;
+  });
+  document.getElementById("standings-body").innerHTML = sorted.map((t,i)=>`
+    <tr>
+      <td class="pos-num muted">${i+1}</td>
+      <td class="team-name">${t.team}</td>
+      <td class="num muted">${t.pj}</td>
+      <td class="num green">${t.pg}</td>
+      <td class="num amber">${t.pe}</td>
+      <td class="num red">${t.pp}</td>
+      <td class="num">${t.gf}</td>
+      <td class="num">${t.ga}</td>
+      <td class="num ${t.gd>=0?"green":"red"}">${t.gd>=0?"+":""}${t.gd}</td>
+      <td class="num" style="font-weight:600;color:var(--text)">${t.pts}</td>
+      <td><div class="form-row">${(t.form||[]).map(formDot).join("")}</div></td>
+      <td class="num ${pctColor(t.btts_pct,45,55)}">${t.btts_pct}%</td>
+      <td class="num ${pctColor(t.over25_pct,45,55)}">${t.over25_pct}%</td>
+      <td class="num ${t.xgf?"":"muted"}">${t.xgf??"-"}</td>
+      <td class="num ${t.xga?"":"muted"}">${t.xga??"-"}</td>
+    </tr>`).join("");
+
+  // xG tab
+  const xgSorted = [...data].filter(t=>t.xgf).sort((a,b)=>b.xgf-a.xgf);
+  const maxXgf = Math.max(...xgSorted.map(t=>t.xgf||0), 0.1);
+  const maxXga = Math.max(...xgSorted.map(t=>t.xga||0), 0.1);
+  document.getElementById("xg-body").innerHTML = xgSorted.map((t,i)=>`
+    <tr>
+      <td class="pos-num muted">${i+1}</td>
+      <td class="team-name">${t.team}</td>
+      <td class="num green">${t.xgf}</td>
+      <td><div class="xg-bar-wrap"><div class="xg-bar-fill" style="width:${t.xgf/maxXgf*120}px;background:var(--green)"></div></div></td>
+      <td class="num red">${t.xga}</td>
+      <td><div class="xg-bar-wrap"><div class="xg-bar-fill" style="width:${t.xga/maxXga*120}px;background:var(--red)"></div></div></td>
+      <td class="num ${(t.xgf-t.xga)>=0?"green":"red"}">${(t.xgf-t.xga)>=0?"+":""}${(t.xgf-t.xga).toFixed(2)}</td>
+    </tr>`).join("");
+}
+
+function renderFixtures(fixtures) {
+  if(!fixtures.length){ document.getElementById("fixtures-grid").innerHTML='<div class="loading">No hay próximos partidos en el CSV</div>'; return; }
+  document.getElementById("fixtures-grid").innerHTML = fixtures.map(f=>`
+    <div class="fixture-row">
+      <span class="fix-date">${f.date}</span>
+      <span class="fix-home">${f.home}</span>
+      <span class="fix-vs">${f.xg_h||"?"} — ${f.xg_a||"?"}</span>
+      <span class="fix-away">${f.away}</span>
+      <div class="fix-odds">
+        ${f.ph?`<span class="odd-pill odd-h">${(f.ph*100).toFixed(0)}%</span>`:""}
+        ${f.pd?`<span class="odd-pill odd-d">${(f.pd*100).toFixed(0)}%</span>`:""}
+        ${f.pa?`<span class="odd-pill odd-a">${(f.pa*100).toFixed(0)}%</span>`:""}
+        ${f.b365h?`<span class="odd-pill" style="color:var(--muted)">@${f.b365h}/${f.b365d}/${f.b365a}</span>`:""}
+      </div>
+    </div>`).join("");
+}
+
+function renderLeagueCards(ls) {
+  document.getElementById("league-cards").innerHTML = [
+    ["Partidos",ls.total_games,"white"],
+    ["Goles/PJ",ls.avg_goals,"amber"],
+    ["BTTS",ls.btts_pct+"%",ls.btts_pct>=50?"green":"red"],
+    ["Over 2.5",ls.over25_pct+"%",ls.over25_pct>=50?"green":"red"],
+    ["Local",ls.home_win_pct+"%","green"],
+    ["Empate",ls.draw_pct+"%","amber"],
+    ["Visitante",ls.away_win_pct+"%","red"],
+  ].map(([l,v,c])=>`
+    <div class="lcard">
+      <div class="lcard-label">${l}</div>
+      <div class="lcard-val ${c}">${v}</div>
+    </div>`).join("");
+}
+
+async function loadLeague(div) {
+  document.getElementById("standings-body").innerHTML = '<tr><td colspan="15" class="loading">cargando...</td></tr>';
+  document.getElementById("fixtures-grid").innerHTML = '<div class="loading">cargando...</div>';
+  try {
+    const r = await fetch(`/api/stats?league=${div}`);
+    const d = await r.json();
+    if(d.error){ alert(d.error); return; }
+    tableData = d.table;
+    renderTable(tableData);
+    renderFixtures(d.upcoming||[]);
+    renderLeagueCards(d.league_stats);
+  } catch(e){ alert("Error: "+e.message); }
+}
+
+document.querySelectorAll("thead th[data-col]").forEach(th=>{
+  th.addEventListener("click",()=>{
+    const col=th.dataset.col;
+    if(sortCol===col){ sortDir*=-1; th.classList.toggle("sorted"); }
+    else{ sortCol=col; sortDir=-1; document.querySelectorAll("thead th").forEach(t=>t.classList.remove("sorted")); }
+    th.classList.add("sorted"); renderTable(tableData);
+  });
+});
+
+loadLeague(currentLeague);
+</script>
+</body>
+</html>
+"""
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2465,6 +2779,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_resolve()
         elif self.path.startswith("/api/analyze"):
             self._serve_analyze()
+        elif self.path == "/stats":
+            self._serve_stats_html()
+        elif self.path.startswith("/api/stats"):
+            self._serve_stats_api()
         else:
             self.send_response(404); self.end_headers()
 
@@ -2697,6 +3015,184 @@ def auto_resolve():
             Log.ok(f"Auto-resolve: {resolved} picks ({wins}W/{losses}L)", "RESOLVE")
     except Exception as e:
         Log.err(f"auto_resolve: {e}", "RESOLVE")
+
+
+    def _serve_stats_api(self):
+        """API /api/stats?league=E1 — stats completos de una liga desde CSV."""
+        try:
+            import pandas as pd
+            from urllib.parse import urlparse, parse_qs
+            qs  = parse_qs(urlparse(self.path).query)
+            div = qs.get("league",["E1"])[0].upper()
+            cfg = TARGET_LEAGUES.get(div)
+            if not cfg:
+                self._json_err(f"Liga {div} no encontrada"); return
+
+            path = os.path.join(DATA_DIR, f"{div}.csv")
+            if not os.path.exists(path):
+                self._json_err(f"CSV {div} no disponible — espera el próximo refresh"); return
+
+            try:    df = pd.read_csv(path, encoding="utf-8-sig")
+            except: df = pd.read_csv(path, encoding="latin-1")
+            df.columns = df.columns.str.strip()
+            df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+            df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+            played = df.dropna(subset=["FTHG","FTAG"]).copy()
+            played["FTHG"] = played["FTHG"].astype(float)
+            played["FTAG"] = played["FTAG"].astype(float)
+            if played.empty:
+                self._json_err("Sin partidos jugados en este CSV"); return
+
+            # ── Tabla de posiciones ──────────────────────────────────────
+            teams = {}
+            for _, r in played.iterrows():
+                for side in ["home","away"]:
+                    t = r["HomeTeam"] if side=="home" else r["AwayTeam"]
+                    gf= r["FTHG"] if side=="home" else r["FTAG"]
+                    ga= r["FTAG"] if side=="home" else r["FTHG"]
+                    if t not in teams:
+                        teams[t]={"pj":0,"pg":0,"pe":0,"pp":0,"gf":0,"ga":0,"pts":0,
+                                   "form":[],"btts":0,"over25":0,"results":[]}
+                    teams[t]["pj"]+=1
+                    teams[t]["gf"]+=gf
+                    teams[t]["ga"]+=ga
+                    teams[t]["btts"] += 1 if (r["FTHG"]>0 and r["FTAG"]>0) else 0
+                    teams[t]["over25"] += 1 if (r["FTHG"]+r["FTAG"])>2.5 else 0
+                    if gf>ga:
+                        teams[t]["pg"]+=1; teams[t]["pts"]+=3
+                        teams[t]["form"].append("W"); teams[t]["results"].append("W")
+                    elif gf==ga:
+                        teams[t]["pe"]+=1; teams[t]["pts"]+=1
+                        teams[t]["form"].append("D"); teams[t]["results"].append("D")
+                    else:
+                        teams[t]["pp"]+=1
+                        teams[t]["form"].append("L"); teams[t]["results"].append("L")
+
+            # xG por equipo (shots o goles proxy)
+            has_shots = cfg.get("has_shots") and "HST" in played.columns
+            conv_h = cfg.get("conv_home",0.30)
+            conv_a = cfg.get("conv_away",0.31)
+
+            xg_data = {}
+            for t in teams:
+                h_rows = played[played["HomeTeam"]==t].tail(8)
+                a_rows = played[played["AwayTeam"]==t].tail(8)
+                xgf_list, xga_list = [], []
+                for _, r in h_rows.iterrows():
+                    if has_shots:
+                        try:
+                            hst=float(r.get("HST",float("nan")))
+                            ast=float(r.get("AST",float("nan")))
+                            if not (hst!=hst or ast!=ast):
+                                xgf_list.append(hst*conv_h)
+                                xga_list.append(ast*conv_a)
+                        except: pass
+                    else:
+                        xgf_list.append(min(float(r["FTHG"]),3))
+                        xga_list.append(min(float(r["FTAG"]),3))
+                for _, r in a_rows.iterrows():
+                    if has_shots:
+                        try:
+                            hst=float(r.get("HST",float("nan")))
+                            ast=float(r.get("AST",float("nan")))
+                            if not (hst!=hst or ast!=ast):
+                                xgf_list.append(ast*conv_a)
+                                xga_list.append(hst*conv_h)
+                        except: pass
+                    else:
+                        xgf_list.append(min(float(r["FTAG"]),3))
+                        xga_list.append(min(float(r["FTHG"]),3))
+                if xgf_list:
+                    xg_data[t] = {
+                        "xgf": round(sum(xgf_list)/len(xgf_list),2),
+                        "xga": round(sum(xga_list)/len(xga_list),2)
+                    }
+
+            # Tabla final ordenada por pts
+            table = []
+            for t, d in teams.items():
+                pj = d["pj"]
+                table.append({
+                    "team": t,
+                    "pj": pj, "pg": d["pg"], "pe": d["pe"], "pp": d["pp"],
+                    "gf": int(d["gf"]), "ga": int(d["ga"]),
+                    "gd": int(d["gf"]-d["ga"]),
+                    "pts": d["pts"],
+                    "form": d["results"][-5:],
+                    "btts_pct": round(d["btts"]/pj*100,1) if pj else 0,
+                    "over25_pct": round(d["over25"]/pj*100,1) if pj else 0,
+                    "avg_gf": round(d["gf"]/pj,2) if pj else 0,
+                    "avg_ga": round(d["ga"]/pj,2) if pj else 0,
+                    "xgf": xg_data.get(t,{}).get("xgf"),
+                    "xga": xg_data.get(t,{}).get("xga"),
+                })
+            table.sort(key=lambda x: (-x["pts"],-x["gd"],-x["gf"]))
+
+            # ── Próximos partidos ────────────────────────────────────────
+            future = df[df["FTHG"].isna()].copy()
+            future["Date"] = pd.to_datetime(future["Date"], dayfirst=True, errors="coerce")
+            upcoming = []
+            for _, r in future.sort_values("Date").head(15).iterrows():
+                h = str(r.get("HomeTeam","")).strip()
+                a = str(r.get("AwayTeam","")).strip()
+                if not h or not a: continue
+                # Probabilidades rápidas desde xG
+                xh_t = xg_data.get(h,{})
+                xa_t = xg_data.get(a,{})
+                xh = round((xh_t.get("xgf",1.2)+xa_t.get("xga",1.2))/2,2) if xh_t and xa_t else None
+                xa = round((xa_t.get("xgf",1.0)+xh_t.get("xga",1.0))/2,2) if xh_t and xa_t else None
+                ph=pd_=pa=None
+                if xh and xa:
+                    try: ph,pd_,pa = dixon_coles(xh,xa); ph=round(ph,3);pd_=round(pd_,3);pa=round(pa,3)
+                    except: pass
+                upcoming.append({
+                    "date": r["Date"].strftime("%d/%m") if pd.notna(r["Date"]) else "?",
+                    "home": h, "away": a,
+                    "xg_h": xh, "xg_a": xa,
+                    "ph": ph, "pd": pd_, "pa": pa,
+                    "b365h": float(r["B365H"]) if "B365H" in r and pd.notna(r.get("B365H")) else None,
+                    "b365d": float(r["B365D"]) if "B365D" in r and pd.notna(r.get("B365D")) else None,
+                    "b365a": float(r["B365A"]) if "B365A" in r and pd.notna(r.get("B365A")) else None,
+                })
+
+            # ── Stats globales de la liga ────────────────────────────────
+            total = len(played)
+            league_stats = {
+                "name": cfg.get("name",""),
+                "total_games": total,
+                "avg_goals": round((played["FTHG"]+played["FTAG"]).mean(),2),
+                "btts_pct": round(((played["FTHG"]>0)&(played["FTAG"]>0)).mean()*100,1),
+                "over25_pct": round(((played["FTHG"]+played["FTAG"])>2.5).mean()*100,1),
+                "home_win_pct": round((played["FTHG"]>played["FTAG"]).mean()*100,1),
+                "draw_pct": round((played["FTHG"]==played["FTAG"]).mean()*100,1),
+                "away_win_pct": round((played["FTHG"]<played["FTAG"]).mean()*100,1),
+            }
+
+            payload = json.dumps({
+                "table": table,
+                "upcoming": upcoming,
+                "league_stats": league_stats,
+                "div": div,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+
+        except Exception as e:
+            self._json_err(str(e))
+
+    def _json_err(self, msg):
+        payload = json.dumps({"error": msg}).encode()
+        self.send_response(500)
+        self.send_header("Content-Type","application/json")
+        self.end_headers(); self.wfile.write(payload)
+
+    def _serve_stats_html(self):
+        self.send_response(200)
+        self.send_header("Content-Type","text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(STATS_HTML.encode("utf-8"))
 
     def _serve_analyze(self):
         """Analiza un partido en tiempo real desde la DB y CSVs."""
