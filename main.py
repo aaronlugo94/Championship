@@ -2375,7 +2375,14 @@ async function analyzeMatch() {
     const url = `/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`;
     const r = await fetch(url);
     const d = await r.json();
-    if (d.error) { alert(d.error); loading.style.display='none'; return; }
+    if (!r.ok || d.error) {
+      alert('Error: ' + (d.error || 'No se pudo analizar el partido'));
+      loading.style.display='none'; return;
+    }
+    if (!d.home_stats || !d.away_stats) {
+      alert('Sin historial suficiente para estos equipos');
+      loading.style.display='none'; return;
+    }
 
     document.getElementById('an-home-name').textContent = d.home;
     document.getElementById('an-away-name').textContent = d.away;
@@ -2754,8 +2761,14 @@ def auto_resolve():
             played = df.dropna(subset=["FTHG","FTAG"])
 
             def team_stats(name, depth=8):
-                rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
+                # Fuzzy match — igual que el motor principal
+                all_teams = pd.concat([played["HomeTeam"],played["AwayTeam"]]).dropna().unique()
+                match = difflib.get_close_matches(name, all_teams, n=1, cutoff=0.50)
+                if not match: return None
+                matched_name = match[0]
+                rows = played[(played["HomeTeam"]==matched_name)|(played["AwayTeam"]==matched_name)].tail(depth)
                 if len(rows) < 2: return None
+                name = matched_name  # usar el nombre real del CSV
                 gf,ga,sf,sa,pts,results = [],[],[],[],[],[]
                 for _,row in rows.iterrows():
                     ih = (row["HomeTeam"]==name)
@@ -2783,6 +2796,7 @@ def auto_resolve():
                     xgf = _wavg(gf)*ff_f
                     xga = _wavg(ga)
                 return {
+                    "matched_name": name,
                     "xgf": round(xgf,2), "xga": round(xga,2),
                     "gf_avg": round(sum(gf)/len(gf),2),
                     "ga_avg": round(sum(ga)/len(ga),2),
@@ -2797,10 +2811,16 @@ def auto_resolve():
             hs = team_stats(home)
             as_ = team_stats(away)
             if not hs or not as_:
-                payload = json.dumps({"error": "Historial insuficiente"}).encode()
+                missing = []
+                if not hs: missing.append(home)
+                if not as_: missing.append(away)
+                payload = json.dumps({"error": f"Sin historial para: {', '.join(missing)}. Verifica el nombre del equipo."}).encode()
                 self.send_response(404)
                 self.send_header("Content-Type","application/json")
                 self.end_headers(); self.wfile.write(payload); return
+            # Actualizar nombres con los que realmente están en el CSV
+            if hs.get("matched_name"): home = hs.pop("matched_name")
+            if as_.get("matched_name"): away = as_.pop("matched_name")
 
             # ── xG del partido ───────────────────────────────────────────
             xh = round((hs["xgf"] + as_["xga"]) / 2, 2)
