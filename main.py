@@ -1448,15 +1448,21 @@ class TripleLeagueV72:
         import pandas as pd
         reset_req(); _CSV_MEM.clear(); _TREND_MEM.clear()
 
-        tomorrow  = (datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d")
-        day_after = (datetime.now()+timedelta(days=2)).strftime("%Y-%m-%d")
-        today_str = datetime.now().strftime("%d/%m/%Y")
+        now_utc   = datetime.now(timezone.utc)
+        tomorrow  = (now_utc+timedelta(days=1)).strftime("%Y-%m-%d")
+        day_after = (now_utc+timedelta(days=2)).strftime("%Y-%m-%d")
+        today_str = now_utc.strftime("%d/%m/%Y")
+        # Los viernes ampliar a D+3 para capturar partidos del sábado completo
+        # fixtures.csv se actualiza viernes — el sábado puede quedar sin picks
+        scan_dates = [tomorrow, day_after]
+        if now_utc.weekday() == 4:  # viernes UTC
+            scan_dates.append((now_utc+timedelta(days=3)).strftime("%Y-%m-%d"))
         preliminary = []
 
-        Log.scan_start([tomorrow, day_after])
+        Log.scan_start(scan_dates)
         send_msg(
             f"🔍 <b>V7.2 Scan D-1</b>\n"
-            f"🗓 {tomorrow} / {day_after}\n"
+            f"🗓 {' / '.join(scan_dates)}\n"
             f"[1] CSV co.uk + [2] fd.org + [3] api-football"
         )
 
@@ -1464,7 +1470,7 @@ class TripleLeagueV72:
         fd_codes = [cfg["fbd_code"] for cfg in TARGET_LEAGUES.values()
                     if cfg.get("fbd_code")]
         all_trends = {}
-        for d in [tomorrow, day_after]:
+        for d in scan_dates:
             all_trends.update(fetch_trends(d, fd_codes))
             time.sleep(7.0)
 
@@ -1473,56 +1479,101 @@ class TripleLeagueV72:
 
         euro_divs = [d for d,c in TARGET_LEAGUES.items() if c["source"]=="csv_euro"]
 
+        # ── Construir lista de partidos desde AMBAS fuentes ─────────────────
+        # Fuente A: fixtures.csv co.uk (ligas principales con cuotas)
+        # Fuente B: CSVs históricos (filas sin resultado = partidos futuros)
+        # Esto garantiza cobertura de las 6 ligas nuevas y fines de semana
+
+        import pandas as pd
+
+        candidate_rows = []  # list of (div, home, away, ko_str, odds_row)
+
+        # Fuente A — fixtures.csv
         if fix_df is not None:
-            for d_off in [1,2]:
-                target_date = (datetime.now()+timedelta(days=d_off)).date()
+            for scan_d in scan_dates:
+                target_date = datetime.strptime(scan_d, "%Y-%m-%d").date()
                 daily = fix_df[
                     (fix_df["Date"].dt.date==target_date) &
                     (fix_df["Div"].isin(euro_divs))
                 ]
                 for _, row in daily.iterrows():
-                    div=row.get("Div")
+                    div=row.get("Div","")
                     if div not in TARGET_LEAGUES: continue
-                    cfg=TARGET_LEAGUES[div]
                     h_n=str(row.get("HomeTeam","")).strip()
                     a_n=str(row.get("AwayTeam","")).strip()
                     if not h_n or not a_n: continue
-                    ko=str(row.get("Date",""))
-                    label=f"{h_n} vs {a_n} ({cfg['name']})"
-                    fid=f"{div}_{h_n}_{a_n}"
-                    print(f"\n  ── {label} ──", flush=True)
+                    candidate_rows.append((div, h_n, a_n, str(row.get("Date","")), row, "fixtures"))
 
-                    # [1] xG desde CSV histórico con shots
-                    df_hist=load_csv(div)
-                    xh,xa,xt,conf,src=build_xg(h_n,a_n,div,cfg,df_hist)
+        # Fuente B — CSVs históricos: filas SIN resultado son partidos futuros
+        for div in euro_divs:
+            if div not in TARGET_LEAGUES: continue
+            cfg_d = TARGET_LEAGUES[div]
+            df_div = load_csv(div)
+            if df_div is None: continue
+            try:
+                # Filas sin FTHG/FTAG = partidos no jugados aún
+                future = df_div[df_div["FTHG"].isna() | df_div["FTAG"].isna()].copy()
+                if future.empty: continue
+                future["Date"] = pd.to_datetime(future["Date"], dayfirst=True, errors="coerce")
+                for scan_d in scan_dates:
+                    target_date = datetime.strptime(scan_d, "%Y-%m-%d").date()
+                    daily_f = future[future["Date"].dt.date==target_date]
+                    for _, row in daily_f.iterrows():
+                        h_n=str(row.get("HomeTeam","")).strip()
+                        a_n=str(row.get("AwayTeam","")).strip()
+                        if not h_n or not a_n: continue
+                        # Evitar duplicados con fixtures.csv
+                        already = any(
+                            r[0]==div and
+                            difflib.SequenceMatcher(None,r[1].lower(),h_n.lower()).ratio()>0.80 and
+                            difflib.SequenceMatcher(None,r[2].lower(),a_n.lower()).ratio()>0.80
+                            for r in candidate_rows
+                        )
+                        if not already:
+                            candidate_rows.append((div, h_n, a_n, str(row.get("Date","")), row, "csv_hist"))
+            except Exception as e:
+                Log.warn(f"CSV hist future {div}: {e}", "SCAN")
 
-                    # [1] Cuotas desde fixtures.csv
-                    odds=get_odds_from_row(row,cfg)
+        Log.info(f"Candidatos encontrados: {len(candidate_rows)} partidos en {len(scan_dates)} fechas", "SCAN")
 
-                    # [2] Trend por nombre (fixtures.csv no tiene team_id)
-                    ts={}
-                    for te in all_trends.values():
-                        hn_t=te.get("homeTeam",{}).get("name","")
-                        an_t=te.get("awayTeam",{}).get("name","")
-                        if (difflib.SequenceMatcher(None,h_n,hn_t).ratio()>0.60 and
-                            difflib.SequenceMatcher(None,a_n,an_t).ratio()>0.60):
-                            ts=extract_trend(te); break
+        # ── Procesar todos los candidatos ─────────────────────────────────
+        for div, h_n, a_n, ko, row, row_src in candidate_rows:
+            cfg=TARGET_LEAGUES[div]
+            label=f"{h_n} vs {a_n} ({cfg['name']})"
+            fid=f"{div}_{h_n}_{a_n}"
+            Log.info(f"── {label} [{row_src}]", "SCAN")
 
-                    ok,reason=validate_xg(xh,xa,odds.get("H"),odds.get("A"),odds.get("O25"))
-                    if not ok: log_rej(label,"ALL",0,0,reason); continue
-                    if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
+            # xG desde CSV histórico
+            df_hist=load_csv(div)
+            xh,xa,xt,conf,src=build_xg(h_n,a_n,div,cfg,df_hist)
 
-                    probs=build_probs(xh,xa,conf,h_n,a_n,cfg,odds,ts)
-                    cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,div,ts)
-                    if cands:
-                        cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
-                        preliminary.append(cands[0])   # ← EUROPEAS ALIMENTAN preliminary ✅
+            # Cuotas — fixtures.csv si viene de ahí, CSV histórico si viene de csv_hist
+            odds=get_odds_from_row(row,cfg)
+
+            # Trend fd.org por nombre
+            ts={}
+            for te in all_trends.values():
+                hn_t=te.get("homeTeam",{}).get("name","")
+                an_t=te.get("awayTeam",{}).get("name","")
+                if (difflib.SequenceMatcher(None,h_n,hn_t).ratio()>0.60 and
+                    difflib.SequenceMatcher(None,a_n,an_t).ratio()>0.60):
+                    ts=extract_trend(te); break
+
+            ok,reason=validate_xg(xh,xa,odds.get("H"),odds.get("A"),odds.get("O25"))
+            if not ok: log_rej(label,"ALL",0,0,reason); continue
+            if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
+
+            probs=build_probs(xh,xa,conf,h_n,a_n,cfg,odds,ts)
+            cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,div,ts)
+            if cands:
+                cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
+                preliminary.append(cands[0])
 
         # ── [1]+[2] BSA — CSV goles proxy + fd.org fixtures + Trend ──────
         df_bra=load_csv("BSA")
         cfg_bra=TARGET_LEAGUES["BSA"]
 
-        for d in [tomorrow, day_after]:
+        for d in scan_dates:
             bsa_matches=get_fd_org_matches("BSA", d)
             time.sleep(7.0)
             for m in bsa_matches:
@@ -1580,7 +1631,7 @@ class TripleLeagueV72:
         # FIX #1 y #4: MEX ahora genera picks reales
         df_mex=load_csv("MEX")
         cfg_mex=TARGET_LEAGUES["MEX"]
-        mx_fixtures=get_mx_fixtures([tomorrow,day_after], self.apif_h)
+        mx_fixtures=get_mx_fixtures(scan_dates, self.apif_h)
 
         for m in mx_fixtures[:8]:
             h_n=m["teams"]["home"]["name"]
