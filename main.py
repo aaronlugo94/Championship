@@ -2202,410 +2202,577 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>V7.2 · Quant Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#07080d;
-  --s1:#0c0e17;
-  --s2:#11141f;
-  --border:#1c2035;
-  --border2:#252840;
-  --accent:#4f6ef7;
-  --accent2:#7c6fff;
-  --green:#22c55e;
-  --red:#ef4444;
-  --amber:#f59e0b;
-  --text:#e8eaf6;
-  --muted:#5a5f80;
-  --mono:'IBM Plex Mono',monospace;
-  --sans:'Barlow',sans-serif;
+  --bg:#07080d;--s1:#0c0e17;--s2:#11141f;
+  --border:#1c2035;--border2:#252840;
+  --accent:#4f6ef7;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;--sky:#38bdf8;--purple:#a78bfa;
+  --text:#e8eaf6;--muted:#5a5f80;--muted2:#3a3f5c;
+  --mono:'IBM Plex Mono',monospace;--sans:'Barlow',sans-serif;
 }
 body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;overflow-x:hidden}
 
 /* ── HEADER ── */
-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:1.25rem 2rem;
-  border-bottom:1px solid var(--border);
-  background:var(--s1);
-}
-.logo{display:flex;align-items:center;gap:10px}
-.logo-mark{width:28px;height:28px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
-.logo-mark svg{width:16px;height:16px;fill:#fff}
-.logo h1{font-size:1rem;font-weight:600;letter-spacing:.02em;color:var(--text)}
-.logo span{font-family:var(--mono);font-size:.65rem;color:var(--muted);margin-top:1px}
-.header-right{display:flex;align-items:center;gap:12px}
-.live-pill{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.65rem;color:var(--green);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);padding:4px 10px;border-radius:99px}
-.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:blink 1.8s infinite}
+header{display:flex;align-items:center;gap:12px;padding:1rem 2rem;border-bottom:1px solid var(--border);background:var(--s1);position:sticky;top:0;z-index:100}
+.logo-mark{width:26px;height:26px;background:var(--accent);border-radius:6px;display:grid;place-items:center;flex-shrink:0}
+.logo-mark svg{width:14px;height:14px;fill:#fff}
+.logo-text{font-size:.9rem;font-weight:600;letter-spacing:.02em}
+.logo-sub{font-family:var(--mono);font-size:.58rem;color:var(--muted)}
+.header-tabs{display:flex;gap:2px;margin-left:auto;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:2px}
+.htab{font-family:var(--mono);font-size:.65rem;padding:6px 16px;border:none;background:transparent;color:var(--muted);border-radius:6px;cursor:pointer;transition:all .15s;letter-spacing:.04em}
+.htab:hover{color:var(--text)}
+.htab.active{background:var(--accent);color:#fff}
+.live-pill{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:.6rem;color:var(--green);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);padding:4px 10px;border-radius:99px;margin-left:12px}
+.live-dot{width:5px;height:5px;border-radius:50%;background:var(--green);animation:blink 1.8s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-#last-update{font-family:var(--mono);font-size:.65rem;color:var(--muted)}
 
-/* ── STAT CARDS ── */
-.stats-row{
-  display:grid;
-  grid-template-columns:repeat(8,minmax(0,1fr));
-  border-bottom:1px solid var(--border);
-}
-.stat{
-  padding:1.25rem 1.5rem;
-  border-right:1px solid var(--border);
-  transition:background .15s;
-}
-.stat:last-child{border-right:none}
-.stat:hover{background:var(--s2)}
-.stat-label{font-family:var(--mono);font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
-.stat-value{font-size:1.65rem;font-weight:600;letter-spacing:-.03em;line-height:1}
-.stat-sub{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.3rem}
-.green{color:var(--green)} .red{color:var(--red)} .blue{color:var(--accent)} .amber{color:var(--amber)} .white{color:var(--text)}
+/* ── TABS ── */
+.tab-pane{display:none}
+.tab-pane.active{display:block}
 
-/* ── TOOLBAR ── */
-.toolbar{
-  display:flex;align-items:center;gap:8px;padding:.85rem 2rem;
-  background:var(--s1);border-bottom:1px solid var(--border);
-  flex-wrap:wrap;
-}
+/* ── TAB 0: CALENDARIO ── */
+.cal-toolbar{display:flex;align-items:center;gap:8px;padding:.85rem 2rem;background:var(--s1);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.league-scroll{display:flex;gap:5px;overflow-x:auto;flex:1;scrollbar-width:none}
+.league-scroll::-webkit-scrollbar{display:none}
+.l-chip{font-family:var(--mono);font-size:.6rem;padding:4px 11px;border:1px solid var(--border);border-radius:99px;cursor:pointer;white-space:nowrap;color:var(--muted);transition:all .15s;flex-shrink:0}
+.l-chip:hover{color:var(--text)}
+.l-chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.date-nav{display:flex;gap:4px;align-items:center;flex-shrink:0}
+.dday{font-family:var(--mono);font-size:.62rem;padding:4px 10px;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--muted);transition:all .15s}
+.dday:hover{color:var(--text)}
+.dday.active{background:var(--s2);color:var(--text);border-color:var(--border2)}
+
+.cal-body{padding:1.5rem 2rem}
+.league-group{margin-bottom:1.5rem}
+.lg-header{display:flex;align-items:center;gap:8px;margin-bottom:.5rem}
+.lg-name{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
+.lg-count{font-family:var(--mono);font-size:.55rem;color:var(--muted2);background:var(--s2);border:1px solid var(--border);padding:1px 7px;border-radius:99px}
+
+.match-row{display:grid;grid-template-columns:55px 1fr 90px 1fr 140px 90px;gap:10px;align-items:center;padding:10px 14px;border:1px solid var(--border);border-radius:8px;margin-bottom:5px;cursor:pointer;transition:all .15s;background:var(--s1)}
+.match-row:hover{border-color:var(--border2);background:var(--s2)}
+.match-row.has-pick{border-color:rgba(79,110,247,.3);background:rgba(79,110,247,.04)}
+.mr-time{font-family:var(--mono);font-size:.62rem;color:var(--muted)}
+.mr-home{text-align:right}
+.mr-away{text-align:left}
+.team-name{font-size:.85rem;font-weight:500}
+.form-row{display:flex;gap:2px;margin-top:3px}
+.form-row.right{justify-content:flex-end}
+.fd{width:14px;height:14px;border-radius:2px;display:flex;align-items:center;justify-content:center;font-size:.52rem;font-weight:600}
+.fw{background:rgba(34,197,94,.15);color:var(--green)}
+.fl{background:rgba(239,68,68,.15);color:var(--red)}
+.fdr{background:rgba(245,158,11,.15);color:var(--amber)}
+.mr-probs{display:flex;gap:3px;justify-content:center}
+.prob-pill{font-family:var(--mono);font-size:.6rem;padding:3px 7px;border-radius:4px;border:1px solid var(--border)}
+.pp-h{color:var(--green);border-color:rgba(34,197,94,.2);background:rgba(34,197,94,.05)}
+.pp-d{color:var(--amber);border-color:rgba(245,158,11,.2);background:rgba(245,158,11,.05)}
+.pp-a{color:var(--red);border-color:rgba(239,68,68,.2);background:rgba(239,68,68,.05)}
+.mr-pick{text-align:right}
+.pick-badge{font-family:var(--mono);font-size:.58rem;padding:3px 9px;border-radius:4px;border:1px solid rgba(79,110,247,.3);color:var(--accent);background:rgba(79,110,247,.08)}
+.mr-xg{font-family:var(--mono);font-size:.65rem;color:var(--muted);text-align:center}
+
+/* Match detail expandido */
+.match-detail{background:var(--s2);border:1px solid var(--border2);border-radius:10px;padding:1.25rem;margin-top:4px;margin-bottom:8px;display:none}
+.match-detail.open{display:block}
+.md-header{display:grid;grid-template-columns:1fr 160px 1fr;gap:1rem;align-items:center;margin-bottom:1rem}
+.md-team{text-align:center}
+.md-team-name{font-size:1.1rem;font-weight:600;margin-bottom:.4rem}
+.md-center{text-align:center;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem}
+.md-xg{font-size:1.4rem;font-weight:600;letter-spacing:.05em;color:var(--accent)}
+.prob-bar-wrap{margin:.5rem 0}
+.prob-bar{display:flex;height:5px;border-radius:3px;overflow:hidden}
+.pb-h{background:var(--green)}
+.pb-d{background:var(--amber)}
+.pb-a{background:var(--red)}
+.prob-labels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:3px}
+.stats-grid{display:grid;grid-template-columns:1fr 90px 1fr;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:1rem}
+.sg-col{display:flex;flex-direction:column}
+.sg-row{display:grid;grid-template-columns:1fr 90px 1fr;border-bottom:1px solid var(--border)}
+.sg-row:last-child{border-bottom:none}
+.sg-val{padding:6px 12px;font-family:var(--mono);font-size:.7rem;text-align:right;background:var(--s1)}
+.sg-val.left{text-align:left;background:var(--s1)}
+.sg-lbl{padding:6px 8px;font-family:var(--mono);font-size:.58rem;color:var(--muted);text-align:center;background:var(--bg)}
+.sg-val.winner{color:var(--green);font-weight:500}
+.md-markets{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:1rem}
+.mkt-card{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:.7rem;text-align:center}
+.mkt-label{font-family:var(--mono);font-size:.55rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.3rem}
+.mkt-pct{font-size:1.1rem;font-weight:600}
+.mkt-fair{font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.2rem}
+.h2h-section{margin-top:.75rem}
+.h2h-title{font-family:var(--mono);font-size:.58rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:.5rem}
+.h2h-summary{display:flex;gap:6px;margin-bottom:.5rem;flex-wrap:wrap}
+.h2h-stat{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 12px;text-align:center;flex:1}
+.h2h-stat-val{font-size:.9rem;font-weight:600}
+.h2h-stat-lbl{font-family:var(--mono);font-size:.55rem;color:var(--muted)}
+.h2h-match{display:grid;grid-template-columns:70px 1fr auto 1fr;gap:6px;align-items:center;padding:5px 8px;background:var(--bg);border-radius:5px;margin-bottom:3px;font-size:.75rem}
+.h2h-score{font-family:var(--mono);font-weight:600;text-align:center;padding:0 6px}
+
+/* ── TAB 1: PICKS JORNADA ── */
+.picks-toolbar{display:flex;align-items:center;gap:8px;padding:.85rem 2rem;background:var(--s1);border-bottom:1px solid var(--border);flex-wrap:wrap}
 .seg{display:flex;gap:2px;background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:2px}
-.seg-btn{
-  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
-  padding:5px 12px;border:none;background:transparent;color:var(--muted);
-  border-radius:6px;cursor:pointer;transition:all .15s;
-}
+.seg-btn{font-family:var(--mono);font-size:.62rem;padding:5px 12px;border:none;background:transparent;color:var(--muted);border-radius:6px;cursor:pointer;transition:all .15s}
 .seg-btn:hover{color:var(--text)}
 .seg-btn.active{background:var(--accent);color:#fff}
 .spacer{flex:1}
-#search{
-  font-family:var(--mono);font-size:.7rem;padding:7px 12px;
-  background:var(--s2);border:1px solid var(--border);color:var(--text);
-  border-radius:7px;outline:none;width:200px;transition:border-color .15s;
-}
-#search:focus{border-color:var(--accent)}
-#search::placeholder{color:var(--muted)}
-#resolve-btn{
-  font-family:var(--mono);font-size:.65rem;letter-spacing:.04em;
-  padding:7px 14px;background:rgba(79,110,247,.12);
-  border:1px solid rgba(79,110,247,.3);color:var(--accent);
-  border-radius:7px;cursor:pointer;transition:all .15s;white-space:nowrap;
-}
-#resolve-btn:hover{background:rgba(79,110,247,.2)}
-#resolve-btn:disabled{opacity:.5;cursor:default}
+.resolve-btn{font-family:var(--mono);font-size:.62rem;padding:7px 14px;background:rgba(79,110,247,.1);border:1px solid rgba(79,110,247,.3);color:var(--accent);border-radius:7px;cursor:pointer}
 
-/* ── TABLE ── */
-.table-wrap{overflow-x:auto;min-height:400px}
-table{width:100%;border-collapse:collapse;font-size:.78rem}
-thead th{
-  font-family:var(--mono);font-size:.58rem;text-transform:uppercase;
-  letter-spacing:.08em;color:var(--muted);padding:10px 16px;
-  text-align:left;border-bottom:1px solid var(--border);
-  cursor:pointer;user-select:none;white-space:nowrap;
-  background:var(--s1);position:sticky;top:0;
-}
+/* Stats cards row */
+.stats-strip{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));border-bottom:1px solid var(--border)}
+.scard{padding:1rem 1.25rem;border-right:1px solid var(--border)}
+.scard:last-child{border-right:none}
+.scard-label{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.4rem}
+.scard-val{font-size:1.5rem;font-weight:600;line-height:1}
+.scard-sub{font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.25rem}
+.c-green{color:var(--green)}.c-red{color:var(--red)}.c-blue{color:var(--accent)}.c-amber{color:var(--amber)}.c-white{color:var(--text)}
+
+/* Tabla de picks */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.75rem}
+thead th{font-family:var(--mono);font-size:.56rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:9px 14px;text-align:left;border-bottom:1px solid var(--border);background:var(--s1);cursor:pointer;white-space:nowrap;position:sticky;top:57px}
 thead th:hover{color:var(--text)}
 thead th.sorted{color:var(--accent)}
-thead th.sorted::after{content:' ↓';font-size:.55rem}
-thead th.sorted.asc::after{content:' ↑'}
-tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s;cursor:pointer}
 tbody tr:hover{background:var(--s2)}
-tbody td{padding:10px 16px;white-space:nowrap;font-family:var(--mono);font-size:.73rem;vertical-align:middle}
-td.party{font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--text);white-space:normal;min-width:160px}
+tbody td{padding:9px 14px;font-family:var(--mono);font-size:.7rem;vertical-align:middle;white-space:nowrap}
+td.party{font-family:var(--sans);font-size:.82rem;font-weight:500;white-space:normal;min-width:150px}
 td.muted-td{color:var(--muted)}
+.empty{text-align:center;padding:4rem;color:var(--muted);font-family:var(--mono);font-size:.75rem}
 
-/* ── BADGES ── */
-.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:.6rem;font-weight:500;letter-spacing:.05em;gap:4px}
+/* badges */
+.badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:.58rem;font-weight:500;letter-spacing:.04em}
 .b-win{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.2)}
 .b-loss{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
 .b-pend{background:rgba(79,110,247,.1);color:var(--accent);border:1px solid rgba(79,110,247,.2)}
-.b-under{background:rgba(56,189,248,.08);color:#38bdf8;border:1px solid rgba(56,189,248,.15)}
+.b-under{background:rgba(56,189,248,.08);color:var(--sky);border:1px solid rgba(56,189,248,.15)}
 .b-over{background:rgba(251,146,60,.08);color:#fb923c;border:1px solid rgba(251,146,60,.15)}
-.b-dc{background:rgba(167,139,250,.08);color:#a78bfa;border:1px solid rgba(167,139,250,.15)}
+.b-dc{background:rgba(167,139,250,.08);color:var(--purple);border:1px solid rgba(167,139,250,.15)}
 .b-1x2{background:rgba(250,204,21,.08);color:#facc15;border:1px solid rgba(250,204,21,.15)}
-
-.pos{color:var(--green)} .neg{color:var(--red)} .neu{color:var(--muted)}
-.ev-high{color:var(--green)} .ev-mid{color:var(--amber)} .ev-low{color:var(--muted)}
-
-/* ── EMPTY ── */
-.empty{text-align:center;padding:5rem;color:var(--muted);font-family:var(--mono);font-size:.8rem}
-
-/* ── MINI CHART BAR ── */
-.xg-bar{display:flex;gap:3px;align-items:center}
+.b-btts{background:rgba(34,197,94,.08);color:var(--green);border:1px solid rgba(34,197,94,.15)}
+.b-dnb{background:rgba(245,158,11,.08);color:var(--amber);border:1px solid rgba(245,158,11,.15)}
+.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--muted)}
+.ev-h{color:var(--green)}.ev-m{color:var(--amber)}.ev-l{color:var(--muted)}
+.xg-mini{display:flex;gap:3px;align-items:center}
 .xg-seg{height:4px;border-radius:2px;min-width:3px}
 
-/* ── RESPONSIVE ── */
+/* ── TAB 2: HISTORICO ── */
+.hist-body{padding:1.5rem 2rem}
+.section-title{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.75rem}
+.chart-container{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:1.25rem;margin-bottom:1.5rem;position:relative}
+.by-mkt-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:1.5rem}
+.bm-card{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:1rem}
+.bm-name{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:.5rem}
+.bm-br{font-size:1.3rem;font-weight:600}
+.bm-n{font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.2rem}
+.bm-form{display:flex;gap:3px;margin-top:.5rem}
+.by-league-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.bl-card{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:.85rem}
+.bl-name{font-size:.78rem;font-weight:500;margin-bottom:.4rem}
+.bl-stats{font-family:var(--mono);font-size:.65rem;color:var(--muted)}
+
 @media(max-width:900px){
-  .stats-row{grid-template-columns:repeat(4,1fr)}
-  .stat{border-bottom:1px solid var(--border)}
-  header{padding:1rem}
-  .toolbar{padding:.75rem 1rem}
-  tbody td{padding:8px 10px}
+  .stats-strip{grid-template-columns:repeat(4,1fr)}
+  .scard{border-bottom:1px solid var(--border)}
+  .match-row{grid-template-columns:45px 1fr 80px 1fr;gap:6px}
+  .mr-pick,.mr-xg{display:none}
+  header{padding:.75rem 1rem}
+  .cal-body,.hist-body{padding:1rem}
 }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="logo">
-    <div class="logo-mark">
-      <svg viewBox="0 0 16 16"><path d="M2 12 L8 4 L14 12 Z"/></svg>
-    </div>
-    <div>
-      <h1>V7.2 Quant</h1>
-      <span>Triple League Specialist</span>
-    </div>
+  <div class="logo-mark"><svg viewBox="0 0 16 16"><path d="M2 12 L8 4 L14 12 Z"/></svg></div>
+  <div><div class="logo-text">V7.2 Quant</div><div class="logo-sub">Triple League Specialist</div></div>
+  <div class="header-tabs">
+    <button class="htab active" onclick="showMainTab(0,this)">Calendario</button>
+    <button class="htab" onclick="showMainTab(1,this)">Picks jornada</button>
+    <button class="htab" onclick="showMainTab(2,this)">Histórico</button>
   </div>
-  <div class="header-right">
-    <span id="last-update"></span>
-    <div class="live-pill"><span class="live-dot"></span>LIVE</div>
-  </div>
+  <div class="live-pill"><span class="live-dot"></span><span id="last-upd">live</span></div>
 </header>
 
-<div class="stats-row">
-  <div class="stat">
-    <div class="stat-label">Picks totales</div>
-    <div class="stat-value white" id="s-total">—</div>
-    <div class="stat-sub" id="s-sub-total"></div>
+<!-- ══════════ TAB 0: CALENDARIO ══════════ -->
+<div id="tab0" class="tab-pane active">
+  <div class="cal-toolbar">
+    <div class="league-scroll" id="league-chips"></div>
+    <div class="date-nav" id="date-nav"></div>
   </div>
-  <div class="stat">
-    <div class="stat-label">Win</div>
-    <div class="stat-value green" id="s-win">—</div>
-    <div class="stat-sub" id="s-sub-win"></div>
+  <div class="cal-body" id="cal-body"><div class="empty">cargando partidos...</div></div>
+</div>
+
+<!-- ══════════ TAB 1: PICKS JORNADA ══════════ -->
+<div id="tab1" class="tab-pane">
+  <div class="stats-strip" id="stats-strip">
+    <div class="scard"><div class="scard-label">Picks totales</div><div class="scard-val c-white" id="s-total">—</div><div class="scard-sub" id="s-sub-total"></div></div>
+    <div class="scard"><div class="scard-label">Win</div><div class="scard-val c-green" id="s-win">—</div><div class="scard-sub" id="s-sub-win"></div></div>
+    <div class="scard"><div class="scard-label">Loss</div><div class="scard-val c-red" id="s-loss">—</div><div class="scard-sub" id="s-sub-loss"></div></div>
+    <div class="scard"><div class="scard-label">Pending</div><div class="scard-val c-blue" id="s-pend">—</div><div class="scard-sub">esperando</div></div>
+    <div class="scard"><div class="scard-label">Beat Rate</div><div class="scard-val" id="s-br">—</div><div class="scard-sub">mín 52%</div></div>
+    <div class="scard"><div class="scard-label">Avg EV</div><div class="scard-val c-blue" id="s-ev">—</div><div class="scard-sub">apertura</div></div>
+    <div class="scard"><div class="scard-label">PnL (u)</div><div class="scard-val" id="s-pnl">—</div><div class="scard-sub">unidades</div></div>
+    <div class="scard"><div class="scard-label">Burn-in</div><div class="scard-val" id="s-burn">—</div><div class="scard-sub" id="s-burn-sub">picks</div></div>
   </div>
-  <div class="stat">
-    <div class="stat-label">Loss</div>
-    <div class="stat-value red" id="s-loss">—</div>
-    <div class="stat-sub" id="s-sub-loss"></div>
+  <div class="picks-toolbar">
+    <div class="seg" id="flt-seg">
+      <button class="seg-btn active" data-f="all">Todos</button>
+      <button class="seg-btn" data-f="WIN">Win</button>
+      <button class="seg-btn" data-f="LOSS">Loss</button>
+      <button class="seg-btn" data-f="PENDING">Pending</button>
+    </div>
+    <div class="seg" id="mkt-seg">
+      <button class="seg-btn active" data-m="all">Mercados</button>
+      <button class="seg-btn" data-m="UNDER">Under</button>
+      <button class="seg-btn" data-m="OVER">Over</button>
+      <button class="seg-btn" data-m="DC">DC</button>
+      <button class="seg-btn" data-m="1X2">1X2</button>
+      <button class="seg-btn" data-m="BTTS">BTTS</button>
+      <button class="seg-btn" data-m="DNB">DNB</button>
+    </div>
+    <div class="spacer"></div>
+    <input id="picks-search" type="text" placeholder="buscar equipo..." style="font-family:var(--mono);font-size:.68rem;padding:7px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+    <button class="resolve-btn" onclick="resolveData()">resolver picks</button>
   </div>
-  <div class="stat">
-    <div class="stat-label">Pending</div>
-    <div class="stat-value blue" id="s-pend">—</div>
-    <div class="stat-sub">esperando resultado</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Beat Rate</div>
-    <div class="stat-value" id="s-br">—</div>
-    <div class="stat-sub">mín. 52% para live</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Avg EV</div>
-    <div class="stat-value blue" id="s-ev">—</div>
-    <div class="stat-sub">apertura</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">PnL (u)</div>
-    <div class="stat-value" id="s-pnl">—</div>
-    <div class="stat-sub">unidades de bankroll</div>
-  </div>
-  <div class="stat">
-    <div class="stat-label">Burn-in</div>
-    <div class="stat-value" id="s-burn">—</div>
-    <div class="stat-sub" id="s-burn-sub">picks resueltos</div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th data-col="date">Fecha</th>
+        <th data-col="div">Liga</th>
+        <th data-col="match">Partido</th>
+        <th data-col="market">Mkt</th>
+        <th data-col="odd">Cuota</th>
+        <th data-col="ev">EV</th>
+        <th data-col="prob">Prob</th>
+        <th data-col="stake">Stake</th>
+        <th data-col="xg">xG</th>
+        <th data-col="status">Resultado</th>
+        <th data-col="profit">Profit</th>
+      </tr></thead>
+      <tbody id="picks-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
+    </table>
   </div>
 </div>
 
-<div class="toolbar">
-  <div class="seg" id="filter-seg">
-    <button class="seg-btn active" data-filter="all">Todos</button>
-    <button class="seg-btn" data-filter="WIN">Win</button>
-    <button class="seg-btn" data-filter="LOSS">Loss</button>
-    <button class="seg-btn" data-filter="PENDING">Pending</button>
-  </div>
-  <div class="seg" id="mkt-seg">
-    <button class="seg-btn active" data-mkt="all">Mercados</button>
-    <button class="seg-btn" data-mkt="UNDER">Under</button>
-    <button class="seg-btn" data-mkt="OVER">Over</button>
-    <button class="seg-btn" data-mkt="DC">DC</button>
-    <button class="seg-btn" data-mkt="1X2">1X2</button>
-    <button class="seg-btn" data-mkt="BTTS">BTTS Sí</button>
-    <button class="seg-btn" data-mkt="BTTS_NO">BTTS No</button>
-    <button class="seg-btn" data-mkt="DNB">DNB</button>
-  </div>
-  <div class="spacer"></div>
-  <input id="search" type="text" placeholder="buscar equipo, liga...">
-  <button id="resolve-btn" onclick="resolveData()">resolver picks</button>
-</div>
-
-<div class="table-wrap">
-<table id="picks-table">
-  <thead>
-    <tr>
-      <th data-col="date">Fecha</th>
-      <th data-col="div">Liga</th>
-      <th data-col="match">Partido</th>
-      <th data-col="market">Mkt</th>
-      <th data-col="odd">Cuota</th>
-      <th data-col="ev">EV</th>
-      <th data-col="prob">Prob</th>
-      <th data-col="stake">Stake</th>
-      <th data-col="xg">xG</th>
-      <th data-col="status">Resultado</th>
-      <th data-col="profit">Profit</th>
-    </tr>
-  </thead>
-  <tbody id="picks-body">
-    <tr><td colspan="11" class="empty">cargando...</td></tr>
-  </tbody>
-</table>
-</div>
-
-<div style="border-top:1px solid var(--border);background:var(--s1)">
-  <div style="padding:1.5rem 2rem;border-bottom:1px solid var(--border)">
-    <p style="font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:.75rem">Análisis de partido</p>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <input id="an-home" type="text" placeholder="Equipo local" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:190px">
-      <span style="color:var(--muted);font-family:var(--mono);font-size:.7rem">vs</span>
-      <input id="an-away" type="text" placeholder="Equipo visitante" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:190px">
-      <input id="an-div" type="text" placeholder="Liga (ej. E0)" style="font-family:var(--mono);font-size:.75rem;padding:8px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:100px">
-      <button onclick="analyzeMatch()" style="font-family:var(--mono);font-size:.65rem;padding:9px 18px;background:var(--accent);border:none;color:#fff;border-radius:7px;cursor:pointer">analizar</button>
-      <span id="an-loading" style="font-family:var(--mono);font-size:.65rem;color:var(--muted);display:none">calculando...</span>
+<!-- ══════════ TAB 2: HISTÓRICO ══════════ -->
+<div id="tab2" class="tab-pane">
+  <div class="hist-body">
+    <p class="section-title">PnL acumulado</p>
+    <div class="chart-container">
+      <canvas id="pnl-chart" height="120"></canvas>
     </div>
-  </div>
-
-  <div id="an-result" style="display:none;padding:1.5rem 2rem">
-
-    <!-- Header partido -->
-    <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:1.5rem;align-items:center;margin-bottom:1.5rem">
-      <div style="text-align:right">
-        <p id="an-home-name" style="font-size:1.3rem;font-weight:600;margin-bottom:.3rem"></p>
-        <p id="an-league" style="font-size:.65rem;color:var(--muted);font-family:var(--mono)"></p>
-        <div style="display:flex;justify-content:flex-end;gap:3px;margin-top:.5rem" id="an-home-form"></div>
-      </div>
-      <div style="text-align:center;background:var(--s2);border:1px solid var(--border);border-radius:12px;padding:1rem 1.5rem">
-        <p style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.25rem">xG</p>
-        <p id="an-xg-score" style="font-size:1.6rem;font-weight:600;letter-spacing:.05em"></p>
-        <div style="display:flex;gap:6px;justify-content:center;margin-top:.5rem">
-          <span id="an-ph-pill" style="font-family:var(--mono);font-size:.65rem;padding:3px 9px;border-radius:4px;background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.2)"></span>
-          <span id="an-pd-pill" style="font-family:var(--mono);font-size:.65rem;padding:3px 9px;border-radius:4px;background:rgba(245,158,11,.1);color:var(--amber);border:1px solid rgba(245,158,11,.2)"></span>
-          <span id="an-pa-pill" style="font-family:var(--mono);font-size:.65rem;padding:3px 9px;border-radius:4px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)"></span>
-        </div>
-      </div>
-      <div style="text-align:left">
-        <p id="an-away-name" style="font-size:1.3rem;font-weight:600;margin-bottom:.3rem"></p>
-        <p id="an-away-league" style="font-size:.65rem;color:var(--muted);font-family:var(--mono)"></p>
-        <div style="display:flex;gap:3px;margin-top:.5rem" id="an-away-form"></div>
-      </div>
-    </div>
-
-    <!-- Stats grid home vs away -->
-    <div style="display:grid;grid-template-columns:1fr 120px 1fr;gap:0;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:1.5rem">
-      <div style="background:var(--s2);padding:.6rem 1rem;font-family:var(--mono);font-size:.6rem;text-align:right;font-weight:500;color:var(--muted);border-bottom:1px solid var(--border)">LOCAL</div>
-      <div style="background:var(--s2);padding:.6rem;font-family:var(--mono);font-size:.6rem;text-align:center;color:var(--muted);border-bottom:1px solid var(--border)">STAT</div>
-      <div style="background:var(--s2);padding:.6rem 1rem;font-family:var(--mono);font-size:.6rem;font-weight:500;color:var(--muted);border-bottom:1px solid var(--border)">VISITANTE</div>
-      <div id="stats-home-col" style="padding:.4rem 1rem"></div>
-      <div id="stats-label-col" style="padding:.4rem;background:var(--bg)"></div>
-      <div id="stats-away-col" style="padding:.4rem 1rem"></div>
-    </div>
-
-    <!-- O/U y BTTS -->
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:1.5rem">
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.85rem;text-align:center">
-        <p style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase">Over 2.5</p>
-        <p id="an-po" style="font-size:1.2rem;font-weight:600;color:#38bdf8"></p>
-        <p id="an-fo" style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.2rem"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.85rem;text-align:center">
-        <p style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase">Under 2.5</p>
-        <p id="an-pu" style="font-size:1.2rem;font-weight:600;color:#a78bfa"></p>
-        <p id="an-fu" style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.2rem"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.85rem;text-align:center">
-        <p style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase">BTTS Sí</p>
-        <p id="an-py" style="font-size:1.2rem;font-weight:600;color:var(--green)"></p>
-        <p id="an-fy" style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.2rem"></p>
-      </div>
-      <div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.85rem;text-align:center">
-        <p style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.35rem;text-transform:uppercase">BTTS No</p>
-        <p id="an-pn" style="font-size:1.2rem;font-weight:600;color:var(--red)"></p>
-        <p style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.2rem">cuota fair</p>
-      </div>
-    </div>
-
-    <!-- H2H -->
-    <div id="an-h2h-wrap" style="margin-bottom:1.5rem;display:none">
-      <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.75rem">Head to Head</p>
-      <div id="an-h2h-summary" style="display:flex;gap:1rem;margin-bottom:.75rem;flex-wrap:wrap"></div>
-      <div id="an-h2h-matches" style="display:flex;flex-direction:column;gap:4px"></div>
-    </div>
-
+    <p class="section-title">por mercado</p>
+    <div class="by-mkt-grid" id="by-mkt-grid"></div>
+    <p class="section-title">por liga</p>
+    <div class="by-league-grid" id="by-league-grid"></div>
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-let allPicks = [], sortCol = 'date', sortDir = -1;
+// ── STATE ──
+let allPicks=[], calMatches=[], sortCol='date', sortDir=-1;
+let activeFlt='all', activeMkt='all', activeLeague='all', activeDate='';
+let pnlChart=null;
 
-const mktBadge = m => {
-  const map = {UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2',BTTS:'b-under',BTTS_NO:'b-over',DNB:'b-dc'};
-  return `<span class="badge ${map[m]||'b-1x2'}">${m}</span>`;
-};
-const statusBadge = s => {
-  const map = {WIN:'b-win',LOSS:'b-loss',PENDING:'b-pend'};
-  const icon = {WIN:'▲',LOSS:'▼',PENDING:'◎'};
-  return `<span class="badge ${map[s]||''}">${icon[s]||''}${s}</span>`;
-};
-const evClass = v => v >= 0.10 ? 'ev-high' : v >= 0.05 ? 'ev-mid' : 'ev-low';
-const fmtDate = d => { if (!d) return '—'; const p = d.split('T')[0].split('-'); return `${p[2]}/${p[1]}/${p[0].slice(2)}`; };
-const xgBar = (h, a) => {
-  const total = (h||0) + (a||0);
-  if (!total) return '—';
-  const hw = Math.round((h/total)*60);
-  return `<div class="xg-bar"><span style="font-size:.6rem;color:var(--muted)">${(h||0).toFixed(1)}</span><div class="xg-seg" style="width:${hw}px;background:var(--accent)"></div><div class="xg-seg" style="width:${60-hw}px;background:var(--red)"></div><span style="font-size:.6rem;color:var(--muted)">${(a||0).toFixed(1)}</span></div>`;
-};
-
-function updateStats(s) {
-  const resolved = s.wins + s.losses;
-  const br = resolved ? s.wins/resolved : 0;
-  document.getElementById('s-total').textContent = s.total;
-  document.getElementById('s-sub-total').textContent = `${resolved} resueltos`;
-  document.getElementById('s-win').textContent = s.wins;
-  document.getElementById('s-sub-win').textContent = resolved ? `${(s.wins/resolved*100).toFixed(1)}%` : '';
-  document.getElementById('s-loss').textContent = s.losses;
-  document.getElementById('s-sub-loss').textContent = resolved ? `${(s.losses/resolved*100).toFixed(1)}%` : '';
-  document.getElementById('s-pend').textContent = s.pending;
-  const brEl = document.getElementById('s-br');
-  brEl.textContent = resolved ? (br*100).toFixed(1)+'%' : '—';
-  brEl.className = 'stat-value ' + (br >= 0.55 ? 'green' : br >= 0.50 ? 'amber' : 'red');
-  document.getElementById('s-ev').textContent = '+' + s.avg_ev.toFixed(1) + '%';
-  const pnlEl = document.getElementById('s-pnl');
-  pnlEl.textContent = (s.pnl >= 0 ? '+' : '') + s.pnl.toFixed(4);
-  pnlEl.className = 'stat-value ' + (s.pnl > 0 ? 'green' : s.pnl < 0 ? 'red' : 'white');
-  const burnEl = document.getElementById('s-burn');
-  burnEl.textContent = s.resolved + '/30';
-  burnEl.className = 'stat-value ' + (s.resolved >= 30 ? 'green' : 'blue');
-  document.getElementById('s-burn-sub').textContent = s.resolved >= 30 ? '¡listo para live!' : `faltan ${30-s.resolved}`;
-  document.getElementById('last-update').textContent = new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+// ── TAB SWITCHING ──
+function showMainTab(i,btn){
+  document.querySelectorAll('.tab-pane').forEach((p,j)=>p.classList.toggle('active',j===i));
+  document.querySelectorAll('.htab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(i===1 && !allPicks.length) loadPicks();
+  if(i===2) renderHistorico();
 }
 
-function render() {
-  const search = document.getElementById('search').value.toLowerCase();
-  let data = allPicks.filter(p => {
-    if (activeFlt !== 'all' && p.status !== activeFlt) return false;
-    if (activeMkt !== 'all' && p.market !== activeMkt) return false;
-    if (search) {
-      const hay = ((p.home||'') + ' ' + (p.away||'') + ' ' + (p.div||'') + ' ' + (p.market||'')).toLowerCase();
-      if (!hay.includes(search)) return false;
-    }
+// ════════════════════════════════════════
+// TAB 0: CALENDARIO
+// ════════════════════════════════════════
+const LEAGUES = {
+  "E0":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier","E1":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 Championship","E2":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 League One",
+  "SP1":"🇪🇸 La Liga","SP2":"🇪🇸 Segunda",
+  "D1":"🇩🇪 Bundesliga","D2":"🇩🇪 Bundesliga 2",
+  "I1":"🇮🇹 Serie A","I2":"🇮🇹 Serie B",
+  "F1":"🇫🇷 Ligue 1","F2":"🇫🇷 Ligue 2",
+  "N1":"🇳🇱 Eredivisie","P1":"🇵🇹 Primeira",
+  "B1":"🇧🇪 Jupiler","SC0":"🏴󠁧󠁢󠁳󠁣󠁴 Premiership",
+  "T1":"🇹🇷 Süper Lig","G1":"🇬🇷 Super League",
+};
+
+function fd(r){
+  const c=r==='W'?'fw':r==='D'?'fdr':'fl';
+  return `<span class="fd ${c}">${r}</span>`;
+}
+
+function renderCalendar(){
+  const body=document.getElementById('cal-body');
+  let matches=calMatches.filter(m=>{
+    if(activeDate && m.date!==activeDate) return false;
+    if(activeLeague!=='all' && m.div!==activeLeague) return false;
     return true;
   });
-  data.sort((a,b) => {
-    let av = a[sortCol] ?? '', bv = b[sortCol] ?? '';
-    if (typeof av === 'string') av = av.toLowerCase();
-    if (typeof bv === 'string') bv = bv.toLowerCase();
-    return av < bv ? sortDir : av > bv ? -sortDir : 0;
+  if(!matches.length){body.innerHTML='<div class="empty">Sin partidos para este filtro</div>';return;}
+
+  // Agrupar por liga
+  const byLeague={};
+  matches.forEach(m=>{
+    const key=m.div;
+    if(!byLeague[key]) byLeague[key]=[];
+    byLeague[key].push(m);
   });
-  if (!data.length) {
-    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">sin picks con ese filtro</td></tr>`;
-    return;
+
+  body.innerHTML=Object.entries(byLeague).map(([div,ms])=>`
+    <div class="league-group">
+      <div class="lg-header">
+        <span class="lg-name">${LEAGUES[div]||div}</span>
+        <span class="lg-count">${ms.length} partidos</span>
+      </div>
+      ${ms.map(m=>matchRowHTML(m)).join('')}
+    </div>`).join('');
+
+  // Event listeners para expandir
+  document.querySelectorAll('.match-row').forEach(row=>{
+    row.addEventListener('click',()=>{
+      const det=row.nextElementSibling;
+      if(det && det.classList.contains('match-detail')){
+        det.classList.toggle('open');
+        if(det.classList.contains('open') && !det.dataset.loaded){
+          det.dataset.loaded='1';
+          loadMatchDetail(det, row.dataset.home, row.dataset.away, row.dataset.div);
+        }
+      }
+    });
+  });
+}
+
+function matchRowHTML(m){
+  const hasPick=!!m.pick;
+  const ph=m.ph?`${(m.ph*100).toFixed(0)}%`:'—';
+  const pd=m.pd?`${(m.pd*100).toFixed(0)}%`:'—';
+  const pa=m.pa?`${(m.pa*100).toFixed(0)}%`:'—';
+  const xg=m.xg_h&&m.xg_a?`${m.xg_h}—${m.xg_a}`:'';
+  const pickBadge=hasPick?`<span class="pick-badge">🎯 ${m.pick.market} @${m.pick.odd.toFixed(2)}</span>`:'';
+  const fh=(m.form_h||[]).map(fd).join('');
+  const fa=(m.form_a||[]).map(fd).join('');
+  return `
+    <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
+      <div class="mr-time">${m.time||m.date?.slice(5)||''}</div>
+      <div class="mr-home">
+        <div class="team-name">${m.home}</div>
+        <div class="form-row right">${fh}</div>
+      </div>
+      <div class="mr-probs">
+        <span class="prob-pill pp-h">${ph}</span>
+        <span class="prob-pill pp-d">${pd}</span>
+        <span class="prob-pill pp-a">${pa}</span>
+      </div>
+      <div class="mr-away">
+        <div class="team-name">${m.away}</div>
+        <div class="form-row">${fa}</div>
+      </div>
+      <div class="mr-pick">${pickBadge}</div>
+      <div class="mr-xg">${xg}</div>
+    </div>
+    <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
+      <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted)">cargando análisis...</div>
+    </div>`;
+}
+
+async function loadMatchDetail(detEl, home, away, div){
+  try{
+    const r=await fetch(`/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`);
+    const d=await r.json();
+    if(d.error){detEl.innerHTML=`<div style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${d.error}</div>`;return;}
+    const hs=d.home_stats, as_=d.away_stats;
+    const hh=hs.home, ah=as_.away;
+    function pct(v){return v!=null?`${(v*100).toFixed(1)}%`:'—';}
+    function fair(v){return v?`@${v} fair`:''}
+    function statRow(lbl,hv,av,hib=true){
+      const hN=parseFloat(hv)||0, aN=parseFloat(av)||0;
+      const hW=hib?(hN>aN):(hN<aN&&hN!==aN);
+      const aW=hib?(aN>hN):(aN<hN&&hN!==aN);
+      return `<div class="sg-row">
+        <div class="sg-val${hW?' winner':''}">${hv}</div>
+        <div class="sg-lbl">${lbl}</div>
+        <div class="sg-val left${aW?' winner':''}">${av}</div>
+      </div>`;
+    }
+    const h2h=d.h2h||{};
+    detEl.innerHTML=`
+      <div class="md-header">
+        <div class="md-team">
+          <div class="md-team-name">${d.home}</div>
+          <div class="form-row" style="justify-content:center">${(hs.overall?.form||[]).map(fd).join('')}</div>
+          <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted);margin-top:.3rem">PPG ${hs.overall?.ppg||'—'}</div>
+        </div>
+        <div class="md-center">
+          <div style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.2rem">xG estimado</div>
+          <div class="md-xg">${d.xg_home} — ${d.xg_away}</div>
+          <div class="prob-bar-wrap">
+            <div class="prob-bar">
+              <div class="pb-h" style="width:${(d.probs.home*100).toFixed(0)}%"></div>
+              <div class="pb-d" style="width:${(d.probs.draw*100).toFixed(0)}%"></div>
+              <div class="pb-a" style="width:${(d.probs.away*100).toFixed(0)}%"></div>
+            </div>
+            <div class="prob-labels"><span>${pct(d.probs.home)}</span><span>${pct(d.probs.draw)}</span><span>${pct(d.probs.away)}</span></div>
+          </div>
+        </div>
+        <div class="md-team">
+          <div class="md-team-name">${d.away}</div>
+          <div class="form-row" style="justify-content:center">${(as_.overall?.form||[]).map(fd).join('')}</div>
+          <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted);margin-top:.3rem">PPG ${as_.overall?.ppg||'—'}</div>
+        </div>
+      </div>
+      <div class="stats-grid">
+        ${statRow('PPG', hs.home?.ppg||'—', as_.away?.ppg||'—')}
+        ${statRow('Win%', (hs.home?.win_pct||'—')+'%', (as_.away?.win_pct||'—')+'%')}
+        ${statRow('Goles/PJ', hs.home?.avg_scored||'—', as_.away?.avg_scored||'—')}
+        ${statRow('Conc/PJ', hs.home?.avg_conceded||'—', as_.away?.avg_conceded||'—', false)}
+        ${statRow('BTTS%', (hs.overall?.btts_pct||'—')+'%', (as_.overall?.btts_pct||'—')+'%')}
+        ${statRow('O2.5%', (hs.overall?.over25_pct||'—')+'%', (as_.overall?.over25_pct||'—')+'%')}
+        ${statRow('xG', hs.home?.xg||'—', as_.away?.xg||'—')}
+        ${statRow('xGA', hs.home?.xga||'—', as_.away?.xga||'—', false)}
+      </div>
+      <div class="md-markets">
+        <div class="mkt-card"><div class="mkt-label">Over 2.5</div><div class="mkt-pct" style="color:var(--sky)">${pct(d.ou.over)}</div><div class="mkt-fair">${fair(d.fair_odds.over)}</div></div>
+        <div class="mkt-card"><div class="mkt-label">Under 2.5</div><div class="mkt-pct" style="color:var(--purple)">${pct(d.ou.under)}</div><div class="mkt-fair">${fair(d.fair_odds.under)}</div></div>
+        <div class="mkt-card"><div class="mkt-label">BTTS Sí</div><div class="mkt-pct" style="color:var(--green)">${pct(d.btts.yes)}</div><div class="mkt-fair">${fair(d.fair_odds.btts_y)}</div></div>
+        <div class="mkt-card"><div class="mkt-label">BTTS No</div><div class="mkt-pct" style="color:var(--red)">${pct(d.btts.no)}</div><div class="mkt-fair"></div></div>
+      </div>
+      ${h2h.total>0?`
+      <div class="h2h-section">
+        <div class="h2h-title">Head to Head — ${h2h.total} enfrentamientos</div>
+        <div class="h2h-summary">
+          <div class="h2h-stat"><div class="h2h-stat-val c-green">${h2h.home_wins}</div><div class="h2h-stat-lbl">${d.home.split(' ').pop()}</div></div>
+          <div class="h2h-stat"><div class="h2h-stat-val c-amber">${h2h.draws}</div><div class="h2h-stat-lbl">empates</div></div>
+          <div class="h2h-stat"><div class="h2h-stat-val c-red">${h2h.away_wins}</div><div class="h2h-stat-lbl">${d.away.split(' ').pop()}</div></div>
+          <div class="h2h-stat"><div class="h2h-stat-val" style="color:var(--sky)">${h2h.over25}/${h2h.total}</div><div class="h2h-stat-lbl">over 2.5</div></div>
+          <div class="h2h-stat"><div class="h2h-stat-val" style="color:var(--purple)">${h2h.btts}/${h2h.total}</div><div class="h2h-stat-lbl">btts</div></div>
+        </div>
+        ${(h2h.matches||[]).slice(0,5).map(m=>`
+          <div class="h2h-match">
+            <span style="color:var(--muted);font-family:var(--mono);font-size:.62rem">${m.date}</span>
+            <span style="text-align:right;font-size:.78rem">${m.home_team}</span>
+            <span class="h2h-score">${m.home_goals} - ${m.away_goals}</span>
+            <span style="font-size:.78rem">${m.away_team}</span>
+          </div>`).join('')}
+      </div>`:''}`;
+  }catch(e){
+    detEl.innerHTML=`<div style="color:var(--red);font-family:var(--mono);font-size:.7rem">Error: ${e.message}</div>`;
   }
-  const rows = data.map(p => {
-    const ev = parseFloat(p.ev||0);
-    const prob = parseFloat(p.prob||0)*100;
-    const stake = parseFloat(p.stake||0)*100;
-    const profit = parseFloat(p.profit||0);
-    const profitStr = p.status === 'PENDING'
-      ? `<span class="neu">—</span>`
-      : `<span class="${profit >= 0 ? 'pos' : 'neg'}">${profit >= 0 ? '+' : ''}${profit.toFixed(4)}</span>`;
-    return `<tr>
+}
+
+async function loadCalendar(){
+  try{
+    const r=await fetch('/api/calendar?days=4');
+    const d=await r.json();
+    calMatches=d.matches||[];
+    const dates=[...new Set(calMatches.map(m=>m.date))].sort();
+
+    // Date nav
+    const nav=document.getElementById('date-nav');
+    nav.innerHTML=dates.map(dt=>{
+      const label=new Date(dt+'T12:00:00').toLocaleDateString('es-MX',{weekday:'short',day:'numeric'});
+      return `<button class="dday${activeDate===dt?' active':''}" onclick="setDate('${dt}',this)">${label}</button>`;
+    }).join('');
+
+    // League chips
+    const divs=[...new Set(calMatches.map(m=>m.div))];
+    const chips=document.getElementById('league-chips');
+    chips.innerHTML=`<div class="l-chip active" onclick="setLeague('all',this)">Todos (${calMatches.length})</div>`+
+      divs.map(d=>{
+        const n=calMatches.filter(m=>m.div===d).length;
+        return `<div class="l-chip" onclick="setLeague('${d}',this)">${LEAGUES[d]||d} (${n})</div>`;
+      }).join('');
+
+    if(dates.length) setDate(dates[0], nav.querySelector('.dday'));
+    else renderCalendar();
+  }catch(e){
+    document.getElementById('cal-body').innerHTML=`<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+function setDate(dt, btn){
+  activeDate=dt;
+  document.querySelectorAll('.dday').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderCalendar();
+}
+function setLeague(div, btn){
+  activeLeague=div;
+  document.querySelectorAll('.l-chip').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderCalendar();
+}
+
+// ════════════════════════════════════════
+// TAB 1: PICKS
+// ════════════════════════════════════════
+const mktBadge=m=>{
+  const map={UNDER:'b-under',OVER:'b-over',DC:'b-dc','1X2':'b-1x2',
+             BTTS:'b-btts',BTTS_NO:'b-over',DNB:'b-dnb'};
+  return `<span class="badge ${map[m]||'b-1x2'}">${m}</span>`;
+};
+const statusBadge=s=>{
+  const map={WIN:'b-win',LOSS:'b-loss',PENDING:'b-pend'};
+  const icon={WIN:'▲',LOSS:'▼',PENDING:'◎'};
+  return `<span class="badge ${map[s]||''}">${icon[s]||''}${s}</span>`;
+};
+const evClass=v=>v>=0.10?'ev-h':v>=0.05?'ev-m':'ev-l';
+const fmtDate=d=>{if(!d)return'—';const p=d.split('T')[0].split('-');return`${p[2]}/${p[1]}/${p[0].slice(2)}`;};
+const xgMini=(h,a)=>{
+  const t=(h||0)+(a||0);if(!t)return'—';
+  const hw=Math.round((h/t)*50);
+  return `<div class="xg-mini"><span style="font-size:.58rem;color:var(--muted)">${(h||0).toFixed(1)}</span><div class="xg-seg" style="width:${hw}px;background:var(--accent)"></div><div class="xg-seg" style="width:${50-hw}px;background:var(--red)"></div><span style="font-size:.58rem;color:var(--muted)">${(a||0).toFixed(1)}</span></div>`;
+};
+
+function updateStats(s){
+  const res=s.wins+s.losses;
+  const br=res?s.wins/res:0;
+  document.getElementById('s-total').textContent=s.total;
+  document.getElementById('s-sub-total').textContent=`${res} resueltos`;
+  document.getElementById('s-win').textContent=s.wins;
+  document.getElementById('s-sub-win').textContent=res?`${(s.wins/res*100).toFixed(1)}%`:'';
+  document.getElementById('s-loss').textContent=s.losses;
+  document.getElementById('s-sub-loss').textContent=res?`${(s.losses/res*100).toFixed(1)}%`:'';
+  document.getElementById('s-pend').textContent=s.pending;
+  const brEl=document.getElementById('s-br');
+  brEl.textContent=res?(br*100).toFixed(1)+'%':'—';
+  brEl.className='scard-val '+(br>=0.55?'c-green':br>=0.50?'c-amber':'c-red');
+  document.getElementById('s-ev').textContent='+'+(s.avg_ev||0).toFixed(1)+'%';
+  const pEl=document.getElementById('s-pnl');
+  pEl.textContent=(s.pnl>=0?'+':'')+s.pnl.toFixed(4);
+  pEl.className='scard-val '+(s.pnl>0?'c-green':s.pnl<0?'c-red':'c-white');
+  const bEl=document.getElementById('s-burn');
+  bEl.textContent=s.resolved+'/30';
+  bEl.className='scard-val '+(s.resolved>=30?'c-green':'c-blue');
+  document.getElementById('s-burn-sub').textContent=s.resolved>=30?'¡listo para live!':`faltan ${30-s.resolved}`;
+  document.getElementById('last-upd').textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});
+}
+
+function renderPicks(){
+  const search=document.getElementById('picks-search').value.toLowerCase();
+  let data=allPicks.filter(p=>{
+    if(activeFlt!=='all'&&p.status!==activeFlt)return false;
+    if(activeMkt!=='all'&&p.market!==activeMkt)return false;
+    if(search){const hay=((p.home||'')+' '+(p.away||'')+' '+(p.div||'')+' '+(p.market||'')).toLowerCase();if(!hay.includes(search))return false;}
+    return true;
+  });
+  data.sort((a,b)=>{
+    let av=a[sortCol]??'',bv=b[sortCol]??'';
+    if(typeof av==='string')av=av.toLowerCase();
+    if(typeof bv==='string')bv=bv.toLowerCase();
+    return av<bv?sortDir:av>bv?-sortDir:0;
+  });
+  if(!data.length){document.getElementById('picks-body').innerHTML=`<tr><td colspan="11" class="empty">sin picks</td></tr>`;return;}
+  document.getElementById('picks-body').innerHTML=data.map(p=>{
+    const ev=parseFloat(p.ev||0);
+    const prob=parseFloat(p.prob||0)*100;
+    const stake=parseFloat(p.stake||0)*100;
+    const profit=parseFloat(p.profit||0);
+    const profitStr=p.status==='PENDING'?`<span class="neu">—</span>`:`<span class="${profit>=0?'pos':'neg'}">${profit>=0?'+':''}${profit.toFixed(4)}</span>`;
+    return`<tr>
       <td class="muted-td">${fmtDate(p.date)}</td>
       <td class="muted-td">${p.div||'—'}</td>
       <td class="party">${p.home||''} <span style="color:var(--muted);font-weight:300">vs</span> ${p.away||''}</td>
@@ -2614,194 +2781,142 @@ function render() {
       <td class="${evClass(ev)}">+${(ev*100).toFixed(1)}%</td>
       <td class="muted-td">${prob.toFixed(1)}%</td>
       <td class="muted-td">${stake.toFixed(2)}%</td>
-      <td>${xgBar(p.xg_h, p.xg_a)}</td>
+      <td>${xgMini(p.xg_h,p.xg_a)}</td>
       <td>${statusBadge(p.status)}</td>
       <td>${profitStr}</td>
     </tr>`;
   }).join('');
-  document.getElementById('picks-body').innerHTML = rows;
 }
 
-async function loadData() {
-  try {
-    const r = await fetch('/api/picks');
-    const data = await r.json();
-    allPicks = data.picks || [];
-    updateStats(data.stats);
-    render();
-  } catch(e) {
-    document.getElementById('picks-body').innerHTML = `<tr><td colspan="11" class="empty">error cargando datos</td></tr>`;
-  }
+async function loadPicks(){
+  try{
+    const r=await fetch('/api/picks');
+    const d=await r.json();
+    allPicks=d.picks||[];
+    updateStats(d.stats);
+    renderPicks();
+  }catch(e){document.getElementById('picks-body').innerHTML=`<tr><td colspan="11" class="empty">error</td></tr>`;}
 }
 
-async function resolveData() {
-  const btn = document.getElementById('resolve-btn');
-  btn.textContent = 'resolviendo...'; btn.disabled = true;
-  try {
-    const r = await fetch('/api/resolve');
-    const d = await r.json();
-    btn.textContent = d.error ? 'error' : `✓ ${d.resolved||0} resueltos (${d.wins||0}W/${d.losses||0}L)`;
-    await loadData();
-  } catch(e) { btn.textContent = 'error'; }
-  setTimeout(() => { btn.textContent = 'resolver picks'; btn.disabled = false; }, 5000);
+async function resolveData(){
+  const btn=document.querySelector('.resolve-btn');
+  btn.textContent='resolviendo...';btn.disabled=true;
+  try{const r=await fetch('/api/resolve');const d=await r.json();
+    btn.textContent=d.error?'error':`✓ ${d.resolved||0} resueltos`;
+    await loadPicks();
+  }catch(e){btn.textContent='error';}
+  setTimeout(()=>{btn.textContent='resolver picks';btn.disabled=false;},4000);
 }
 
-document.querySelectorAll('#filter-seg .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#filter-seg .seg-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active'); activeFlt = btn.dataset.filter; render();
+document.querySelectorAll('#flt-seg .seg-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('#flt-seg .seg-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');activeFlt=btn.dataset.f;renderPicks();
   });
 });
-document.querySelectorAll('#mkt-seg .seg-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#mkt-seg .seg-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active'); activeMkt = btn.dataset.mkt; render();
+document.querySelectorAll('#mkt-seg .seg-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('#mkt-seg .seg-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');activeMkt=btn.dataset.m;renderPicks();
   });
 });
-document.querySelectorAll('thead th[data-col]').forEach(th => {
-  th.addEventListener('click', () => {
-    const col = th.dataset.col;
-    if (sortCol === col) { sortDir *= -1; th.classList.toggle('asc'); }
-    else { sortCol = col; sortDir = -1; document.querySelectorAll('thead th').forEach(t => { t.classList.remove('sorted','asc'); }); }
-    th.classList.add('sorted'); render();
+document.querySelectorAll('thead th[data-col]').forEach(th=>{
+  th.addEventListener('click',()=>{
+    const col=th.dataset.col;
+    if(sortCol===col){sortDir*=-1;}else{sortCol=col;sortDir=-1;document.querySelectorAll('thead th').forEach(t=>t.classList.remove('sorted'));}
+    th.classList.add('sorted');renderPicks();
   });
 });
-document.getElementById('search').addEventListener('input', render);
+document.getElementById('picks-search').addEventListener('input',renderPicks);
 
-// ── Analizador de partido ────────────────────────────────────────────────
-let activeFlt = 'all', activeMkt = 'all';
+// ════════════════════════════════════════
+// TAB 2: HISTÓRICO
+// ════════════════════════════════════════
+function renderHistorico(){
+  if(!allPicks.length){loadPicks().then(renderHistorico);return;}
 
-function formDot(r) {
-  const c = r==='W'?'#22c55e':r==='D'?'#f59e0b':'#ef4444';
-  return `<span style="width:20px;height:20px;border-radius:3px;background:${c}22;border:1px solid ${c}44;display:inline-flex;align-items:center;justify-content:center;font-size:.58rem;font-weight:600;color:${c}">${r}</span>`;
-}
+  // PnL chart
+  const resolved=allPicks.filter(p=>p.status!=='PENDING').reverse();
+  let cum=0;
+  const labels=resolved.map((_,i)=>i+1);
+  const data=resolved.map(p=>{cum+=parseFloat(p.profit||0);return Math.round(cum*10000)/10000;});
+  const colors=data.map((v,i)=>i>0&&data[i]<data[i-1]?'#ef4444':'#22c55e');
 
-function statRow(label, hVal, aVal, higherIsBetter=true) {
-  const hNum = parseFloat(hVal)||0, aNum = parseFloat(aVal)||0;
-  const hBetter = higherIsBetter ? hNum >= aNum : hNum <= aNum;
-  const aBetter = higherIsBetter ? aNum > hNum : aNum < hNum;
-  const hColor = hBetter && hNum!==aNum ? 'var(--green)' : 'var(--text)';
-  const aColor = aBetter ? 'var(--green)' : 'var(--text)';
-  const rowStyle = 'border-bottom:1px solid var(--border);padding:7px 0';
-  return [
-    `<div style="${rowStyle};text-align:right;font-family:var(--mono);font-size:.72rem;color:${hColor};font-weight:${hBetter&&hNum!==aNum?'600':'400'}">${hVal}</div>`,
-    `<div style="${rowStyle};text-align:center;font-family:var(--mono);font-size:.58rem;color:var(--muted)">${label}</div>`,
-    `<div style="${rowStyle};font-family:var(--mono);font-size:.72rem;color:${aColor};font-weight:${aBetter?'600':'400'}">${aVal}</div>`,
-  ];
-}
-
-async function analyzeMatch() {
-  const home = document.getElementById('an-home').value.trim();
-  const away = document.getElementById('an-away').value.trim();
-  const div  = document.getElementById('an-div').value.trim();
-  if (!home || !away) return;
-  document.getElementById('an-loading').style.display = 'inline';
-  document.getElementById('an-result').style.display = 'none';
-  try {
-    const r = await fetch(`/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`);
-    const d = await r.json();
-    if (!r.ok || d.error) { alert(d.error || 'Error'); document.getElementById('an-loading').style.display='none'; return; }
-    if (!d.home_stats || !d.away_stats) { alert('Sin historial suficiente'); document.getElementById('an-loading').style.display='none'; return; }
-
-    const hs = d.home_stats, as_ = d.away_stats;
-    const ho = hs.overall, hh = hs.home, ha = hs.away;
-    const ao = as_.overall, ah = as_.home, aa = as_.away;
-
-    document.getElementById('an-home-name').textContent = d.home;
-    document.getElementById('an-away-name').textContent = d.away;
-    document.getElementById('an-league').textContent = d.league || d.div;
-    document.getElementById('an-away-league').textContent = d.league || d.div;
-    document.getElementById('an-xg-score').textContent = `${d.xg_home} — ${d.xg_away}`;
-
-    document.getElementById('an-ph-pill').textContent = `${(d.probs.home*100).toFixed(0)}% L`;
-    document.getElementById('an-pd-pill').textContent = `${(d.probs.draw*100).toFixed(0)}% E`;
-    document.getElementById('an-pa-pill').textContent = `${(d.probs.away*100).toFixed(0)}% V`;
-
-    const hFormEl = document.getElementById('an-home-form');
-    const aFormEl = document.getElementById('an-away-form');
-    hFormEl.innerHTML = (ho?.form||[]).map(formDot).join('');
-    aFormEl.innerHTML = (ao?.form||[]).map(formDot).join('');
-
-    // Stats grid
-    const statsRows = [
-      ['PPG', ho?.ppg??'-', ao?.ppg??'-', true],
-      ['Win%', (ho?.win_pct??'-')+'%', (ao?.win_pct??'-')+'%', true],
-      ['Goles/PJ', ho?.avg_scored??'-', ao?.avg_scored??'-', true],
-      ['Conced/PJ', ho?.avg_conceded??'-', ao?.avg_conceded??'-', false],
-      ['BTTS%', (hh?.btts_pct??ho?.btts_pct??'-')+'%', (ah?.btts_pct??ao?.btts_pct??'-')+'%', true],
-      ['CS%', (hh?.cs_pct??ho?.cs_pct??'-')+'%', (ah?.cs_pct??ao?.cs_pct??'-')+'%', true],
-      ['Over 2.5%', (hh?.over25_pct??ho?.over25_pct??'-')+'%', (ah?.over25_pct??ao?.over25_pct??'-')+'%', true],
-      ['xG', hh?.xg??'-', ah?.xg??'-', true],
-      ['xGA', hh?.xga??'-', ah?.xga??'-', false],
-    ];
-    let hCol='', lCol='', aCol='';
-    statsRows.forEach(([label,hv,av,hib]) => {
-      const [h,l,a] = statRow(label,hv,av,hib);
-      hCol+=h; lCol+=l; aCol+=a;
-    });
-    document.getElementById('stats-home-col').innerHTML = hCol;
-    document.getElementById('stats-label-col').innerHTML = lCol;
-    document.getElementById('stats-away-col').innerHTML = aCol;
-
-    document.getElementById('an-po').textContent = `${(d.ou.over*100).toFixed(1)}%`;
-    document.getElementById('an-pu').textContent = `${(d.ou.under*100).toFixed(1)}%`;
-    document.getElementById('an-py').textContent = `${(d.btts.yes*100).toFixed(1)}%`;
-    document.getElementById('an-pn').textContent = `${(d.btts.no*100).toFixed(1)}%`;
-    document.getElementById('an-fo').textContent = d.fair_odds.over ? `@${d.fair_odds.over} fair` : '';
-    document.getElementById('an-fu').textContent = d.fair_odds.under ? `@${d.fair_odds.under} fair` : '';
-    document.getElementById('an-fy').textContent = d.fair_odds.btts_y ? `@${d.fair_odds.btts_y} fair` : '';
-
-    // H2H
-    const h2h = d.h2h;
-    if (h2h && h2h.total > 0) {
-      document.getElementById('an-h2h-wrap').style.display = 'block';
-      const hw = h2h.home_wins, dr = h2h.draws, aw = h2h.away_wins, tot = h2h.total;
-      document.getElementById('an-h2h-summary').innerHTML = `
-        <div style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:6px;padding:6px 14px;text-align:center">
-          <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">${d.home.split(' ').slice(-1)[0]}</p>
-          <p style="font-size:1.1rem;font-weight:600;color:var(--green)">${hw}</p>
-        </div>
-        <div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px;padding:6px 14px;text-align:center">
-          <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">Empates</p>
-          <p style="font-size:1.1rem;font-weight:600;color:var(--amber)">${dr}</p>
-        </div>
-        <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:6px;padding:6px 14px;text-align:center">
-          <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">${d.away.split(' ').slice(-1)[0]}</p>
-          <p style="font-size:1.1rem;font-weight:600;color:var(--red)">${aw}</p>
-        </div>
-        <div style="background:var(--s2);border:1px solid var(--border);border-radius:6px;padding:6px 14px;text-align:center">
-          <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">Over 2.5</p>
-          <p style="font-size:1.1rem;font-weight:600;color:#38bdf8">${h2h.over25}/${tot}</p>
-        </div>
-        <div style="background:var(--s2);border:1px solid var(--border);border-radius:6px;padding:6px 14px;text-align:center">
-          <p style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">BTTS</p>
-          <p style="font-size:1.1rem;font-weight:600;color:#a78bfa">${h2h.btts}/${tot}</p>
-        </div>`;
-      document.getElementById('an-h2h-matches').innerHTML = (h2h.matches||[]).map(m=>`
-        <div style="display:grid;grid-template-columns:80px 1fr auto 1fr;gap:8px;align-items:center;padding:7px 10px;background:var(--s2);border-radius:6px;border:1px solid var(--border)">
-          <span style="font-family:var(--mono);font-size:.6rem;color:var(--muted)">${m.date}</span>
-          <span style="font-family:var(--sans);font-size:.8rem;text-align:right">${m.home_team}</span>
-          <span style="font-family:var(--mono);font-size:.8rem;font-weight:600;text-align:center;padding:0 8px">${m.home_goals} - ${m.away_goals}</span>
-          <span style="font-family:var(--sans);font-size:.8rem">${m.away_team}</span>
-        </div>`).join('');
-    } else {
-      document.getElementById('an-h2h-wrap').style.display = 'none';
+  if(pnlChart) pnlChart.destroy();
+  const ctx=document.getElementById('pnl-chart').getContext('2d');
+  pnlChart=new Chart(ctx,{
+    type:'line',
+    data:{
+      labels,
+      datasets:[{
+        data,borderColor:'#4f6ef7',backgroundColor:'rgba(79,110,247,.08)',
+        borderWidth:2,pointRadius:2,pointBackgroundColor:'#4f6ef7',
+        fill:true,tension:.3
+      }]
+    },
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{
+        callbacks:{label:c=>`PnL: ${c.parsed.y>=0?'+':''}${c.parsed.y.toFixed(4)}U`}
+      }},
+      scales:{
+        x:{ticks:{color:'#5a5f80',font:{size:10}},grid:{color:'#1c2035'}},
+        y:{ticks:{color:'#5a5f80',font:{size:10}},grid:{color:'#1c2035'}}
+      }
     }
+  });
 
-    document.getElementById('an-result').style.display = 'block';
-  } catch(e) { alert('Error: ' + e.message); }
-  finally { document.getElementById('an-loading').style.display = 'none'; }
+  // Por mercado
+  const mkts={};
+  allPicks.filter(p=>p.status!=='PENDING').forEach(p=>{
+    if(!mkts[p.market]) mkts[p.market]={w:0,l:0,pnl:0,form:[]};
+    if(p.status==='WIN'){mkts[p.market].w++;mkts[p.market].pnl+=parseFloat(p.profit||0);}
+    else{mkts[p.market].l++;mkts[p.market].pnl-=parseFloat(p.stake||0)*0; mkts[p.market].pnl+=parseFloat(p.profit||0);}
+    mkts[p.market].form.push(p.status==='WIN'?'W':'L');
+  });
+  document.getElementById('by-mkt-grid').innerHTML=Object.entries(mkts).map(([m,d])=>{
+    const tot=d.w+d.l;
+    const br=tot?d.w/tot:0;
+    const c=br>=0.55?'var(--green)':br>=0.50?'var(--amber)':'var(--red)';
+    return`<div class="bm-card">
+      <div class="bm-name">${m}</div>
+      <div class="bm-br" style="color:${c}">${(br*100).toFixed(1)}%</div>
+      <div class="bm-n">${tot} picks · ${d.w}W/${d.l}L</div>
+      <div class="bm-form">${d.form.slice(-8).map(r=>`<span class="fd ${r==='W'?'fw':'fl'}">${r}</span>`).join('')}</div>
+    </div>`;
+  }).join('');
+
+  // Por liga
+  const divs={};
+  allPicks.filter(p=>p.status!=='PENDING').forEach(p=>{
+    if(!divs[p.div]) divs[p.div]={w:0,l:0};
+    if(p.status==='WIN') divs[p.div].w++;
+    else divs[p.div].l++;
+  });
+  document.getElementById('by-league-grid').innerHTML=Object.entries(divs)
+    .filter(([,d])=>d.w+d.l>=2)
+    .sort((a,b)=>(b[1].w+b[1].l)-(a[1].w+a[1].l))
+    .map(([div,d])=>{
+      const tot=d.w+d.l;
+      const br=d.w/tot;
+      const c=br>=0.55?'var(--green)':br>=0.50?'var(--amber)':'var(--red)';
+      return`<div class="bl-card">
+        <div class="bl-name">${LEAGUES[div]||div}</div>
+        <div style="font-size:1.1rem;font-weight:600;color:${c}">${(br*100).toFixed(0)}%</div>
+        <div class="bl-stats">${tot} picks · ${d.w}W/${d.l}L</div>
+      </div>`;
+    }).join('');
 }
 
-document.getElementById('an-home').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
-document.getElementById('an-away').addEventListener('keydown', e => { if(e.key==='Enter') analyzeMatch(); });
-
-loadData();
-setInterval(loadData, 60000);
+// ── INIT ──
+loadCalendar();
+loadPicks();
+setInterval(()=>{loadPicks();document.getElementById('last-upd').textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});},60000);
 </script>
 </body>
 </html>
 """
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
@@ -2824,6 +2939,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_stats_html()
         elif self.path.startswith("/api/stats"):
             self._serve_stats_api()
+        elif self.path.startswith("/api/calendar"):
+            self._serve_calendar()
+        elif self.path.startswith("/api/picks_summary"):
+            self._serve_picks_summary()
         else:
             self.send_response(404); self.end_headers()
 
@@ -3057,6 +3176,175 @@ def auto_resolve():
     except Exception as e:
         Log.err(f"auto_resolve: {e}", "RESOLVE")
 
+
+    def _serve_calendar(self):
+        """API /api/calendar?days=3 — todos los partidos próximos de las 17 ligas."""
+        try:
+            import pandas as pd
+            from urllib.parse import urlparse, parse_qs
+            qs   = parse_qs(urlparse(self.path).query)
+            days = int(qs.get("days",["4"])[0])
+
+            now_utc = datetime.now(timezone.utc)
+            dates   = [(now_utc + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days+1)]
+
+            # Cargar picks de la DB para marcar partidos con pick activo
+            conn = sqlite3.connect(DB_PATH)
+            db_picks = conn.execute("""
+                SELECT home_team, away_team, market, selection,
+                       odd_open, ev_open, stake_pct, result, prob_model
+                FROM picks_log WHERE result IN ('PENDING','WIN','LOSS')
+                ORDER BY id DESC
+            """).fetchall()
+            conn.close()
+
+            picks_map = {}
+            for p in db_picks:
+                key = f"{p[0]}|{p[1]}"
+                if key not in picks_map:
+                    picks_map[key] = {
+                        "market": p[2], "selection": p[3],
+                        "odd": float(p[4] or 0), "ev": float(p[5] or 0),
+                        "stake": float(p[6] or 0), "result": p[7],
+                        "prob": float(p[8] or 0)
+                    }
+
+            all_matches = []
+            euro_divs = [d for d,c in TARGET_LEAGUES.items() if c["source"]=="csv_euro"]
+
+            # Fuente A: fixtures.csv co.uk
+            fix_rows = {}
+            try:
+                r = requests.get(FIXTURES_URL,
+                    headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+                if r.status_code == 200:
+                    df_fix = pd.read_csv(pd.io.common.StringIO(
+                        r.content.decode("utf-8-sig","replace")))
+                    df_fix.columns = df_fix.columns.str.strip()
+                    df_fix["Date"] = pd.to_datetime(
+                        df_fix["Date"], dayfirst=True, errors="coerce")
+                    for _, row in df_fix.iterrows():
+                        div = str(row.get("Div","")).strip()
+                        if div not in TARGET_LEAGUES: continue
+                        d_str = row["Date"].strftime("%Y-%m-%d") if pd.notna(row["Date"]) else None
+                        if d_str not in dates: continue
+                        h = str(row.get("HomeTeam","")).strip()
+                        a = str(row.get("AwayTeam","")).strip()
+                        if not h or not a: continue
+                        fix_rows[f"{div}|{h}|{a}"] = row
+            except: pass
+
+            # Fuente B: CSVs históricos — filas sin resultado
+            for div in euro_divs:
+                cfg_d = TARGET_LEAGUES[div]
+                path  = os.path.join(DATA_DIR, f"{div}.csv")
+                if not os.path.exists(path): continue
+                try:
+                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                    except: df = pd.read_csv(path, encoding="latin-1")
+                    df.columns = df.columns.str.strip()
+                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                            "HG":"FTHG","AG":"FTAG"})
+                    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+                    future = df[df["FTHG"].isna() | df["FTAG"].isna()].copy()
+                    played = df.dropna(subset=["FTHG","FTAG"]).copy()
+                    played["FTHG"] = played["FTHG"].astype(float)
+                    played["FTAG"] = played["FTAG"].astype(float)
+
+                    def get_form(name, n=5):
+                        rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(n)
+                        res = []
+                        for _,r in rows.iterrows():
+                            ih = r["HomeTeam"]==name
+                            gf = r["FTHG"] if ih else r["FTAG"]
+                            ga = r["FTAG"] if ih else r["FTHG"]
+                            res.append("W" if gf>ga else "D" if gf==ga else "L")
+                        return res
+
+                    def get_xg_simple(name):
+                        rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(8)
+                        if rows.empty: return None
+                        vals = []
+                        for _,r in rows.iterrows():
+                            ih = r["HomeTeam"]==name
+                            vals.append(float(r["FTHG"] if ih else r["FTAG"]))
+                        return round(sum(vals)/len(vals),2) if vals else None
+
+                    for _, row in future.iterrows():
+                        h = str(row.get("HomeTeam","")).strip()
+                        a = str(row.get("AwayTeam","")).strip()
+                        if not h or not a: continue
+                        d_str = row["Date"].strftime("%Y-%m-%d") if pd.notna(row["Date"]) else None
+                        if d_str not in dates: continue
+                        key3 = f"{div}|{h}|{a}"
+                        already = any(
+                            m["div"]==div and
+                            difflib.SequenceMatcher(None,m["home"].lower(),h.lower()).ratio()>0.75
+                            for m in all_matches
+                        )
+                        if already: continue
+
+                        # Cuotas — fixture o CSV histórico
+                        fix_row = fix_rows.get(key3)
+                        b365h = b365d = b365a = None
+                        if fix_row is not None:
+                            try: b365h = float(fix_row.get("B365H", float("nan")))
+                            except: pass
+                            try: b365d = float(fix_row.get("B365D", float("nan")))
+                            except: pass
+                            try: b365a = float(fix_row.get("B365A", float("nan")))
+                            except: pass
+                        if not b365h:
+                            try: b365h = float(row.get("B365H", float("nan")))
+                            except: pass
+                            try: b365d = float(row.get("B365D", float("nan")))
+                            except: pass
+                            try: b365a = float(row.get("B365A", float("nan")))
+                            except: pass
+
+                        # Probabilidades rápidas desde cuotas o modelo
+                        ph = pd_ = pa = None
+                        if b365h and b365d and b365a and b365h==b365h:
+                            vig = 1/b365h + 1/b365d + 1/b365a
+                            ph  = round(1/b365h/vig, 3)
+                            pd_ = round(1/b365d/vig, 3)
+                            pa  = round(1/b365a/vig, 3)
+
+                        # xG rápido
+                        xgh = get_xg_simple(h)
+                        xga = get_xg_simple(a)
+
+                        # Pick del bot si existe
+                        pick_info = picks_map.get(f"{h}|{a}") or picks_map.get(f"{a}|{h}")
+
+                        all_matches.append({
+                            "date": d_str,
+                            "time": row.get("Time","") if "Time" in row.index else "",
+                            "div": div,
+                            "league": cfg_d.get("name",""),
+                            "home": h, "away": a,
+                            "b365h": b365h if b365h and b365h==b365h else None,
+                            "b365d": b365d if b365d and b365d==b365d else None,
+                            "b365a": b365a if b365a and b365a==b365a else None,
+                            "ph": ph, "pd": pd_, "pa": pa,
+                            "xg_h": xgh, "xg_a": xga,
+                            "form_h": get_form(h),
+                            "form_a": get_form(a),
+                            "pick": pick_info,
+                        })
+                except Exception as e:
+                    Log.warn(f"calendar {div}: {e}", "CALENDAR")
+
+            # Ordenar por fecha
+            all_matches.sort(key=lambda x: (x["date"], x["div"]))
+
+            payload = json.dumps({"matches": all_matches, "dates": dates}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e:
+            self._json_err(str(e))
 
     def _serve_stats_api(self):
         """API /api/stats?league=E1 — stats completos de una liga desde CSV."""
@@ -3493,6 +3781,232 @@ def auto_resolve():
             import traceback
             Log.err(f"analyze: {e}\n{traceback.format_exc()}", "ANALYZE")
             self._json_err(str(e))
+
+    def _serve_calendar(self):
+        """API /api/calendar?days=3 — todos los partidos próximos de todas las ligas."""
+        try:
+            import pandas as pd
+            from urllib.parse import urlparse, parse_qs
+            qs   = parse_qs(urlparse(self.path).query)
+            days = int(qs.get("days", ["4"])[0])
+            now  = datetime.now(timezone.utc)
+            dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days+1)]
+
+            matches = []
+            seen = set()
+
+            for div, cfg in TARGET_LEAGUES.items():
+                if div in ("BSA","MEX"): continue
+                path = os.path.join(DATA_DIR, f"{div}.csv")
+                if not os.path.exists(path): continue
+                try:
+                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                    except: df = pd.read_csv(path, encoding="latin-1")
+                    df.columns = df.columns.str.strip()
+                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+                    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+                    future = df[df["FTHG"].isna() | df["FTAG"].isna()].copy()
+                    if future.empty: continue
+                    played = df.dropna(subset=["FTHG","FTAG"]).copy()
+                    played["FTHG"] = played["FTHG"].astype(float)
+                    played["FTAG"] = played["FTAG"].astype(float)
+
+                    def get_form(name, n=5):
+                        rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(n)
+                        form = []
+                        for _,r in rows.iterrows():
+                            ih = r["HomeTeam"]==name
+                            gf = r["FTHG"] if ih else r["FTAG"]
+                            ga = r["FTAG"] if ih else r["FTHG"]
+                            form.append("W" if gf>ga else "D" if gf==ga else "L")
+                        return form
+
+                    def get_team_stats_quick(name):
+                        h_rows = played[played["HomeTeam"]==name]
+                        a_rows = played[played["AwayTeam"]==name]
+                        all_rows = pd.concat([h_rows, a_rows])
+                        n = len(all_rows)
+                        if n == 0: return {}
+                        gf_h = h_rows["FTHG"].sum() + a_rows["FTAG"].sum()
+                        ga_h = h_rows["FTAG"].sum() + a_rows["FTHG"].sum()
+                        wins = sum(1 for _,r in all_rows.iterrows() if
+                                   (r["HomeTeam"]==name and r["FTHG"]>r["FTAG"]) or
+                                   (r["AwayTeam"]==name and r["FTAG"]>r["FTHG"]))
+                        draws = sum(1 for _,r in all_rows.iterrows() if r["FTHG"]==r["FTAG"])
+                        btts = sum(1 for _,r in all_rows.iterrows() if r["FTHG"]>0 and r["FTAG"]>0)
+                        over25 = sum(1 for _,r in all_rows.iterrows() if r["FTHG"]+r["FTAG"]>2.5)
+                        return {
+                            "ppg": round((wins*3+draws)/n, 2),
+                            "avg_scored": round(gf_h/n, 2),
+                            "avg_conceded": round(ga_h/n, 2),
+                            "btts_pct": round(btts/n*100, 1),
+                            "over25_pct": round(over25/n*100, 1),
+                            "pj": n,
+                        }
+
+                    for date_str in dates:
+                        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        day_matches = future[future["Date"].dt.date==target]
+                        for _, row in day_matches.iterrows():
+                            h = str(row.get("HomeTeam","")).strip()
+                            a = str(row.get("AwayTeam","")).strip()
+                            if not h or not a: continue
+                            key = f"{div}_{date_str}_{h}_{a}"
+                            if key in seen: continue
+                            seen.add(key)
+
+                            # Cuotas de apertura del CSV
+                            b365h = row.get("B365H") or row.get("BbAvH")
+                            b365d = row.get("B365D") or row.get("BbAvD")
+                            b365a = row.get("B365A") or row.get("BbAvA")
+                            def safe_float(v):
+                                try: f=float(v); return round(f,2) if f>1.01 else None
+                                except: return None
+                            oh = safe_float(b365h)
+                            od = safe_float(b365d)
+                            oa = safe_float(b365a)
+
+                            # xG y forma rápida
+                            hf = get_form(h)
+                            af = get_form(a)
+                            hs = get_team_stats_quick(h)
+                            as_ = get_team_stats_quick(a)
+
+                            # Probabilidades rápidas Dixon-Coles
+                            ph = pd_ = pa = None
+                            xh = xa = None
+                            try:
+                                std = cfg.get("xg_std", 1.55)
+                                conv_h = cfg.get("conv_home", 0.30)
+                                conv_a = cfg.get("conv_away", 0.31)
+                                xgf_h = hs.get("avg_scored", 1.2) * conv_h / 0.30
+                                xga_h = hs.get("avg_conceded", 1.2) * conv_a / 0.31
+                                xgf_a = as_.get("avg_scored", 1.0) * conv_a / 0.31
+                                xga_a = as_.get("avg_conceded", 1.0) * conv_h / 0.30
+                                xh = round((xgf_h + xga_a) / 2, 2)
+                                xa = round((xgf_a + xga_h) / 2, 2)
+                                ph, pd_, pa = dixon_coles(xh, xa)
+                                ph,pd_,pa = round(ph,3),round(pd_,3),round(pa,3)
+                            except: pass
+
+                            matches.append({
+                                "date": date_str,
+                                "div": div,
+                                "league": cfg.get("name",""),
+                                "home": h, "away": a,
+                                "home_form": hf,
+                                "away_form": af,
+                                "home_stats": hs,
+                                "away_stats": as_,
+                                "xg_h": xh, "xg_a": xa,
+                                "ph": ph, "pd": pd_, "pa": pa,
+                                "b365h": oh, "b365d": od, "b365a": oa,
+                            })
+                except Exception as e:
+                    Log.warn(f"calendar {div}: {e}", "CAL")
+
+            # Ordenar por fecha
+            matches.sort(key=lambda x: (x["date"], x["league"]))
+
+            # Inyectar picks del modelo para estos partidos
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                rows = conn.execute("""
+                    SELECT home_team, away_team, market, selection, odd_open, ev, stake_pct, result
+                    FROM picks_log
+                    WHERE date(kickoff_time) >= date('now')
+                    ORDER BY kickoff_time ASC
+                """).fetchall()
+                conn.close()
+                picks_map = {}
+                for r in rows:
+                    k = f"{r[0]}_{r[1]}"
+                    picks_map.setdefault(k, []).append({
+                        "market": r[2], "selection": r[3],
+                        "odd": r[4], "ev": r[5], "stake": r[6], "result": r[7]
+                    })
+                for m in matches:
+                    key = f"{m['home']}_{m['away']}"
+                    m["picks"] = picks_map.get(key, [])
+            except: pass
+
+            payload = json.dumps({"matches": matches, "dates": dates}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e:
+            import traceback; Log.err(f"calendar: {e}\n{traceback.format_exc()}", "CAL")
+            self._json_err(str(e))
+
+    def _serve_picks_summary(self):
+        """API /api/picks_summary — picks recientes y stats por mercado para dashboard."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            # Picks de los últimos 7 días
+            recent = conn.execute("""
+                SELECT date(kickoff_time) as dt, div, home_team, away_team,
+                       market, selection, odd_open, ev, stake_pct, result, profit, xg_h, xg_a
+                FROM picks_log
+                WHERE date(kickoff_time) >= date('now', '-7 days')
+                ORDER BY kickoff_time DESC
+            """).fetchall()
+            # Stats por mercado
+            mkt_stats = conn.execute("""
+                SELECT market,
+                       COUNT(*) as n,
+                       SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+                       SUM(CASE WHEN result='LOSS' THEN 1 ELSE 0 END) as losses,
+                       AVG(ev) as avg_ev,
+                       SUM(profit) as total_pnl
+                FROM picks_log
+                WHERE result IN ('WIN','LOSS')
+                GROUP BY market ORDER BY n DESC
+            """).fetchall()
+            # PnL acumulado pick a pick
+            pnl_curve = conn.execute("""
+                SELECT profit, result, date(kickoff_time) as dt
+                FROM picks_log
+                WHERE result IN ('WIN','LOSS')
+                ORDER BY kickoff_time ASC
+            """).fetchall()
+            conn.close()
+
+            recent_list = [{
+                "date": r[0], "div": r[1], "home": r[2], "away": r[3],
+                "market": r[4], "selection": r[5], "odd": r[6],
+                "ev": round(float(r[7] or 0)*100,1),
+                "stake": round(float(r[8] or 0)*100,2),
+                "result": r[9],
+                "profit": round(float(r[10] or 0),4),
+                "xg_h": r[11], "xg_a": r[12],
+            } for r in recent]
+
+            mkt_list = [{
+                "market": r[0], "n": r[1], "wins": r[2], "losses": r[3],
+                "br": round(r[2]/(r[2]+r[3])*100,1) if (r[2]+r[3])>0 else 0,
+                "avg_ev": round(float(r[4] or 0)*100,1),
+                "pnl": round(float(r[5] or 0),4),
+            } for r in mkt_stats]
+
+            cum = 0
+            curve = []
+            for profit, result, dt in pnl_curve:
+                cum += float(profit or 0)
+                curve.append({"pnl": round(cum,4), "result": result, "date": dt})
+
+            payload = json.dumps({
+                "recent": recent_list,
+                "mkt_stats": mkt_list,
+                "pnl_curve": curve,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e:
+            self._json_err(str(e))
+
 
 def start_dashboard(port=8080):
     server = HTTPServer(("0.0.0.0", port), DashboardHandler)
