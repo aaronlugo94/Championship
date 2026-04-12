@@ -330,6 +330,37 @@ XG_DEC  = 0.85    # decay temporal
 # DATABASE
 # ============================================================
 
+# ── Copas europeas y locales para cálculo de fatiga ─────────────────────
+CUP_LEAGUES = {
+    # Europeas
+    2:   "UCL",       # Champions League
+    3:   "UEL",       # Europa League
+    848: "UECL",      # Conference League
+    # Inglaterra
+    45:  "FA_Cup",
+    48:  "EFL_Cup",
+    # España
+    143: "Copa_Rey",
+    # Alemania
+    529: "DFB_Pokal",
+    # Italia
+    137: "Coppa_Italia",
+    # Francia
+    66:  "Coupe_France",
+    # Portugal
+    96:  "Taca_Portugal",
+    # Bélgica
+    144: "Belgian_Cup",
+    # Países Bajos
+    90:  "KNVB_Beker",
+    # Turquía
+    156: "Turkish_Cup",
+    # Grecia
+    528: "Greek_Cup",
+    # Escocia
+    322: "Scottish_Cup",
+}
+
 def init_db():
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS picks_log (
@@ -361,6 +392,16 @@ def init_db():
         fixture_id TEXT, market TEXT, selection TEXT,
         odd_open REAL, odd_close REAL, clv_pct REAL, captured_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_fixtures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_normalized TEXT NOT NULL,
+        competition TEXT NOT NULL,
+        match_date TEXT NOT NULL,
+        opponent TEXT,
+        updated_at TEXT,
+        UNIQUE(team_normalized, competition, match_date)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_cup ON cup_fixtures(team_normalized, match_date)")
     conn.commit(); conn.close()
 
 # ============================================================
@@ -514,6 +555,17 @@ def get_odds_from_row(row, cfg):
                     if f > 1.01: return f
             except: pass
         return None
+    # AH: handicap asiático de la línea principal
+    # Negativo = local favorito (ej -0.5, -1.0), positivo = visitante favorito
+    def best_ah(*cols):
+        for c in cols:
+            try:
+                v = row.get(c) if hasattr(row, 'get') else getattr(row, c, None)
+                if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                    return float(v)
+            except: pass
+        return None
+
     return {
         "H":      best("PSH",    "B365H",    "AvgH",    "MaxH"),
         "D":      best("PSD",    "B365D",    "AvgD",    "MaxD"),
@@ -521,6 +573,17 @@ def get_odds_from_row(row, cfg):
         "O25":    best("P>2.5",  "B365>2.5", "Avg>2.5", "Max>2.5"),
         "U25":    best("P<2.5",  "B365<2.5", "Avg<2.5", "Max<2.5"),
         "BTTS_Y": best("BbAvBBTS","B365BTTSY"),
+        # Asian Handicap — línea de la casa (negativo = local favorito)
+        "AH":     best_ah("AHh", "AHCh", "BbAHh"),
+        # Cuota máxima para usar en EV real (mejor precio disponible)
+        "MaxH":   best("MaxH"),
+        "MaxD":   best("MaxD"),
+        "MaxA":   best("MaxA"),
+        "MaxO25": best("Max>2.5"),
+        "MaxU25": best("Max<2.5"),
+        # Avg del mercado para calibración
+        "AvgH":   best("AvgH"),
+        "AvgO25": best("Avg>2.5"),
     }
 
 # ============================================================
@@ -727,6 +790,26 @@ def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
     xa = (af + ha) / 2   # ataque de away + debilidad defensiva de home
     xh *= (1 - min(inj_h*0.015, 0.08))
     xa *= (1 - min(inj_a*0.015, 0.08))
+
+    # ── FATIGA: ajuste por días de descanso ──────────────────────────────
+    # Evidencia CSV I1: ≤4 días → 2.33 goles/PJ, 5-7 → 2.46, >7 → 2.50
+    # Factor escala xG según cuánto descansó cada equipo
+    def _fatigue_factor(days_rest):
+        if days_rest is None or days_rest <= 0: return 1.0
+        if days_rest <= 3:   return 0.92   # ≤3 días: fatiga severa (-8%)
+        if days_rest <= 4:   return 0.95   # 4 días: fatiga moderada (-5%)
+        if days_rest <= 7:   return 1.00   # 5-7 días: normal
+        return 1.03                         # >7 días: frescura (+3%)
+
+    # Obtener días de descanso desde el cache de partidos
+    # (se pasa como parámetro opcional desde run_daily_scan)
+    if hasattr(build_xg, '_rest_h') and build_xg._rest_h is not None:
+        ff_h = _fatigue_factor(build_xg._rest_h)
+        ff_a = _fatigue_factor(build_xg._rest_a)
+        if ff_h != 1.0 or ff_a != 1.0:
+            Log.info(f"  Fatiga: H={ff_h:.2f} (rest={build_xg._rest_h}d) A={ff_a:.2f} (rest={build_xg._rest_a}d)", "xG")
+        xh *= ff_h; xa *= ff_a
+
     lf  = cfg.get("league_factor", 1.0)
     xh  = max(0.60, min(xh*lf, 3.80))
     xa  = max(0.60, min(xa*lf, 3.80))
@@ -827,6 +910,214 @@ def apif_get(path, params, headers):
         return r.json().get("response", [])
     except Exception as e:
         print(f"  ⚠️ apif {path}: {e}", flush=True); return []
+
+def fetch_cup_fixtures(headers, full_season=False):
+    """
+    Descarga partidos de copas europeas y locales usando api-football.
+    
+    full_season=True  → temporada completa (agosto 2025 → hoy). 
+                        Se corre UNA VEZ al arrancar si la DB está vacía.
+                        Costo: 14 requests (una por copa).
+    full_season=False → últimos 10 días solamente.
+                        Se corre cada lunes a las 05:00 UTC.
+                        Costo: 14 requests.
+    
+    Total plan free: 100 req/día. Esto usa ≤14 req por ejecución.
+    """
+    now = datetime.now(timezone.utc)
+
+    if full_season:
+        # Temporada completa: desde inicio agosto 2025 hasta hoy
+        date_from = "2025-07-01"
+        date_to   = now.strftime("%Y-%m-%d")
+        Log.info("Descargando temporada COMPLETA de copas...", "CUPS")
+    else:
+        date_from = (now - timedelta(days=10)).strftime("%Y-%m-%d")
+        date_to   = now.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    total_saved = total_fixtures = 0
+
+    def norm(n):
+        """Normaliza nombre de equipo para matching fuzzy."""
+        import unicodedata
+        n = n.lower().strip()
+        # Remover acentos
+        n = ''.join(c for c in unicodedata.normalize('NFD', n)
+                    if unicodedata.category(c) != 'Mn')
+        # Abreviaciones comunes
+        replacements = {
+            "fc ": "", " fc": "", "afc ": "", " afc": "",
+            "cf ": "", " cf": "", "ac ": "", " ac": "",
+            "internazionale": "inter milan",
+            "atletico": "atletico",
+            "manchester united": "man united",
+            "manchester city": "man city",
+            "paris saint-germain": "psg",
+            "paris saint germain": "psg",
+        }
+        for old, new_v in replacements.items():
+            n = n.replace(old, new_v)
+        return n.strip()
+
+    for league_id, comp_name in CUP_LEAGUES.items():
+        try:
+            res = apif_get("fixtures", {
+                "league":  league_id,
+                "season":  2025,
+                "from":    date_from,
+                "to":      date_to,
+                "status":  "FT-AET-PEN"   # solo partidos terminados
+            }, headers)
+
+            if not res:
+                Log.warn(f"  {comp_name}: sin datos", "CUPS")
+                continue
+
+            copa_saved = 0
+            for fix in res:
+                try:
+                    fix_date  = fix["fixture"]["date"][:10]
+                    status    = fix["fixture"]["status"]["short"]
+                    if status not in ("FT","AET","PEN"):
+                        continue
+                    home_name = fix["teams"]["home"]["name"]
+                    away_name = fix["teams"]["away"]["name"]
+                    total_fixtures += 1
+
+                    for team, opp in [(home_name, away_name), (away_name, home_name)]:
+                        try:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO cup_fixtures
+                                (team_normalized, competition, match_date, opponent, updated_at)
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (norm(team), comp_name, fix_date,
+                                  norm(opp), now.isoformat()))
+                            copa_saved += 1
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+            total_saved += copa_saved
+            Log.ok(f"  {comp_name}: {len(res)} partidos → {copa_saved} equipos registrados", "CUPS")
+
+        except Exception as e:
+            Log.warn(f"Copa {comp_name} (id={league_id}): {e}", "CUPS")
+
+    conn.commit()
+    conn.close()
+
+    mode = "temporada completa" if full_season else f"{date_from}→{date_to}"
+    Log.ok(f"cup_fixtures [{mode}]: {total_fixtures} partidos, {total_saved} registros", "CUPS")
+
+    # Enviar resumen por Telegram si es temporada completa
+    if full_season and total_saved > 0:
+        try:
+            send_msg(
+                f"⚽ <b>Cup fixtures cargados</b>\n"
+                f"📅 Temporada 2025-26 completa\n"
+                f"🏆 {len(CUP_LEAGUES)} copas • {total_fixtures} partidos\n"
+                f"✅ {total_saved} registros en DB para cálculo de fatiga"
+            )
+        except Exception:
+            pass
+
+    return total_saved
+
+
+def _cup_db_is_empty():
+    """Verifica si la tabla cup_fixtures está vacía."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        n = conn.execute("SELECT COUNT(*) FROM cup_fixtures").fetchone()[0]
+        conn.close()
+        return n == 0
+    except:
+        return True
+
+
+def get_true_rest_days(team_name: str, before_date, div: str, df_league=None) -> int | None:
+    """
+    Calcula los días reales de descanso de un equipo considerando:
+    1. Partidos de liga (CSV co.uk)
+    2. Partidos de copas europeas y locales (cup_fixtures SQLite)
+    Retorna los días desde el último partido en CUALQUIER competición.
+    """
+    import difflib as _dl
+    candidates = []
+
+    # ── Fuente 1: CSV de liga ─────────────────────────────────────────
+    if df_league is not None:
+        try:
+            df = df_league.copy()
+            if "Date" not in df.columns and "date" in df.columns:
+                df = df.rename(columns={"date":"Date"})
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+                df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                        "HG":"FTHG","AG":"FTAG"})
+                # Fuzzy match del nombre
+                all_teams = pd.concat([df.get("HomeTeam", pd.Series()),
+                                       df.get("AwayTeam", pd.Series())]).dropna().unique()
+                matches = _dl.get_close_matches(team_name, all_teams, n=1, cutoff=0.50)
+                if matches:
+                    nm = matches[0]
+                    past = df[
+                        ((df.get("HomeTeam")==nm) | (df.get("AwayTeam")==nm)) &
+                        (df["Date"] < pd.Timestamp(before_date)) &
+                        df.get("FTHG", pd.Series(dtype=float)).notna()
+                    ].sort_values("Date")
+                    if not past.empty:
+                        candidates.append(past.iloc[-1]["Date"])
+        except Exception as e:
+            Log.warn(f"rest_days CSV {team_name}: {e}", "FAT")
+
+    # ── Fuente 2: cup_fixtures (copas europeas + locales) ─────────────
+    try:
+        norm_name = team_name.lower().strip()
+        before_str = pd.Timestamp(before_date).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+
+        # Buscar por nombre exacto normalizado
+        rows = conn.execute("""
+            SELECT match_date FROM cup_fixtures
+            WHERE team_normalized = ? AND match_date < ?
+            ORDER BY match_date DESC LIMIT 5
+        """, (norm_name, before_str)).fetchall()
+
+        if not rows:
+            # Intentar fuzzy match con los equipos en la DB
+            all_cup_teams = [r[0] for r in conn.execute(
+                "SELECT DISTINCT team_normalized FROM cup_fixtures").fetchall()]
+            fuzzy = _dl.get_close_matches(norm_name, all_cup_teams, n=3, cutoff=0.65)
+            for fn in fuzzy:
+                cup_rows = conn.execute("""
+                    SELECT match_date FROM cup_fixtures
+                    WHERE team_normalized = ? AND match_date < ?
+                    ORDER BY match_date DESC LIMIT 3
+                """, (fn, before_str)).fetchall()
+                rows.extend(cup_rows)
+
+        conn.close()
+
+        for (match_date_str,) in rows:
+            try:
+                candidates.append(pd.Timestamp(match_date_str))
+            except:
+                pass
+    except Exception as e:
+        Log.warn(f"rest_days cups {team_name}: {e}", "FAT")
+
+    # ── Calcular días desde el partido más reciente ───────────────────
+    if not candidates:
+        return None
+
+    last_match = max(candidates)
+    before_ts  = pd.Timestamp(before_date)
+    days = (before_ts - last_match).days
+    return max(0, days)
+
 
 def get_mx_season(headers):
     """
@@ -929,6 +1220,37 @@ def _pmf(mu, k):
     try: return exp(-mu + k*log(mu) - lgamma(k+1))
     except: return 0.0
 
+def adjust_strong_favorite(ph, pd_, pa):
+    """
+    Corrección para favoritos fuertes.
+    Evidencia CSV: cuando MaxH implica >70%, el mercado sobreestima 5.1%.
+    Cuando MaxA implica >70%, similar sesgo.
+    Fix: shrinkage adicional proporcional a cuánto supera el 65%.
+    """
+    def shrink_fav(p, threshold=0.65, max_correction=0.05):
+        if p <= threshold: return p
+        excess = p - threshold          # cuánto supera el umbral
+        correction = min(excess * 0.35, max_correction)  # máx 5%
+        return p - correction
+
+    ph_adj  = shrink_fav(ph)
+    pa_adj  = shrink_fav(pa)
+
+    # Si se ajustó alguno, redistribuir la diferencia al empate
+    delta_h = ph - ph_adj
+    delta_a = pa - pa_adj
+    pd_adj  = min(pd_ + delta_h + delta_a, 0.45)  # cap empate a 45%
+
+    # Renormalizar
+    total = ph_adj + pd_adj + pa_adj
+    if total > 0:
+        ph_adj  = ph_adj  / total
+        pd_adj  = pd_adj  / total
+        pa_adj  = pa_adj  / total
+
+    return ph_adj, pd_adj, pa_adj
+
+
 def dixon_coles(lh, la, rho=DC_RHO):
     """Dixon-Coles 1X2 con corrección scores bajos (0-0, 1-0, 0-1, 1-1)."""
     ph = pd_ = pa = 0.0
@@ -949,7 +1271,13 @@ def dixon_coles(lh, la, rho=DC_RHO):
     return ph/t, pd_/t, pa/t
 
 def negbinom_ou(xg_total, std, line=2.5):
-    """NegBinom O/U con std calibrado empíricamente por liga."""
+    """
+    NegBinom O/U con std calibrado empíricamente por liga.
+    CORRECCIÓN POISSON: el modelo subestima partidos de 3+ goles.
+    Evidencia CSV I1 2025-26: 3 goles Poisson=21.1% vs Real=24.3% (+3.2%)
+                               4 goles Poisson=12.9% vs Real=15.0% (+2.1%)
+    Fix: corrección +0.03 a P(Over2.5) cuando xG total > 2.0
+    """
     mu=xg_total; var=max(std**2, mu)
     def nb(k):
         if mu<=0: return 0.0
@@ -958,7 +1286,15 @@ def negbinom_ou(xg_total, std, line=2.5):
         try: return exp(lgamma(k+r)-lgamma(r)-lgamma(k+1)+r*log(p)+k*log(1-p))
         except: return 0.0
     pu = sum(nb(k) for k in range(int(np.floor(line))+1))
-    return round(1-pu,4), round(pu,4)
+    po = 1 - pu
+    # Corrección empírica: Poisson subestima colas altas de goles
+    # Se aplica solo cuando xG sugiere partido con goles (xG > 2.0)
+    # Factor decrece a 0 cuando xG < 1.5 (partidos defensivos, corrección no aplica)
+    if line == 2.5 and mu > 1.5:
+        correction = 0.03 * min((mu - 1.5) / 1.0, 1.0)  # rampa 0→0.03 entre xG 1.5-2.5
+        po = min(po + correction, 0.95)
+        pu = 1 - po
+    return round(po,4), round(pu,4)
 
 def btts_prob(xh, xa):
     if not (0.4<=xh<=4.0 and 0.4<=xa<=4.0): return None, None
@@ -1005,6 +1341,9 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     else:
         ph, pd_, pa = dc_h, dc_d, dc_a
 
+    # Corrección favoritos fuertes — evidencia CSV: P(home)>70% sobreestimado 5.1%
+    ph, pd_, pa = adjust_strong_favorite(ph, pd_, pa)
+
     # 1X2: solo cuotas ≥ 2.50 en ligas menos líquidas (liq < 0.88)
     # Mercado muy eficiente en ligas top — solo apostamos donde hay ineficiencia
     MIN_ODD_1X2 = 2.50 if liq < 0.88 else 3.00
@@ -1039,9 +1378,26 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
                 # FILTRO CALIBRADO: DC solo funciona con cuota < 1.52
                 # Análisis 40 picks: cuota <1.50 = 100% BR, cuota 1.50-1.60 = 33% BR
                 if dc_odd and 1.01 < dc_odd < 1.52:
-                    out.append({"mkt":"DC","pick":dc_pick,"odd":round(dc_odd,2),
-                                "prob":dc_prob,
-                                "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
+                    # FILTRO AH: validar con Asian Handicap del mercado
+                    # Evidencia CSV: AH=0 (neutro) → local gana solo 22.5%
+                    # DC home (1X) tiene sentido solo si AH ≤ -0.5 (mercado confirma favoritismo)
+                    ah_val = odds.get("AH")
+                    ah_ok = True
+                    if ah_val is not None:
+                        if "o Empate" in dc_pick:  # DC home: 1X
+                            # Requiere que mercado diga local es favorito (AH ≤ 0)
+                            if ah_val > 0.25:
+                                ah_ok = False
+                                Log.rej(f"DC home rechazado: AH={ah_val:+.2f} (mercado no confirma favoritismo)", "AH")
+                        elif dc_pick.startswith("DC: Empate o"):  # DC away: X2
+                            # Requiere que mercado diga visitante es favorito (AH ≥ 0)
+                            if ah_val < -0.25:
+                                ah_ok = False
+                                Log.rej(f"DC away rechazado: AH={ah_val:+.2f} (mercado no confirma favoritismo visit.)", "AH")
+                    if ah_ok:
+                        out.append({"mkt":"DC","pick":dc_pick,"odd":round(dc_odd,2),
+                                    "prob":dc_prob,"ah":ah_val,
+                                    "model_gap":round(dc_prob-1/(dc_odd*vig),4)})
 
     # ── DRAW NO BET ──────────────────────────────────────────────────────
     # DNB: si empata devuelven. EV real = ph/(ph+pa) para local,  pa/(ph+pa) para visitante.
@@ -1608,6 +1964,19 @@ class TripleLeagueV72:
 
             # xG desde CSV histórico
             df_hist=load_csv(div)
+
+            # ── Fatiga: calcular días de descanso de cada equipo ──────────
+            try:
+                import difflib as _dlf
+                ko_date = pd.Timestamp(ko)
+                # Fatiga real: liga + copas europeas/locales
+                build_xg._rest_h = get_true_rest_days(h_n, ko_date, div, df_hist)
+                build_xg._rest_a = get_true_rest_days(a_n, ko_date, div, df_hist)
+                if build_xg._rest_h is not None or build_xg._rest_a is not None:
+                    Log.info(f"  Descanso real (liga+copas): {h_n}={build_xg._rest_h}d {a_n}={build_xg._rest_a}d", "FAT")
+            except:
+                build_xg._rest_h = None; build_xg._rest_a = None
+
             xh,xa,xt,conf,src=build_xg(h_n,a_n,div,cfg,df_hist)
 
             # Cuotas — fixtures.csv si viene de ahí, CSV histórico si viene de csv_hist
@@ -1757,6 +2126,121 @@ class TripleLeagueV72:
         conn.commit(); conn.close()
 
     # ── CLV CAPTURE ──────────────────────────────────────────────────────
+
+    def check_ht_alerts(self):
+        """
+        Revisa picks Under/Over activos y genera alertas HT.
+        Evidencia CSV I1:
+          HT 0-0 → Over 2.5 FT = 15.2%  | ALERTA si pick es OVER
+          HT 1 gol → neutro (47.1%)
+          HT 2+ goles → Over 2.5 FT = 83.9% | ALERTA si pick es UNDER
+
+        Llama a api-football /fixtures para obtener marcadores en vivo.
+        Solo activo durante ventana de partidos (12:00-23:00 UTC).
+        """
+        try:
+            now_utc = datetime.now(timezone.utc)
+            # Solo entre 12:00 y 23:00 UTC (ventana de partidos europeos)
+            if not (12 <= now_utc.hour <= 23):
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            # Picks Under/Over PENDING de hoy
+            pending = conn.execute("""
+                SELECT id, home_team, away_team, market, selection, div,
+                       kickoff_time, odd_open
+                FROM picks_log
+                WHERE result = 'PENDING'
+                  AND market IN ('UNDER','OVER')
+                  AND date(kickoff_time) = date('now')
+                  AND (ht_alerted IS NULL OR ht_alerted = 0)
+            """).fetchall()
+            conn.close()
+
+            if not pending:
+                return
+
+            alerts_sent = 0
+            for pid, home, away, mkt, sel, div, ko, odd in pending:
+                try:
+                    # Obtener fixture en vivo desde api-football
+                    res = apif_get("fixtures", {
+                        "date": now_utc.strftime("%Y-%m-%d")
+                    }, self.apif_h)
+
+                    for fix in res:
+                        fh = fix["teams"]["home"]["name"]
+                        fa = fix["teams"]["away"]["name"]
+                        # Fuzzy match
+                        import difflib as _dl
+                        if (_dl.SequenceMatcher(None, home.lower(), fh.lower()).ratio() > 0.60 and
+                            _dl.SequenceMatcher(None, away.lower(), fa.lower()).ratio() > 0.60):
+
+                            status = fix["fixture"]["status"]["short"]
+                            # Solo alertar en el descanso (HT)
+                            if status != "HT":
+                                continue
+
+                            score = fix.get("score",{}).get("halftime",{})
+                            ht_h = score.get("home", 0) or 0
+                            ht_a = score.get("away", 0) or 0
+                            ht_total = ht_h + ht_a
+
+                            # Generar alerta según evidencia CSV
+                            alert_msg = None
+                            ht_score = f"{home} {ht_h}-{ht_a} {away} (HT)"
+                            if mkt == "OVER" and ht_total == 0:
+                                alert_msg = (
+                                    "⚠️ <b>ALERTA HT — OVER en riesgo</b>\n"
+                                    f"🏟️ {ht_score}\n"
+                                    f"Pick: {sel} @{odd:.2f}\n"
+                                    "📊 Histórico: 0-0 HT → Over 2.5 FT solo <b>15.2%</b>\n"
+                                    "💡 Mercado ha repriced probablemente"
+                                )
+                            elif mkt == "UNDER" and ht_total == 0:
+                                alert_msg = (
+                                    "✅ <b>CONFIRMACIÓN HT — UNDER bien posicionado</b>\n"
+                                    f"🏟️ {ht_score}\n"
+                                    f"Pick: {sel} @{odd:.2f}\n"
+                                    "📊 Histórico: 0-0 HT → Over 2.5 FT solo <b>15.2%</b> → Under muy probable"
+                                )
+                            elif mkt == "UNDER" and ht_total >= 2:
+                                alert_msg = (
+                                    "⚠️ <b>ALERTA HT — UNDER en riesgo</b>\n"
+                                    f"🏟️ {ht_score}\n"
+                                    f"Pick: {sel} @{odd:.2f}\n"
+                                    f"📊 Histórico: {ht_total} goles HT → Over 2.5 FT <b>83.9%</b>\n"
+                                    "💡 Under está en peligro"
+                                )
+                            elif mkt == "OVER" and ht_total >= 2:
+                                alert_msg = (
+                                    "✅ <b>CONFIRMACIÓN HT — OVER excelente posición</b>\n"
+                                    f"🏟️ {ht_score}\n"
+                                    f"Pick: {sel} @{odd:.2f}\n"
+                                    f"📊 Histórico: {ht_total} goles HT → Over 2.5 FT <b>83.9%</b>"
+                                )
+                            if alert_msg:
+                                send_msg(alert_msg)
+                                alerts_sent += 1
+                                # Marcar como alertado para no repetir
+                                conn2 = sqlite3.connect(DB_PATH)
+                                try:
+                                    conn2.execute(
+                                        "UPDATE picks_log SET ht_alerted=1 WHERE id=?",
+                                        (pid,))
+                                    conn2.commit()
+                                except Exception:
+                                    pass
+                                conn2.close()
+                            break
+                except Exception as e:
+                    Log.warn(f"HT alert {home} vs {away}: {e}", "HT")
+
+            if alerts_sent:
+                Log.ok(f"HT alerts enviadas: {alerts_sent}", "HT")
+
+        except Exception as e:
+            Log.err(f"check_ht_alerts: {e}", "HT")
 
     def capture_clv(self):
         """
@@ -2700,6 +3184,11 @@ function matchRowHTML(m){
       <div class="mr-xg">
         ${m.home_pos&&m.away_pos?`<span style="font-family:var(--mono);font-size:.55rem;color:var(--muted)">#${m.home_pos} vs #${m.away_pos}</span><br>`:''}
         ${xg}
+        ${(m.rest_h||m.rest_a)?`<div style="font-family:var(--mono);font-size:.52rem;margin-top:2px">
+          <span style="color:${m.rest_h<=4?'var(--red)':m.rest_h>7?'var(--green)':'var(--muted)'}">${m.rest_h?m.rest_h+'d':'-'}</span>
+          <span style="color:var(--muted)">vs</span>
+          <span style="color:${m.rest_a<=4?'var(--red)':m.rest_a>7?'var(--green)':'var(--muted)'}">${m.rest_a?m.rest_a+'d':'-'}</span>
+        </div>`:''}
       </div>
     </div>
     <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
@@ -2771,6 +3260,12 @@ async function loadMatchDetail(detEl, home, away, div){
         </div>
       </div>
       <div class="stats-grid">
+        ${m.rest_h||m.rest_a?`
+        <div class="sg-row" style="background:rgba(79,110,247,.04)">
+          <div class="sg-val" style="color:${m.rest_h<=4?'var(--red)':m.rest_h>7?'var(--green)':'var(--text)'}">${m.rest_h?m.rest_h+' días':'-'}</div>
+          <div class="sg-lbl">Descanso</div>
+          <div class="sg-val left" style="color:${m.rest_a<=4?'var(--red)':m.rest_a>7?'var(--green)':'var(--text)'}">${m.rest_a?m.rest_a+' días':'-'}</div>
+        </div>`:''}
         ${statRow('PPG overall', hs.overall?.ppg||'—', as_.overall?.ppg||'—')}
         ${statRow('PPG local/visit', hs.home?.ppg||'—', as_.away?.ppg||'—')}
         ${statRow('Win%', (hs.overall?.win_pct||'—')+'%', (as_.overall?.win_pct||'—')+'%')}
@@ -3210,6 +3705,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_stats_api()
         elif self.path.startswith("/api/calendar"):
             self._serve_calendar()
+        elif self.path == "/api/cups":
+            self._serve_cups_status()
         elif self.path.startswith("/api/picks_summary"):
             self._serve_picks_summary()
         else:
@@ -3671,6 +4168,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             import traceback; Log.err(f"analyze: {e}", "ANALYZE")
             self._json_err(str(e))
 
+    def _serve_cups_status(self):
+        """API /api/cups — estado de la tabla cup_fixtures."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            total = conn.execute("SELECT COUNT(*) FROM cup_fixtures").fetchone()[0]
+            by_comp = conn.execute("""
+                SELECT competition, COUNT(DISTINCT team_normalized) as teams,
+                       COUNT(*) as matches, MAX(match_date) as last_date
+                FROM cup_fixtures GROUP BY competition ORDER BY last_date DESC
+            """).fetchall()
+            recent = conn.execute("""
+                SELECT team_normalized, competition, match_date, opponent
+                FROM cup_fixtures ORDER BY match_date DESC LIMIT 20
+            """).fetchall()
+            conn.close()
+            payload = json.dumps({
+                "total_records": total,
+                "competitions": [{"name":r[0],"teams":r[1],"matches":r[2],"last":r[3]}
+                                  for r in by_comp],
+                "recent": [{"team":r[0],"comp":r[1],"date":r[2],"vs":r[3]}
+                            for r in recent]
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e: self._json_err(str(e))
+
     def _serve_calendar(self):
         """API /api/calendar?days=N — partidos próximos usando fixtures.csv + CSVs históricos."""
         try:
@@ -3826,12 +4351,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         h_pos,n_teams=get_pos(div,h,pl_p)
                         a_pos,_=get_pos(div,a,pl_p)
                 except: pass
+                # Días de descanso para el calendario
+                try:
+                    path_r=os.path.join(DATA_DIR,f"{div}.csv")
+                    rest_h_c=rest_a_c=None
+                    if os.path.exists(path_r):
+                        try:    df_r=pd.read_csv(path_r,encoding="utf-8-sig")
+                        except: df_r=pd.read_csv(path_r,encoding="latin-1")
+                        df_r.columns=df_r.columns.str.strip()
+                        df_r=df_r.rename(columns={"Home":"HomeTeam","Away":"AwayTeam"})
+                        df_r["Date"]=pd.to_datetime(df_r["Date"],dayfirst=True,errors="coerce")
+                        match_dt=pd.Timestamp(date_str)
+                        # Fatiga real: liga + copas
+                        rest_h_c = get_true_rest_days(h, match_dt, div, df_r)
+                        rest_a_c = get_true_rest_days(a, match_dt, div, df_r)
+                except: rest_h_c=rest_a_c=None
                 matches.append({"date":date_str,"div":div,"league":cfg.get("name",div),
                     "home":h,"away":a,"home_form":hf,"away_form":af,
                     "home_stats":hs_q,"away_stats":as_q,
                     "xg_h":xh,"xg_a":xa,"ph":ph,"pd":pd_,"pa":pa,
                     "b365h":oh,"b365d":od,"b365a":oa,"picks":picks_m,
-                    "home_pos":h_pos,"away_pos":a_pos,"n_teams":n_teams})
+                    "home_pos":h_pos,"away_pos":a_pos,"n_teams":n_teams,
+                    "rest_h":rest_h_c,"rest_a":rest_a_c})
 
             # Procesar fixtures.csv
             if fix_df is not None:
@@ -3973,6 +4514,16 @@ if __name__ == "__main__":
     # Arrancar dashboard web en puerto 8080
     start_dashboard(port=int(os.getenv("PORT", "8080")))
     auto_resolve()   # resolver picks PENDING contra CSVs al arrancar
+    # Cargar copa fixtures al arrancar
+    # Si la DB está vacía → descargar temporada completa (julio 2025→hoy)
+    # Si ya tiene datos → solo últimos 10 días para ahorrar requests
+    try:
+        is_empty = _cup_db_is_empty()
+        n = fetch_cup_fixtures(bot.apif_h, full_season=is_empty)
+        mode = "temporada completa" if is_empty else "últimos 10 días"
+        Log.ok(f"Cup fixtures [{mode}]: {n} registros", "CUPS")
+    except Exception as e:
+        Log.warn(f"cup_fixtures startup: {e}", "CUPS")
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
@@ -4037,10 +4588,23 @@ if __name__ == "__main__":
             try: bot.capture_clv()
             except Exception as e: Log.err(f"capture_clv: {e}", "SCHED")
 
+        # HT Alerts — cada 30 min durante ventana europea (12:00-23:00 UTC)
+        # Detecta marcadores de primer tiempo y avisa si el pick está en riesgo
+        if 12 <= hh <= 23 and mm % 30 == 0:
+            try: bot.check_ht_alerts()
+            except Exception as e: Log.warn(f"HT alerts: {e}", "HT")
+
         # Martes 09:00 — standings
         if now.weekday() == 1 and (hh, mm) == (STAND_H, STAND_M) and not _ran_this_week("standings"):
             _mark_ran_week("standings")
             try: bot.weekly_standings()
             except Exception as e: Log.err(f"weekly_standings: {e}", "SCHED")
+            # Copas: actualizar lunes a las 05:00 UTC (solo últimos 10 días)
+            now_d = datetime.now(timezone.utc)
+            if now_d.weekday() == 0 and abs(now_d.hour - 5) < 1:
+                try:
+                    n = fetch_cup_fixtures(bot.apif_h, full_season=False)
+                    Log.ok(f"Cup fixtures actualizados: {n} registros", "CUPS")
+                except Exception as e: Log.err(f"cup_fixtures: {e}", "CUPS")
 
         time.sleep(30)
