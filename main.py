@@ -561,11 +561,14 @@ def _form_pts(gf_series, ga_series, n=5):
     factor = 0.80 + (avg_pts / 3.0) * 0.40
     return round(max(0.80, min(factor, 1.20)), 3)
 
-def get_team_stats(df, team_name, cfg, depth=8):
+def get_team_stats(df, team_name, cfg, depth=10, perspective="all"):
     """
     Extrae xG del equipo desde el DataFrame.
-    Con shots (europeas): xG = wavg(HST) × conv_rate × form
-    Sin shots (BSA/MEX):  xG = wavg(FTHG) × form
+    MEJORADO:
+    - perspective: "home" | "away" | "all" — calcula xG según dónde juega
+    - shot_quality: ajuste por ratio HST/HS (calidad de tiros, no solo cantidad)
+    - momentum: últimos 3 partidos pesan más que la media histórica
+    - conv_rate dinámico: conv_home para partidos local, conv_away para visitante
     """
     import pandas as pd
     teams = pd.concat([df["HomeTeam"], df["AwayTeam"]]).dropna().unique().tolist()
@@ -573,45 +576,92 @@ def get_team_stats(df, team_name, cfg, depth=8):
     if not match: return None, None, [], [], "LOW"
 
     name   = match[0]
-    played = df.dropna(subset=["FTHG","FTAG"])
-    rows   = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].sort_values("Date").tail(depth)
+    played = df.dropna(subset=["FTHG","FTAG"]).copy()
+    if "Date" in played.columns:
+        played = played.sort_values("Date")
+
+    # Filtrar por perspectiva home/away o todos
+    if perspective == "home":
+        rows = played[played["HomeTeam"]==name].tail(depth)
+    elif perspective == "away":
+        rows = played[played["AwayTeam"]==name].tail(depth)
+    else:
+        rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
+
     if len(rows) < 2: return None, None, [], [], "LOW"
 
-    gf_l, ga_l, sf_l, sa_l = [], [], [], []
+    gf_l, ga_l, sf_l, sa_l, sq_l = [], [], [], [], []
     for _, row in rows.iterrows():
         ih = (row["HomeTeam"] == name)
-        # Clipear a 3 — un partido de 4-0 no debe sesgar el xG promedio
-        gf_l.append(min(float(row["FTHG"] if ih else row["FTAG"]), 3.0))
-        ga_l.append(min(float(row["FTAG"] if ih else row["FTHG"]), 3.0))
+        gf_l.append(min(float(row["FTHG"] if ih else row["FTAG"]), 3.5))
+        ga_l.append(min(float(row["FTAG"] if ih else row["FTHG"]), 3.5))
         if cfg["has_shots"]:
             try:
                 hst = float(row.get("HST", float("nan")))
-                ast = float(row.get("AST", float("nan")))
-                if not (math.isnan(hst) or math.isnan(ast)):
-                    sf_l.append(hst if ih else ast)
-                    sa_l.append(ast if ih else hst)
+                ast_ = float(row.get("AST", float("nan")))
+                hs   = float(row.get("HS",  float("nan")))
+                as_  = float(row.get("AS",  float("nan")))
+                if not any(math.isnan(x) for x in [hst, ast_]):
+                    sf_val = hst if ih else ast_
+                    sa_val = ast_ if ih else hst
+                    sf_l.append(sf_val)
+                    sa_l.append(sa_val)
+                    # Shot quality: ratio tiros a puerta / total tiros
+                    # Un HST/HS alto = mejor calidad de tiros → xG real mayor
+                    if not any(math.isnan(x) for x in [hs, as_]):
+                        hs_val = hs if ih else as_
+                        sq = hst/max(hs_val, 1) if ih else ast_/max(as_ if ih else hs, 1)
+                        sq_l.append(min(sq, 1.0))
             except: pass
 
-    # Forma xG (goles marcados/concedidos) — detecta tendencia ofensiva/defensiva
+    # ── Momentum: últimos 3 con peso extra ───────────────────────────────
+    def _momentum(series, n_recent=3):
+        """Si los últimos n_recent son mejores que el promedio → factor>1."""
+        if len(series) < 4: return 1.0
+        recent = sum(series[-n_recent:]) / n_recent
+        hist   = sum(series[:-n_recent]) / max(len(series)-n_recent, 1)
+        if hist < 0.1: return 1.0
+        ratio = recent / hist
+        return max(0.85, min(ratio, 1.20))
+
+    mom_f = _momentum(gf_l)
+    mom_a = _momentum(ga_l)
+
+    # ── Forma blend ──────────────────────────────────────────────────────
     ff_f = _form(gf_l); ff_a = _form(ga_l)
-    # Forma puntos (V/E/D) — detecta rachas de resultados reales
-    # Blend: 60% forma xG + 40% forma puntos para capturar contexto real
     fp_f = _form_pts(gf_l, ga_l, n=5)
-    fp_a = _form_pts(ga_l, gf_l, n=5)   # para déficit: invertir perspectiva
-    ff_f_final = ff_f * 0.60 + fp_f * 0.40
-    ff_a_final = ff_a * 0.60 + fp_a * 0.40
+    fp_a = _form_pts(ga_l, gf_l, n=5)
+    ff_f_final = (ff_f * 0.50 + fp_f * 0.35 + mom_f * 0.15)
+    ff_a_final = (ff_a * 0.50 + fp_a * 0.35 + mom_a * 0.15)
+
+    # ── Shot quality factor ───────────────────────────────────────────────
+    # Liga promedio: ~35% de tiros van a puerta (HST/HS ≈ 0.35)
+    # Si el equipo tiene SQ > 0.35 → mejor calidad → multiplicar xG
+    sq_avg = sum(sq_l)/len(sq_l) if sq_l else 0.35
+    sq_factor = max(0.85, min(sq_avg / 0.35, 1.25))
+
+    # ── conv_rate según perspectiva ───────────────────────────────────────
+    if perspective == "home":
+        conv_f = cfg.get("conv_home", 0.30)
+        conv_a = cfg.get("conv_away", 0.31)
+    elif perspective == "away":
+        conv_f = cfg.get("conv_away", 0.31)
+        conv_a = cfg.get("conv_home", 0.30)
+    else:
+        conv_f = (cfg.get("conv_home",0.30) + cfg.get("conv_away",0.31)) / 2
+        conv_a = conv_f
 
     if cfg["has_shots"] and sf_l:
-        xgf = _wavg(sf_l) * cfg["conv_home"] * ff_f_final
-        xga = _wavg(sa_l) * cfg["conv_away"] * ff_a_final
-        src = "shots"
+        xgf = _wavg(sf_l) * conv_f * ff_f_final * sq_factor
+        xga = _wavg(sa_l) * conv_a * ff_a_final
+        src = f"shots+sq({sq_factor:.2f})"
     else:
         xgf = _wavg(gf_l) * ff_f_final
         xga = _wavg(ga_l) * ff_a_final
         src = "goals_proxy"
 
     conf = "HIGH" if len(gf_l)>=6 else "MED" if len(gf_l)>=3 else "LOW"
-    Log.info(f"  {name}: xGF={xgf:.2f} xGA={xga:.2f} {conf} via {src} forma={ff_f_final:.2f}", "xG")
+    Log.info(f"  {name}[{perspective}]: xGF={xgf:.2f} xGA={xga:.2f} {conf} sq={sq_factor:.2f} mom={mom_f:.2f}", "xG")
     return xgf, xga, gf_l, ga_l, conf
 
 def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
@@ -645,23 +695,36 @@ def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
             conn.commit(); conn.close()
         except: pass
 
-    kh = f"{div}:{home_name}"; ka = f"{div}:{away_name}"
+    # Clave diferenciada por perspectiva home/away
+    kh = f"{div}:{home_name}:home"; ka = f"{div}:{away_name}:away"
+    kh_all = f"{div}:{home_name}"; ka_all = f"{div}:{away_name}"
+
+    # Intentar cache con perspectiva específica, fallback a cache general
     hf, ha, hc = from_cache(kh)
+    if hf is None: hf, ha, hc = from_cache(kh_all)
     if hf is None and df is not None:
-        hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg)
-        if hf: to_cache(kh, home_name, hf, ha, hg, hga, hc)
+        # MEJORA: calcular xG del local COMO LOCAL (últimos partidos en casa)
+        hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg, perspective="home")
+        if hf is None:
+            hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg, perspective="all")
+        if hf: to_cache(kh, home_name, hf, ha, hg if hg else [], hga if hga else [], hc)
 
     af, aa, ac = from_cache(ka)
+    if af is None: af, aa, ac = from_cache(ka_all)
     if af is None and df is not None:
-        af, aa, ag, aga, ac = get_team_stats(df, away_name, cfg)
-        if af: to_cache(ka, away_name, af, aa, ag, aga, ac)
+        # MEJORA: calcular xG del visitante COMO VISITANTE
+        af, aa, ag, aga, ac = get_team_stats(df, away_name, cfg, perspective="away")
+        if af is None:
+            af, aa, ag, aga, ac = get_team_stats(df, away_name, cfg, perspective="all")
+        if af: to_cache(ka, away_name, af, aa, ag if ag else [], aga if aga else [], ac)
 
     if hf is None or af is None:
         Log.warn(f"DEFAULT xG para {home_name} vs {away_name}", "xG")
         return 1.20, 1.20, 2.40, "LOW", "default"
 
-    xh = (hf + aa) / 2
-    xa = (af + ha) / 2
+    # xG del partido: ataque local vs defensa visitante / ataque visitante vs defensa local
+    xh = (hf + aa) / 2   # ataque de home + debilidad defensiva de away
+    xa = (af + ha) / 2   # ataque de away + debilidad defensiva de home
     xh *= (1 - min(inj_h*0.015, 0.08))
     xa *= (1 - min(inj_a*0.015, 0.08))
     lf  = cfg.get("league_factor", 1.0)
@@ -2687,14 +2750,17 @@ async function loadMatchDetail(detEl, home, away, div){
         </div>
       </div>
       <div class="stats-grid">
-        ${statRow('PPG', hs.home?.ppg||'—', as_.away?.ppg||'—')}
-        ${statRow('Win%', (hs.home?.win_pct||'—')+'%', (as_.away?.win_pct||'—')+'%')}
+        ${statRow('PPG overall', hs.overall?.ppg||'—', as_.overall?.ppg||'—')}
+        ${statRow('PPG local/visit', hs.home?.ppg||'—', as_.away?.ppg||'—')}
+        ${statRow('Win%', (hs.overall?.win_pct||'—')+'%', (as_.overall?.win_pct||'—')+'%')}
         ${statRow('Goles/PJ', hs.home?.avg_scored||'—', as_.away?.avg_scored||'—')}
         ${statRow('Conc/PJ', hs.home?.avg_conceded||'—', as_.away?.avg_conceded||'—', false)}
-        ${statRow('BTTS%', (hs.overall?.btts_pct||'—')+'%', (as_.overall?.btts_pct||'—')+'%')}
-        ${statRow('O2.5%', (hs.overall?.over25_pct||'—')+'%', (as_.overall?.over25_pct||'—')+'%')}
-        ${statRow('xG', hs.home?.xg||'—', as_.away?.xg||'—')}
-        ${statRow('xGA', hs.home?.xga||'—', as_.away?.xga||'—', false)}
+        ${statRow('BTTS%', (hs.home?.btts_pct||hs.overall?.btts_pct||'—')+'%', (as_.away?.btts_pct||as_.overall?.btts_pct||'—')+'%')}
+        ${statRow('CS%', (hs.home?.cs_pct||hs.overall?.cs_pct||'—')+'%', (as_.away?.cs_pct||as_.overall?.cs_pct||'—')+'%')}
+        ${statRow('FTS%', (hs.home?.fts_pct||hs.overall?.fts_pct||'—')+'%', (as_.away?.fts_pct||as_.overall?.fts_pct||'—')+'%', false)}
+        ${statRow('Over 1.5%', (hs.overall?.over15_pct||'—')+'%', (as_.overall?.over15_pct||'—')+'%')}
+        ${statRow('Over 2.5%', (hs.home?.over25_pct||hs.overall?.over25_pct||'—')+'%', (as_.away?.over25_pct||as_.overall?.over25_pct||'—')+'%')}
+        ${statRow('Over 3.5%', (hs.overall?.over35_pct||'—')+'%', (as_.overall?.over35_pct||'—')+'%')}
       </div>
       <div class="md-markets">
         <div class="mkt-card"><div class="mkt-label">Over 2.5</div><div class="mkt-pct" style="color:var(--sky)">${pct(d.ou.over)}</div><div class="mkt-fair">${fair(d.fair_odds.over)}</div></div>
@@ -3386,33 +3452,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
             played["FTHG"]=played["FTHG"].astype(float)
             played["FTAG"]=played["FTAG"].astype(float)
             has_shots=cfg.get("has_shots") and "HST" in played.columns
-            def quick_stats(name):
-                h_rows=played[played["HomeTeam"]==name].copy()
-                a_rows=played[played["AwayTeam"]==name].copy()
-                import numpy as _np
-                gf=_np.concatenate([h_rows["FTHG"].values, a_rows["FTAG"].values])
-                ga=_np.concatenate([h_rows["FTAG"].values, a_rows["FTHG"].values])
-                n=len(gf)
-                if n==0: return {}
-                wins=int((gf>ga).sum()); draws=int((gf==ga).sum())
-                btts=int(((gf>0)&(ga>0)).sum())
-                over25=int(((gf+ga)>2.5).sum())
-                # Forma en orden cronológico correcto
-                form=[]
-                all_r2=pd.concat([h_rows,a_rows])
-                if "Date" in all_r2.columns:
-                    all_r2=all_r2.sort_values("Date",ascending=True)
-                for _,rr in all_r2.tail(5).iterrows():
-                    ih2=rr["HomeTeam"]==name
-                    gx=rr["FTHG"] if ih2 else rr["FTAG"]; gcx=rr["FTAG"] if ih2 else rr["FTHG"]
-                    form.append("W" if gx>gcx else "D" if gx==gcx else "L")
-                return {"ppg":round((wins*3+draws)/n,2),"win_pct":round(wins/n*100,1),
-                    "avg_scored":round(float(gf.mean()),2),"avg_conceded":round(float(ga.mean()),2),
-                    "btts_pct":round(btts/n*100,1),"over25_pct":round(over25/n*100,1),
-                    "form":form[-5:],"pj":n,"xg":None,"xga":None}
-            hs=quick_stats(home); as_=quick_stats(away)
-            xh=round((hs.get("avg_scored",1.2)+as_.get("avg_conceded",1.2))/2,2)
-            xa=round((as_.get("avg_scored",1.0)+hs.get("avg_conceded",1.0))/2,2)
+            import numpy as _np_a
+            def side_stats_full(rows_h, rows_a, name_t):
+                """Stats completos para un equipo: overall + home + away."""
+                def calc(rows, gf_col, ga_col):
+                    if rows.empty: return {}
+                    gf=rows[gf_col].values.astype(float)
+                    ga=rows[ga_col].values.astype(float)
+                    n2=len(gf)
+                    if n2==0: return {}
+                    w=int((gf>ga).sum()); d=int((gf==ga).sum())
+                    return {
+                        "pj":n2,"ppg":round((w*3+d)/n2,2),
+                        "win_pct":round(w/n2*100,1),
+                        "avg_scored":round(float(gf.mean()),2),
+                        "avg_conceded":round(float(ga.mean()),2),
+                        "btts_pct":round(int(((gf>0)&(ga>0)).sum())/n2*100,1),
+                        "cs_pct":round(int((ga==0).sum())/n2*100,1),
+                        "fts_pct":round(int((gf==0).sum())/n2*100,1),
+                        "over15_pct":round(int(((gf+ga)>1.5).sum())/n2*100,1),
+                        "over25_pct":round(int(((gf+ga)>2.5).sum())/n2*100,1),
+                        "over35_pct":round(int(((gf+ga)>3.5).sum())/n2*100,1),
+                    }
+                home_s=calc(rows_h,"FTHG","FTAG")
+                away_s=calc(rows_a,"FTAG","FTHG")
+                # Overall
+                gf_o=_np_a.concatenate([rows_h["FTHG"].values.astype(float), rows_a["FTAG"].values.astype(float)])
+                ga_o=_np_a.concatenate([rows_h["FTAG"].values.astype(float), rows_a["FTHG"].values.astype(float)])
+                n_o=len(gf_o)
+                w_o=int((gf_o>ga_o).sum()); d_o=int((gf_o==ga_o).sum())
+                # Forma global ordenada por fecha
+                form_o=[]
+                all_r=pd.concat([rows_h,rows_a])
+                if "Date" in all_r.columns:
+                    all_r=all_r.sort_values("Date",ascending=True)
+                for _,rr in all_r.tail(5).iterrows():
+                    ih2=rr["HomeTeam"]==name_t
+                    gx=float(rr["FTHG"] if ih2 else rr["FTAG"])
+                    gcx=float(rr["FTAG"] if ih2 else rr["FTHG"])
+                    form_o.append("W" if gx>gcx else "D" if gx==gcx else "L")
+                overall={
+                    "pj":n_o,"ppg":round((w_o*3+d_o)/n_o,2) if n_o>0 else 0,
+                    "win_pct":round(w_o/n_o*100,1) if n_o>0 else 0,
+                    "avg_scored":round(float(gf_o.mean()),2) if n_o>0 else 0,
+                    "avg_conceded":round(float(ga_o.mean()),2) if n_o>0 else 0,
+                    "btts_pct":round(int(((gf_o>0)&(ga_o>0)).sum())/n_o*100,1) if n_o>0 else 0,
+                    "cs_pct":round(int((ga_o==0).sum())/n_o*100,1) if n_o>0 else 0,
+                    "fts_pct":round(int((gf_o==0).sum())/n_o*100,1) if n_o>0 else 0,
+                    "over25_pct":round(int(((gf_o+ga_o)>2.5).sum())/n_o*100,1) if n_o>0 else 0,
+                    "form":form_o
+                }
+                return {"overall":overall,"home":home_s,"away":away_s}
+
+            h_rows_a=played[played["HomeTeam"]==home].copy()
+            a_rows_a=played[played["AwayTeam"]==home].copy()
+            h_rows_b=played[played["HomeTeam"]==away].copy()
+            a_rows_b=played[played["AwayTeam"]==away].copy()
+            hs=side_stats_full(h_rows_a, a_rows_a, home)
+            as_=side_stats_full(h_rows_b, a_rows_b, away)
+
+            # xG usando perspectiva correcta: local como local, visitante como visitante
+            h_ov=hs.get("home",hs.get("overall",{}))
+            a_ov=as_.get("away",as_.get("overall",{}))
+            xh=round((h_ov.get("avg_scored",1.2)+a_ov.get("avg_conceded",1.2))/2,2)
+            xa=round((a_ov.get("avg_scored",1.0)+h_ov.get("avg_conceded",1.0))/2,2)
             xt=round(xh+xa,2)
             try: ph,pd_,pa=dixon_coles(xh,xa); ph,pd_,pa=round(ph,3),round(pd_,3),round(pa,3)
             except: ph,pd_,pa=0.4,0.25,0.35
@@ -3433,7 +3536,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "home_goals":int(r["FTHG"]),"away_goals":int(r["FTAG"])})
             h2h_tot=hwins+hdraws+awins
             payload=json.dumps({"home":home,"away":away,"div":div,"league":cfg.get("name",""),
-                "home_stats":{"overall":hs},"away_stats":{"overall":as_},
+                "home_stats":hs,"away_stats":as_,
                 "xg_home":xh,"xg_away":xa,"xg_total":xt,
                 "probs":{"home":ph,"draw":pd_,"away":pa},"ou":{"over":po,"under":pu},
                 "btts":{"yes":py,"no":pn},
@@ -3515,11 +3618,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             g  = r["FTHG"] if ih else r["FTAG"]
                             gc = r["FTAG"] if ih else r["FTHG"]
                             form.append("W" if g > gc else "D" if g == gc else "L")
-                    stats = {"ppg":round((wins*3+draws)/n,2),
-                        "avg_scored":round(float(gf.mean()),2),
-                        "avg_conceded":round(float(ga.mean()),2),
-                        "btts_pct":round(btts/n*100,1),
-                        "over25_pct":round(over25/n*100,1),"pj":n}
+                    # Stats home específicos del equipo
+                    gf_h=h_r["FTHG"].values.astype(float); ga_h=h_r["FTAG"].values.astype(float)
+                    gf_a=a_r["FTAG"].values.astype(float); ga_a=a_r["FTHG"].values.astype(float)
+                    import numpy as _np2
+                    gf_all=_np2.concatenate([gf_h,gf_a]); ga_all=_np2.concatenate([ga_h,ga_a])
+                    n_all=len(gf_all)
+                    def _s(gf,ga):
+                        n2=len(gf); w=int((gf>ga).sum()); d=int((gf==ga).sum())
+                        if n2==0: return {}
+                        return {"pj":n2,"ppg":round((w*3+d)/n2,2),
+                            "avg_scored":round(float(gf.mean()),2),
+                            "avg_conceded":round(float(ga.mean()),2),
+                            "btts_pct":round(int(((gf>0)&(ga>0)).sum())/n2*100,1),
+                            "cs_pct":round(int((ga==0).sum())/n2*100,1),
+                            "over25_pct":round(int(((gf+ga)>2.5).sum())/n2*100,1)}
+                    stats = {"overall":_s(gf_all,ga_all),"home":_s(gf_h,ga_h),"away":_s(gf_a,ga_a),
+                        # Compatibilidad directa con código antiguo
+                        "ppg":round((int((gf_all>ga_all).sum())*3+int((gf_all==ga_all).sum()))/n_all,2) if n_all>0 else 0,
+                        "avg_scored":round(float(gf_all.mean()),2) if n_all>0 else 0,
+                        "avg_conceded":round(float(ga_all.mean()),2) if n_all>0 else 0,
+                        "btts_pct":round(int(((gf_all>0)&(ga_all>0)).sum())/n_all*100,1) if n_all>0 else 0,
+                        "over25_pct":round(int(((gf_all+ga_all)>2.5).sum())/n_all*100,1) if n_all>0 else 0,
+                        "pj":n_all}
                     return stats, form
                 except: return {}, []
 
