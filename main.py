@@ -2351,13 +2351,13 @@ header{display:flex;align-items:center;gap:12px;padding:1rem 2rem;border-bottom:
 .pb-d{background:var(--amber)}
 .pb-a{background:var(--red)}
 .prob-labels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:3px}
-.stats-grid{display:grid;grid-template-columns:1fr 90px 1fr;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:1rem}
+.stats-grid{display:grid;grid-template-columns:1fr minmax(110px,auto) 1fr;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:1rem}
 .sg-col{display:flex;flex-direction:column}
-.sg-row{display:grid;grid-template-columns:1fr 90px 1fr;border-bottom:1px solid var(--border)}
+.sg-row{display:grid;grid-template-columns:1fr minmax(110px,auto) 1fr;border-bottom:1px solid var(--border)}
 .sg-row:last-child{border-bottom:none}
 .sg-val{padding:6px 12px;font-family:var(--mono);font-size:.7rem;text-align:right;background:var(--s1)}
 .sg-val.left{text-align:left;background:var(--s1)}
-.sg-lbl{padding:6px 8px;font-family:var(--mono);font-size:.58rem;color:var(--muted);text-align:center;background:var(--bg)}
+.sg-lbl{padding:6px 10px;font-family:var(--mono);font-size:.58rem;color:var(--muted);text-align:center;background:var(--bg);white-space:nowrap}
 .sg-val.winner{color:var(--green);font-weight:500}
 .md-markets{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:1rem}
 .mkt-card{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:.7rem;text-align:center}
@@ -2697,7 +2697,10 @@ function matchRowHTML(m){
         <div class="form-row">${fa}</div>
       </div>
       <div class="mr-pick">${pickBadge}</div>
-      <div class="mr-xg">${xg}</div>
+      <div class="mr-xg">
+        ${m.home_pos&&m.away_pos?`<span style="font-family:var(--mono);font-size:.55rem;color:var(--muted)">#${m.home_pos} vs #${m.away_pos}</span><br>`:''}
+        ${xg}
+      </div>
     </div>
     <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
       <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted)">cargando análisis...</div>
@@ -2742,6 +2745,24 @@ async function loadMatchDetail(detEl, home, away, div){
             </div>
             <div class="prob-labels"><span>${pct(d.probs.home)}</span><span>${pct(d.probs.draw)}</span><span>${pct(d.probs.away)}</span></div>
           </div>
+          ${(()=>{
+            // VALUE vs MERCADO
+            const fo=d.fair_odds||{};
+            const bh=m.b365h, bd=m.b365d, ba=m.b365a;
+            if(!bh) return '';
+            function ev(fair,book){if(!fair||!book)return null;return ((book/fair)-1)*100;}
+            const evH=ev(fo.home,bh), evD=ev(fo.draw,bd), evA=ev(fo.away,ba);
+            function pill(label,evVal,odd){
+              if(evVal===null) return '';
+              const c=evVal>3?'var(--green)':evVal>0?'#86efac':evVal>-3?'var(--amber)':'var(--red)';
+              const sign=evVal>0?'+':'';
+              return `<span style="font-family:var(--mono);font-size:.58rem;padding:2px 7px;border-radius:4px;border:1px solid ${c}22;background:${c}11;color:${c}">${label} @${odd} ${sign}${evVal.toFixed(1)}%</span>`;
+            }
+            return `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:.5rem;justify-content:center">
+              ${pill('L',evH,bh)}${pill('E',evD,bd)}${pill('V',evA,ba)}
+            </div>`;
+          })()}
+          ${d.home_pos?.pos?`<div style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:.4rem">${d.home} #${d.home_pos.pos} · ${d.away} #${d.away_pos?.pos||'?'} de ${d.home_pos.total}</div>`:''}
         </div>
         <div class="md-team">
           <div class="md-team-name">${d.away}</div>
@@ -2767,6 +2788,46 @@ async function loadMatchDetail(detEl, home, away, div){
         <div class="mkt-card"><div class="mkt-label">Under 2.5</div><div class="mkt-pct" style="color:var(--purple)">${pct(d.ou.under)}</div><div class="mkt-fair">${fair(d.fair_odds.under)}</div></div>
         <div class="mkt-card"><div class="mkt-label">BTTS Sí</div><div class="mkt-pct" style="color:var(--green)">${pct(d.btts.yes)}</div><div class="mkt-fair">${fair(d.fair_odds.btts_y)}</div></div>
         <div class="mkt-card"><div class="mkt-label">BTTS No</div><div class="mkt-pct" style="color:var(--red)">${pct(d.btts.no)}</div><div class="mkt-fair"></div></div>
+      </div>
+      ${(()=>{
+        // RACHA O/U últimos 5
+        function ouRow(label, streak){
+          if(!streak||!streak.length) return '';
+          const dots=streak.map(s=>{
+            const c=s.result==='O'?'var(--sky)':'var(--purple)';
+            return `<span style="display:inline-flex;flex-direction:column;align-items:center;gap:1px">
+              <span style="width:22px;height:22px;border-radius:4px;background:${c}22;border:1px solid ${c}44;color:${c};font-family:var(--mono);font-size:.58rem;font-weight:600;display:flex;align-items:center;justify-content:center">${s.result}</span>
+              <span style="font-family:var(--mono);font-size:.48rem;color:var(--muted)">${s.goals}</span>
+            </span>`;
+          }).join('');
+          const overs=streak.filter(s=>s.result==='O').length;
+          const btts_c=streak.filter(s=>s.btts).length;
+          return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0">
+            <span style="font-family:var(--mono);font-size:.6rem;color:var(--muted);width:70px">${label}</span>
+            <div style="display:flex;gap:4px">${dots}</div>
+            <span style="font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-left:4px">${overs}/5 Over · ${btts_c}/5 BTTS</span>
+          </div>`;
+        }
+        const homeOu=d.home_ou||[]; const awayOu=d.away_ou||[];
+        if(!homeOu.length&&!awayOu.length) return '';
+        return `<div style="background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:.75rem 1rem;margin-top:.75rem">
+          <div style="font-family:var(--mono);font-size:.58rem;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:.5rem">Racha Over/Under — últimos 5</div>
+          ${ouRow(d.home, homeOu)}
+          ${ouRow(d.away, awayOu)}
+        </div>`;
+      })()}
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:.5rem">
+        ${(()=>{
+          if(!m.b365h||!d.probs) return '';
+          function ev(p,odd){return p>0?((odd*p-1)*100):null;}
+          function pill(lbl,p,odd){
+            if(!odd||!p) return '';
+            const e=ev(p,odd);
+            const c=e>3?'var(--green)':e>0?'#86efac':e>-3?'var(--amber)':'var(--red)';
+            return `<span style="font-family:var(--mono);font-size:.6rem;padding:3px 8px;border-radius:5px;border:1px solid ${c}33;color:${c};background:${c}0d">${lbl} @${odd} ${e>0?'+':''}${e.toFixed(1)}% EV</span>`;
+          }
+          return pill('Local',d.probs.home,m.b365h)+pill('Empate',d.probs.draw,m.b365d)+pill('Visitante',d.probs.away,m.b365a);
+        })()}
       </div>
       ${h2h.total>0?`
       <div class="h2h-section">
@@ -3523,6 +3584,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
             po_raw,pu_raw=negbinom_ou(xt,std)
             po=round(shrink(po_raw,a=0.65),3); pu=round(1-po,3)
             py,pn=btts_prob(xh,xa); py=round(py or 0,3); pn=round(1-py,3)
+            # ── Racha O/U últimos 5 por equipo ──────────────────────────────
+            def ou_streak(rows_h, rows_a, name_t, line=2.5):
+                """Últimos 5 partidos del equipo: Over/Under y BTTS."""
+                all_r = pd.concat([rows_h, rows_a])
+                if "Date" in all_r.columns:
+                    all_r = all_r.sort_values("Date", ascending=True)
+                streak = []
+                for _, r in all_r.tail(5).iterrows():
+                    total = float(r["FTHG"]) + float(r["FTAG"])
+                    btts_r = float(r["FTHG"]) > 0 and float(r["FTAG"]) > 0
+                    streak.append({
+                        "result": "O" if total > line else "U",
+                        "goals": int(r["FTHG"]) + int(r["FTAG"]),
+                        "btts": btts_r,
+                        "home": r["HomeTeam"],
+                        "away": r["AwayTeam"],
+                        "score": f"{int(r['FTHG'])}-{int(r['FTAG'])}",
+                    })
+                return streak
+
+            home_ou = ou_streak(h_rows_a, a_rows_a, home)
+            away_ou = ou_streak(h_rows_b, a_rows_b, away)
+
+            # ── Posición en tabla ─────────────────────────────────────────
+            def get_league_table(played_df, team_name):
+                """Posición, PJ, PTS del equipo en la tabla actual."""
+                table = {}
+                for _, r in played_df.iterrows():
+                    for side, gf_col, ga_col in [("HomeTeam","FTHG","FTAG"),("AwayTeam","FTAG","FTHG")]:
+                        t = r[side]; gf = float(r[gf_col]); ga = float(r[ga_col])
+                        if t not in table:
+                            table[t] = {"pj":0,"pts":0,"gf":0,"ga":0,"pg":0,"pe":0,"pp":0}
+                        table[t]["pj"] += 1; table[t]["gf"] += gf; table[t]["ga"] += ga
+                        if gf > ga: table[t]["pts"] += 3; table[t]["pg"] += 1
+                        elif gf == ga: table[t]["pts"] += 1; table[t]["pe"] += 1
+                        else: table[t]["pp"] += 1
+                sorted_table = sorted(table.items(), key=lambda x: (-x[1]["pts"], -(x[1]["gf"]-x[1]["ga"]), -x[1]["gf"]))
+                pos_map = {t: i+1 for i, (t, _) in enumerate(sorted_table)}
+                n_teams = len(sorted_table)
+                def info(name):
+                    import difflib as dl
+                    teams = list(table.keys())
+                    match = dl.get_close_matches(name, teams, n=1, cutoff=0.50)
+                    if not match: return {}
+                    d = table[match[0]]
+                    pos = pos_map.get(match[0], 0)
+                    return {"pos": pos, "total": n_teams, "pj": d["pj"], "pts": d["pts"],
+                            "gf": int(d["gf"]), "ga": int(d["ga"]),
+                            "gd": int(d["gf"]-d["ga"])}
+                return info(home), info(away)
+
+            home_pos, away_pos = get_league_table(played, home)
+
             h2h_rows=played[((played["HomeTeam"]==home)&(played["AwayTeam"]==away))|
                 ((played["HomeTeam"]==away)&(played["AwayTeam"]==home))].sort_values("Date",ascending=False).head(10)
             hwins=hdraws=awins=0; h2h_list=[]
@@ -3546,7 +3660,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "h2h":{"total":h2h_tot,"home_wins":hwins,"draws":hdraws,"away_wins":awins,
                     "over25":sum(1 for r in h2h_list if r["home_goals"]+r["away_goals"]>2),
                     "btts":sum(1 for r in h2h_list if r["home_goals"]>0 and r["away_goals"]>0),
-                    "matches":h2h_list}}).encode()
+                    "matches":h2h_list},
+                "home_ou":home_ou, "away_ou":away_ou,
+                "home_pos":home_pos, "away_pos":away_pos}).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
             self.send_header("Access-Control-Allow-Origin","*")
@@ -3648,6 +3764,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 try: f=float(v); return round(f,2) if f>1.01 else None
                 except: return None
 
+            # ── Tabla de posiciones para mostrar en el calendario ───────────
+            _table_cache = {}
+            def get_pos(div_key, team_name, played_df):
+                if div_key not in _table_cache:
+                    tbl = {}
+                    for _, r in played_df.iterrows():
+                        for side, gf_col, ga_col in [("HomeTeam","FTHG","FTAG"),("AwayTeam","FTAG","FTHG")]:
+                            t=r[side]; gf=float(r[gf_col]); ga=float(r[ga_col])
+                            if t not in tbl: tbl[t]={"pts":0,"gf":0,"ga":0}
+                            tbl[t]["gf"]+=gf; tbl[t]["ga"]+=ga
+                            if gf>ga: tbl[t]["pts"]+=3
+                            elif gf==ga: tbl[t]["pts"]+=1
+                    sorted_t=sorted(tbl.items(),key=lambda x:(-x[1]["pts"],-(x[1]["gf"]-x[1]["ga"]),-x[1]["gf"]))
+                    _table_cache[div_key]={t:i+1 for i,(t,_) in enumerate(sorted_t)}
+                    _table_cache[div_key+"__n"]=len(sorted_t)
+                pos_map=_table_cache.get(div_key,{})
+                n=_table_cache.get(div_key+"__n",0)
+                import difflib as _dl
+                match=_dl.get_close_matches(team_name,list(pos_map.keys()),n=1,cutoff=0.50)
+                return pos_map.get(match[0],0) if match else 0, n
+
             def add_match(div, h, a, date_str, row):
                 key = f"{div}_{date_str}_{h}_{a}"
                 if key in seen: return
@@ -3675,11 +3812,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     conn_p.close()
                     picks_m=[{"market":r[0],"selection":r[1],"odd":r[2],"ev":r[3],"stake":r[4],"result":r[5]} for r in pk]
                 except: pass
+                # Posición en tabla
+                h_pos=a_pos=n_teams=0
+                try:
+                    path_p=os.path.join(DATA_DIR,f"{div}.csv")
+                    if os.path.exists(path_p):
+                        try:    df_p=pd.read_csv(path_p,encoding="utf-8-sig")
+                        except: df_p=pd.read_csv(path_p,encoding="latin-1")
+                        df_p.columns=df_p.columns.str.strip()
+                        df_p=df_p.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+                        pl_p=df_p.dropna(subset=["FTHG","FTAG"]).copy()
+                        pl_p["FTHG"]=pl_p["FTHG"].astype(float); pl_p["FTAG"]=pl_p["FTAG"].astype(float)
+                        h_pos,n_teams=get_pos(div,h,pl_p)
+                        a_pos,_=get_pos(div,a,pl_p)
+                except: pass
                 matches.append({"date":date_str,"div":div,"league":cfg.get("name",div),
                     "home":h,"away":a,"home_form":hf,"away_form":af,
                     "home_stats":hs_q,"away_stats":as_q,
                     "xg_h":xh,"xg_a":xa,"ph":ph,"pd":pd_,"pa":pa,
-                    "b365h":oh,"b365d":od,"b365a":oa,"picks":picks_m})
+                    "b365h":oh,"b365d":od,"b365a":oa,"picks":picks_m,
+                    "home_pos":h_pos,"away_pos":a_pos,"n_teams":n_teams})
 
             # Procesar fixtures.csv
             if fix_df is not None:
