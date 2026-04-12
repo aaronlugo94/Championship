@@ -2389,8 +2389,9 @@ td.muted-td{color:var(--muted)}
   <div><div class="logo-text">V7.2 Quant</div><div class="logo-sub">Triple League Specialist</div></div>
   <div class="header-tabs">
     <button class="htab active" onclick="showMainTab(0,this)">Calendario</button>
-    <button class="htab" onclick="showMainTab(1,this)">Picks jornada</button>
-    <button class="htab" onclick="showMainTab(2,this)">Histórico</button>
+    <button class="htab" onclick="showMainTab(1,this)">Jornada</button>
+    <button class="htab" onclick="showMainTab(2,this)">Historial</button>
+    <button class="htab" onclick="showMainTab(3,this)">Dashboard</button>
   </div>
   <div class="live-pill"><span class="live-dot"></span><span id="last-upd">live</span></div>
 </header>
@@ -2406,6 +2407,34 @@ td.muted-td{color:var(--muted)}
 
 <!-- ══════════ TAB 1: PICKS JORNADA ══════════ -->
 <div id="tab1" class="tab-pane">
+  <!-- JORNADA: solo picks PENDING -->
+  <div class="picks-toolbar" style="border-bottom:1px solid var(--border);padding:.75rem 1.5rem;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <span style="font-family:var(--mono);font-size:.6rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Picks activos — pendientes de resolución</span>
+    <div class="spacer"></div>
+    <div class="seg" id="mkt-seg-j">
+      <button class="seg-btn active" data-m="all">Todos</button>
+      <button class="seg-btn" data-m="UNDER">Under</button>
+      <button class="seg-btn" data-m="OVER">Over</button>
+      <button class="seg-btn" data-m="DC">DC</button>
+      <button class="seg-btn" data-m="1X2">1X2</button>
+      <button class="seg-btn" data-m="BTTS">BTTS</button>
+      <button class="seg-btn" data-m="DNB">DNB</button>
+    </div>
+    <button class="resolve-btn" onclick="resolveData()">resolver picks</button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Fecha</th><th>Liga</th><th>Partido</th><th>Mkt</th>
+        <th>Cuota</th><th>EV</th><th>Prob</th><th>Stake</th><th>xG</th>
+      </tr></thead>
+      <tbody id="jornada-body"><tr><td colspan="9" class="empty">cargando...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══════════ TAB 2: HISTORIAL RESUELTOS ══════════ -->
+<div id="tab2" class="tab-pane">
   <div class="stats-strip" id="stats-strip">
     <div class="scard"><div class="scard-label">Picks totales</div><div class="scard-val c-white" id="s-total">—</div><div class="scard-sub" id="s-sub-total"></div></div>
     <div class="scard"><div class="scard-label">Win</div><div class="scard-val c-green" id="s-win">—</div><div class="scard-sub" id="s-sub-win"></div></div>
@@ -2456,8 +2485,40 @@ td.muted-td{color:var(--muted)}
   </div>
 </div>
 
-<!-- ══════════ TAB 2: HISTÓRICO ══════════ -->
-<div id="tab2" class="tab-pane">
+  <!-- picks resueltos en tab2 -->
+  <div class="picks-toolbar" style="border-bottom:1px solid var(--border);padding:.75rem 1.5rem;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <div class="seg" id="flt-seg">
+      <button class="seg-btn active" data-f="all">Todos</button>
+      <button class="seg-btn" data-f="WIN">Win</button>
+      <button class="seg-btn" data-f="LOSS">Loss</button>
+    </div>
+    <div class="seg" id="mkt-seg-h">
+      <button class="seg-btn active" data-m="all">Mercados</button>
+      <button class="seg-btn" data-m="UNDER">Under</button>
+      <button class="seg-btn" data-m="OVER">Over</button>
+      <button class="seg-btn" data-m="DC">DC</button>
+      <button class="seg-btn" data-m="1X2">1X2</button>
+    </div>
+    <div class="spacer"></div>
+    <input id="picks-search" type="text" placeholder="buscar equipo..." style="font-family:var(--mono);font-size:.68rem;padding:7px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th data-col="date">Fecha</th><th data-col="div">Liga</th>
+        <th data-col="match">Partido</th><th data-col="market">Mkt</th>
+        <th data-col="odd">Cuota</th><th data-col="ev">EV</th>
+        <th data-col="prob">Prob</th><th data-col="stake">Stake</th>
+        <th data-col="xg">xG</th><th data-col="status">Resultado</th>
+        <th data-col="profit">Profit</th>
+      </tr></thead>
+      <tbody id="picks-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══════════ TAB 3: DASHBOARD ══════════ -->
+<div id="tab3" class="tab-pane">
   <div class="hist-body">
     <p class="section-title">PnL acumulado</p>
     <div class="chart-container">
@@ -2482,8 +2543,9 @@ function showMainTab(i,btn){
   document.querySelectorAll('.tab-pane').forEach((p,j)=>p.classList.toggle('active',j===i));
   document.querySelectorAll('.htab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
-  if(i===1 && !allPicks.length) loadPicks();
-  if(i===2) renderHistorico();
+  if(i===1){ loadPicks().then(renderJornada); }
+  if(i===2){ loadPicks().then(renderHistorial); }
+  if(i===3){ if(!allPicks.length) loadPicks().then(renderHistorico); else renderHistorico(); }
 }
 
 // ════════════════════════════════════════
@@ -2794,8 +2856,75 @@ async function loadPicks(){
     const d=await r.json();
     allPicks=d.picks||[];
     updateStats(d.stats);
-    renderPicks();
-  }catch(e){document.getElementById('picks-body').innerHTML=`<tr><td colspan="11" class="empty">error</td></tr>`;}
+  }catch(e){console.error('loadPicks:',e);}
+}
+
+function renderJornada(){
+  const segJ=document.getElementById('mkt-seg-j');
+  let mktF='all';
+  if(segJ){const a=segJ.querySelector('.seg-btn.active');if(a)mktF=a.dataset.m||'all';}
+  const pending=allPicks.filter(p=>p.status==='PENDING'&&(mktF==='all'||p.market===mktF));
+  const tbody=document.getElementById('jornada-body');
+  if(!tbody)return;
+  if(!pending.length){tbody.innerHTML='<tr><td colspan="9" class="empty">Sin picks pendientes esta jornada</td></tr>';return;}
+  tbody.innerHTML=pending.map(p=>{
+    const ev=(parseFloat(p.ev||0)*100).toFixed(1);
+    const prob=(parseFloat(p.prob||0)*100).toFixed(1);
+    const stake=(parseFloat(p.stake||0)*100).toFixed(2);
+    const d=p.date?p.date.slice(5).replace('-','/'):'—';
+    return `<tr>
+      <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${d}</td>
+      <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
+      <td style="font-size:.82rem;font-weight:500">${p.home||''} <span style="color:var(--muted)">vs</span> ${p.away||''}</td>
+      <td>${mktBadge(p.market)}</td>
+      <td style="font-family:var(--mono)">@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td class="${evCls(parseFloat(ev))}">+${ev}%</td>
+      <td style="color:var(--muted);font-family:var(--mono)">${prob}%</td>
+      <td style="color:var(--muted);font-family:var(--mono)">${stake}%</td>
+      <td>${xgMini(p.xg_h,p.xg_a)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderHistorial(){
+  const segFlt=document.getElementById('flt-seg');
+  const segMkt=document.getElementById('mkt-seg-h');
+  const srch=document.getElementById('picks-search');
+  let fltF='all',mktF='all',searchF='';
+  if(segFlt){const a=segFlt.querySelector('.seg-btn.active');if(a)fltF=a.dataset.f||'all';}
+  if(segMkt){const a=segMkt.querySelector('.seg-btn.active');if(a)mktF=a.dataset.m||'all';}
+  if(srch)searchF=srch.value.toLowerCase();
+  let data=allPicks.filter(p=>{
+    if(p.status==='PENDING')return false;
+    if(fltF!=='all'&&p.status!==fltF)return false;
+    if(mktF!=='all'&&p.market!==mktF)return false;
+    if(searchF){const hay=((p.home||'')+' '+(p.away||'')+' '+(p.div||'')).toLowerCase();if(!hay.includes(searchF))return false;}
+    return true;
+  });
+  data.sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const tbody=document.getElementById('picks-body');
+  if(!tbody)return;
+  if(!data.length){tbody.innerHTML='<tr><td colspan="11" class="empty">sin picks resueltos</td></tr>';return;}
+  tbody.innerHTML=data.map(p=>{
+    const ev=(parseFloat(p.ev||0)*100).toFixed(1);
+    const prob=(parseFloat(p.prob||0)*100).toFixed(1);
+    const stake=(parseFloat(p.stake||0)*100).toFixed(2);
+    const profit=parseFloat(p.profit||0);
+    const d=p.date?p.date.slice(5).replace('-','/'):'—';
+    return `<tr>
+      <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${d}</td>
+      <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
+      <td style="font-size:.82rem;font-weight:500">${p.home||''} <span style="color:var(--muted)">vs</span> ${p.away||''}</td>
+      <td>${mktBadge(p.market)}</td>
+      <td style="font-family:var(--mono)">@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td class="${evCls(parseFloat(ev))}">+${ev}%</td>
+      <td style="color:var(--muted);font-family:var(--mono)">${prob}%</td>
+      <td style="color:var(--muted);font-family:var(--mono)">${stake}%</td>
+      <td>${xgMini(p.xg_h,p.xg_a)}</td>
+      <td>${resBadge(p.status)}</td>
+      <td class="${profit>0?'c-green':profit<0?'c-red':''}">${profit>=0?'+':''}${profit.toFixed(4)}</td>
+    </tr>`;
+  }).join('');
 }
 
 async function resolveData(){
@@ -2910,8 +3039,21 @@ function renderHistorico(){
 
 // ── INIT ──
 loadCalendar();
-loadPicks();
-setInterval(()=>{loadPicks();document.getElementById('last-upd').textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});},60000);
+loadPicks().then(()=>{
+  const wire=(id,fn)=>{const seg=document.getElementById(id);if(seg)seg.querySelectorAll('.seg-btn').forEach(b=>b.addEventListener('click',()=>{seg.querySelectorAll('.seg-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');fn();}));};
+  wire('flt-seg', renderHistorial);
+  wire('mkt-seg-h', renderHistorial);
+  wire('mkt-seg-j', renderJornada);
+  const srch=document.getElementById('picks-search');
+  if(srch) srch.addEventListener('input', renderHistorial);
+});
+loadCalendario();
+setInterval(()=>{
+  loadPicks();
+  loadCalendario();
+  const el=document.getElementById('last-upd');
+  if(el) el.textContent=new Date().toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'});
+},120000);
 </script>
 </body>
 </html>
@@ -3289,6 +3431,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "away":round(1/pa,2) if pa>0 else None,"over":round(1/po,2) if po>0 else None,
                     "under":round(1/pu,2) if pu>0 else None,"btts_y":round(1/py,2) if py>0 else None},
                 "h2h":{"total":h2h_tot,"home_wins":hwins,"draws":hdraws,"away_wins":awins,
+                    "over25":sum(1 for r in h2h_list if r["home_goals"]+r["away_goals"]>2),
+                    "btts":sum(1 for r in h2h_list if r["home_goals"]>0 and r["away_goals"]>0),
                     "matches":h2h_list}}).encode()
             self.send_response(200)
             self.send_header("Content-Type","application/json")
