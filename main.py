@@ -309,7 +309,7 @@ MIN_EV_MKT = {
     "UNDER": 0.050,   # Under sobreestimado — requiere margen alto (BR 42%)
     "OVER":  0.020,   # Over sin sesgo claro — margen moderado
     "DC":    0.010,   # DC: 100% beat rate — margen mínimo
-    "1X2":   0.025,   # 1X2: mercado eficiente — margen alto
+    "1X2":   0.030,   # 1X2: EV mín 3% — umbral cuota bajado a 2.00
     "BTTS":  0.020,   # BTTS Sí: moderado
     "BTTS_NO": 0.020, # BTTS No: moderado
     "DNB":     0.025, # DNB: mercado semi-eficiente
@@ -1344,15 +1344,18 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     # Corrección favoritos fuertes — evidencia CSV: P(home)>70% sobreestimado 5.1%
     ph, pd_, pa = adjust_strong_favorite(ph, pd_, pa)
 
-    # 1X2: solo cuotas ≥ 2.50 en ligas menos líquidas (liq < 0.88)
-    # Mercado muy eficiente en ligas top — solo apostamos donde hay ineficiencia
-    MIN_ODD_1X2 = 2.50 if liq < 0.88 else 3.00
+    # 1X2: umbral bajado para acumular track record en rango betterFly-style (>2.0)
+    # Evidencia externa: 60% WR con cuota 2.05 = +16% ROI (algobetting community)
+    # Ligas menos líquidas (liq < 0.88): umbral 2.00
+    # Ligas top líquidas: umbral 2.50 (mercado más eficiente)
+    MIN_ODD_1X2 = 2.00 if liq < 0.88 else 2.50
     for prob, odd_val, pick in [(ph,oh,f"Gana {h_n}"),
                                  (pd_,od,"Empate"),
                                  (pa,oa,f"Gana {a_n}")]:
         if odd_val and odd_val >= MIN_ODD_1X2:
             out.append({"mkt":"1X2","pick":pick,"odd":odd_val,"prob":prob,
-                        "model_gap":round(prob-1/(odd_val*1.05),4)})
+                        "model_gap":round(prob-1/(odd_val*1.05),4),
+                        "odd_range":"2.0-2.5" if odd_val < 2.5 else "2.5+"})
 
     # ── DOUBLE CHANCE ────────────────────────────────────────────────────
     # DC calculado de probabilidades Dixon-Coles ya calibradas
@@ -3148,7 +3151,8 @@ function renderCalendar(){
         det.classList.toggle('open');
         if(det.classList.contains('open') && !det.dataset.loaded){
           det.dataset.loaded='1';
-          loadMatchDetail(det, row.dataset.home, row.dataset.away, row.dataset.div);
+          const matchData = row.dataset.match ? JSON.parse(row.dataset.match) : {};
+          loadMatchDetail(det, row.dataset.home, row.dataset.away, row.dataset.div, matchData);
         }
       }
     });
@@ -3165,7 +3169,7 @@ function matchRowHTML(m){
   const fh=(m.form_h||[]).map(fd).join('');
   const fa=(m.form_a||[]).map(fd).join('');
   return `
-    <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
+    <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a})}'>
       <div class="mr-time">${m.time||m.date?.slice(5)||''}</div>
       <div class="mr-home">
         <div class="team-name">${m.home}</div>
@@ -3191,12 +3195,12 @@ function matchRowHTML(m){
         </div>`:''}
       </div>
     </div>
-    <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}">
+    <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a})}'>
       <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted)">cargando análisis...</div>
     </div>`;
 }
 
-async function loadMatchDetail(detEl, home, away, div){
+async function loadMatchDetail(detEl, home, away, div, m={}){
   try{
     const r=await fetch(`/api/analyze?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&div=${encodeURIComponent(div)}`);
     const d=await r.json();
