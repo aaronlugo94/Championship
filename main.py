@@ -574,7 +574,7 @@ def get_team_stats(df, team_name, cfg, depth=8):
 
     name   = match[0]
     played = df.dropna(subset=["FTHG","FTAG"])
-    rows   = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(depth)
+    rows   = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].sort_values("Date").tail(depth)
     if len(rows) < 2: return None, None, [], [], "LOW"
 
     gf_l, ga_l, sf_l, sa_l = [], [], [], []
@@ -3387,15 +3387,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             played["FTAG"]=played["FTAG"].astype(float)
             has_shots=cfg.get("has_shots") and "HST" in played.columns
             def quick_stats(name):
-                h_rows=played[played["HomeTeam"]==name]; a_rows=played[played["AwayTeam"]==name]
-                all_r=pd.concat([h_rows,a_rows]); n=len(all_r)
+                h_rows=played[played["HomeTeam"]==name].copy()
+                a_rows=played[played["AwayTeam"]==name].copy()
+                import numpy as _np
+                gf=_np.concatenate([h_rows["FTHG"].values, a_rows["FTAG"].values])
+                ga=_np.concatenate([h_rows["FTAG"].values, a_rows["FTHG"].values])
+                n=len(gf)
                 if n==0: return {}
-                gf=pd.concat([h_rows["FTHG"],a_rows["FTAG"]]); ga=pd.concat([h_rows["FTAG"],a_rows["FTHG"]])
                 wins=int((gf>ga).sum()); draws=int((gf==ga).sum())
-                btts=int(((pd.concat([h_rows["FTHG"],a_rows["FTAG"]])>0)&(pd.concat([h_rows["FTAG"],a_rows["FTHG"]])>0)).sum())
+                btts=int(((gf>0)&(ga>0)).sum())
                 over25=int(((gf+ga)>2.5).sum())
+                # Forma en orden cronológico correcto
                 form=[]
-                for g,gc in zip(gf,ga): form.append("W" if g>gc else "D" if g==gc else "L")
+                all_r2=pd.concat([h_rows,a_rows])
+                if "Date" in all_r2.columns:
+                    all_r2=all_r2.sort_values("Date",ascending=True)
+                for _,rr in all_r2.tail(5).iterrows():
+                    ih2=rr["HomeTeam"]==name
+                    gx=rr["FTHG"] if ih2 else rr["FTAG"]; gcx=rr["FTAG"] if ih2 else rr["FTHG"]
+                    form.append("W" if gx>gcx else "D" if gx==gcx else "L")
                 return {"ppg":round((wins*3+draws)/n,2),"win_pct":round(wins/n*100,1),
                     "avg_scored":round(float(gf.mean()),2),"avg_conceded":round(float(ga.mean()),2),
                     "btts_pct":round(btts/n*100,1),"over25_pct":round(over25/n*100,1),
@@ -3486,19 +3496,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     nm = match[0]
                     h_r = played_h[played_h["HomeTeam"]==nm]
                     a_r = played_h[played_h["AwayTeam"]==nm]
-                    gf = pd.concat([h_r["FTHG"],a_r["FTAG"]])
-                    ga = pd.concat([h_r["FTAG"],a_r["FTHG"]])
+                    import numpy as _np
+                    gf = _np.concatenate([h_r["FTHG"].values, a_r["FTAG"].values])
+                    ga = _np.concatenate([h_r["FTAG"].values, a_r["FTHG"].values])
                     n = len(gf)
                     if n == 0: return {}, []
                     wins = int((gf>ga).sum()); draws = int((gf==ga).sum())
                     btts = int(((gf>0)&(ga>0)).sum())
                     over25 = int(((gf+ga)>2.5).sum())
+                    # Forma: últimos 5 partidos ordenados por fecha REAL
                     form = []
-                    rows_all = pd.concat([h_r,a_r]).sort_values("Date" if "Date" in played_h.columns else played_h.columns[0])
-                    for _,r in rows_all.tail(5).iterrows():
-                        ih = r["HomeTeam"]==nm
-                        g=r["FTHG"] if ih else r["FTAG"]; gc=r["FTAG"] if ih else r["FTHG"]
-                        form.append("W" if g>gc else "D" if g==gc else "L")
+                    if "Date" in played_h.columns:
+                        played_h["Date"] = pd.to_datetime(played_h["Date"], dayfirst=True, errors="coerce")
+                        rows_all = pd.concat([h_r, a_r])
+                        rows_all = rows_all.sort_values("Date", ascending=True).dropna(subset=["Date"])
+                        for _, r in rows_all.tail(5).iterrows():
+                            ih = r["HomeTeam"] == nm
+                            g  = r["FTHG"] if ih else r["FTAG"]
+                            gc = r["FTAG"] if ih else r["FTHG"]
+                            form.append("W" if g > gc else "D" if g == gc else "L")
                     stats = {"ppg":round((wins*3+draws)/n,2),
                         "avg_scored":round(float(gf.mean()),2),
                         "avg_conceded":round(float(ga.mean()),2),
