@@ -3299,7 +3299,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_err(str(e))
 
     def _serve_calendar(self):
-        """API /api/calendar?days=N — partidos próximos de todas las ligas."""
+        """API /api/calendar?days=N — partidos próximos usando fixtures.csv + CSVs históricos."""
         try:
             import pandas as pd
             from urllib.parse import urlparse, parse_qs
@@ -3308,7 +3308,113 @@ class DashboardHandler(BaseHTTPRequestHandler):
             now  = datetime.now(timezone.utc)
             dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days+1)]
             matches = []; seen = set()
-            for div, cfg in TARGET_LEAGUES.items():
+
+            # ── FUENTE A: fixtures.csv de co.uk (siempre tiene próximos partidos) ──
+            fix_df = None
+            try:
+                fix_r = requests.get(FIXTURES_URL,
+                    headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+                if fix_r.status_code == 200:
+                    try:    fix_df = pd.read_csv(pd.io.common.StringIO(fix_r.content.decode("utf-8-sig")))
+                    except: fix_df = pd.read_csv(pd.io.common.StringIO(fix_r.content.decode("latin-1")))
+                    fix_df.columns = fix_df.columns.str.strip()
+                    fix_df["Date"] = pd.to_datetime(fix_df["Date"], dayfirst=True, errors="coerce")
+                    Log.info(f"fixtures.csv: {len(fix_df)} partidos próximos", "CAL")
+            except Exception as e:
+                Log.warn(f"fixtures.csv: {e}", "CAL")
+
+            # Helper: stats rápidas de un equipo desde su CSV histórico
+            def get_stats_from_csv(div, name):
+                path = os.path.join(DATA_DIR, f"{div}.csv")
+                if not os.path.exists(path): return {}, []
+                try:
+                    try:    df_h = pd.read_csv(path, encoding="utf-8-sig")
+                    except: df_h = pd.read_csv(path, encoding="latin-1")
+                    df_h.columns = df_h.columns.str.strip()
+                    df_h = df_h.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+                    played_h = df_h.dropna(subset=["FTHG","FTAG"]).copy()
+                    played_h["FTHG"] = played_h["FTHG"].astype(float)
+                    played_h["FTAG"] = played_h["FTAG"].astype(float)
+                    # fuzzy match nombre
+                    all_teams = pd.concat([played_h["HomeTeam"],played_h["AwayTeam"]]).dropna().unique()
+                    match = difflib.get_close_matches(name, all_teams, n=1, cutoff=0.50)
+                    if not match: return {}, []
+                    nm = match[0]
+                    h_r = played_h[played_h["HomeTeam"]==nm]
+                    a_r = played_h[played_h["AwayTeam"]==nm]
+                    gf = pd.concat([h_r["FTHG"],a_r["FTAG"]])
+                    ga = pd.concat([h_r["FTAG"],a_r["FTHG"]])
+                    n = len(gf)
+                    if n == 0: return {}, []
+                    wins = int((gf>ga).sum()); draws = int((gf==ga).sum())
+                    btts = int(((gf>0)&(ga>0)).sum())
+                    over25 = int(((gf+ga)>2.5).sum())
+                    form = []
+                    rows_all = pd.concat([h_r,a_r]).sort_values("Date" if "Date" in played_h.columns else played_h.columns[0])
+                    for _,r in rows_all.tail(5).iterrows():
+                        ih = r["HomeTeam"]==nm
+                        g=r["FTHG"] if ih else r["FTAG"]; gc=r["FTAG"] if ih else r["FTHG"]
+                        form.append("W" if g>gc else "D" if g==gc else "L")
+                    stats = {"ppg":round((wins*3+draws)/n,2),
+                        "avg_scored":round(float(gf.mean()),2),
+                        "avg_conceded":round(float(ga.mean()),2),
+                        "btts_pct":round(btts/n*100,1),
+                        "over25_pct":round(over25/n*100,1),"pj":n}
+                    return stats, form
+                except: return {}, []
+
+            def safe_float(v):
+                try: f=float(v); return round(f,2) if f>1.01 else None
+                except: return None
+
+            def add_match(div, h, a, date_str, row):
+                key = f"{div}_{date_str}_{h}_{a}"
+                if key in seen: return
+                seen.add(key)
+                cfg = TARGET_LEAGUES.get(div,{})
+                oh=safe_float(row.get("B365H") or row.get("PSH") or row.get("BbAvH"))
+                od=safe_float(row.get("B365D") or row.get("PSD") or row.get("BbAvD"))
+                oa=safe_float(row.get("B365A") or row.get("PSA") or row.get("BbAvA"))
+                hs_q, hf = get_stats_from_csv(div, h)
+                as_q, af = get_stats_from_csv(div, a)
+                xh=xa=ph=pd_=pa=None
+                try:
+                    xh=round((hs_q.get("avg_scored",1.2)+as_q.get("avg_conceded",1.2))/2,2)
+                    xa=round((as_q.get("avg_scored",1.0)+hs_q.get("avg_conceded",1.0))/2,2)
+                    ph,pd_,pa=dixon_coles(xh,xa)
+                    ph,pd_,pa=round(ph,3),round(pd_,3),round(pa,3)
+                except: pass
+                picks_m=[]
+                try:
+                    conn_p=sqlite3.connect(DB_PATH)
+                    pk=conn_p.execute(
+                        "SELECT market,selection,odd_open,ev,stake_pct,result FROM picks_log "
+                        "WHERE home_team LIKE ? AND away_team LIKE ? AND date(kickoff_time)=?",
+                        (f"%{h[:5]}%",f"%{a[:5]}%",date_str)).fetchall()
+                    conn_p.close()
+                    picks_m=[{"market":r[0],"selection":r[1],"odd":r[2],"ev":r[3],"stake":r[4],"result":r[5]} for r in pk]
+                except: pass
+                matches.append({"date":date_str,"div":div,"league":cfg.get("name",div),
+                    "home":h,"away":a,"home_form":hf,"away_form":af,
+                    "home_stats":hs_q,"away_stats":as_q,
+                    "xg_h":xh,"xg_a":xa,"ph":ph,"pd":pd_,"pa":pa,
+                    "b365h":oh,"b365d":od,"b365a":oa,"picks":picks_m})
+
+            # Procesar fixtures.csv
+            if fix_df is not None:
+                for date_str in dates:
+                    target = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    day = fix_df[fix_df["Date"].dt.date==target]
+                    for _, row in day.iterrows():
+                        div = str(row.get("Div","")).strip()
+                        if div not in TARGET_LEAGUES: continue
+                        h = str(row.get("HomeTeam","")).strip()
+                        a = str(row.get("AwayTeam","")).strip()
+                        if not h or not a: continue
+                        add_match(div, h, a, date_str, row)
+
+            # ── FUENTE B: CSVs históricos (filas sin resultado = partidos futuros) ──
+            for div in TARGET_LEAGUES:
                 if div in ("BSA","MEX"): continue
                 path = os.path.join(DATA_DIR, f"{div}.csv")
                 if not os.path.exists(path): continue
@@ -3318,73 +3424,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     df.columns = df.columns.str.strip()
                     df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
                     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-                    played = df.dropna(subset=["FTHG","FTAG"]).copy()
-                    played["FTHG"] = played["FTHG"].astype(float)
-                    played["FTAG"] = played["FTAG"].astype(float)
                     future = df[df["FTHG"].isna() | df["FTAG"].isna()].copy()
                     if future.empty: continue
-
-                    def get_form(name, n=5):
-                        rows = played[(played["HomeTeam"]==name)|(played["AwayTeam"]==name)].tail(n)
-                        f=[]
-                        for _,r in rows.iterrows():
-                            ih=r["HomeTeam"]==name; gf=r["FTHG"] if ih else r["FTAG"]; ga=r["FTAG"] if ih else r["FTHG"]
-                            f.append("W" if gf>ga else "D" if gf==ga else "L")
-                        return f
-
-                    def get_stats(name):
-                        h_rows=played[played["HomeTeam"]==name]; a_rows=played[played["AwayTeam"]==name]
-                        gf=pd.concat([h_rows["FTHG"],a_rows["FTAG"]]); ga=pd.concat([h_rows["FTAG"],a_rows["FTHG"]])
-                        n=len(gf)
-                        if n==0: return {}
-                        wins=int((gf>ga).sum()); draws=int((gf==ga).sum())
-                        btts=int(((gf>0)&(ga>0)).sum()); over25=int(((gf+ga)>2.5).sum())
-                        return {"ppg":round((wins*3+draws)/n,2),
-                            "avg_scored":round(float(gf.mean()),2),"avg_conceded":round(float(ga.mean()),2),
-                            "btts_pct":round(btts/n*100,1),"over25_pct":round(over25/n*100,1),"pj":n}
-
                     for date_str in dates:
                         target = datetime.strptime(date_str, "%Y-%m-%d").date()
-                        day_m = future[future["Date"].dt.date==target]
-                        for _, row in day_m.iterrows():
-                            h=str(row.get("HomeTeam","")).strip(); a=str(row.get("AwayTeam","")).strip()
+                        for _, row in future[future["Date"].dt.date==target].iterrows():
+                            h=str(row.get("HomeTeam","")).strip()
+                            a=str(row.get("AwayTeam","")).strip()
                             if not h or not a: continue
-                            key=f"{div}_{date_str}_{h}_{a}"
-                            if key in seen: continue
-                            seen.add(key)
-                            def sf(v):
-                                try: f=float(v); return round(f,2) if f>1.01 else None
-                                except: return None
-                            oh=sf(row.get("B365H") or row.get("BbAvH"))
-                            od=sf(row.get("B365D") or row.get("BbAvD"))
-                            oa=sf(row.get("B365A") or row.get("BbAvA"))
-                            hf=get_form(h); af=get_form(a)
-                            hs_q=get_stats(h); as_q=get_stats(a)
-                            xh=xa=ph=pd_=pa=None
-                            try:
-                                xh=round((hs_q.get("avg_scored",1.2)+as_q.get("avg_conceded",1.2))/2,2)
-                                xa=round((as_q.get("avg_scored",1.0)+hs_q.get("avg_conceded",1.0))/2,2)
-                                ph,pd_,pa=dixon_coles(xh,xa)
-                                ph,pd_,pa=round(ph,3),round(pd_,3),round(pa,3)
-                            except: pass
-                            # picks del modelo para este partido
-                            picks_m=[]
-                            try:
-                                conn_p=sqlite3.connect(DB_PATH)
-                                pk=conn_p.execute(
-                                    "SELECT market,selection,odd_open,ev,stake_pct,result FROM picks_log "
-                                    "WHERE home_team LIKE ? AND away_team LIKE ? AND date(kickoff_time)=?",
-                                    (f"%{h[:6]}%",f"%{a[:6]}%",date_str)).fetchall()
-                                conn_p.close()
-                                picks_m=[{"market":r[0],"selection":r[1],"odd":r[2],"ev":r[3],"stake":r[4],"result":r[5]} for r in pk]
-                            except: pass
-                            matches.append({"date":date_str,"div":div,"league":cfg.get("name",""),
-                                "home":h,"away":a,"home_form":hf,"away_form":af,
-                                "home_stats":hs_q,"away_stats":as_q,
-                                "xg_h":xh,"xg_a":xa,"ph":ph,"pd":pd_,"pa":pa,
-                                "b365h":oh,"b365d":od,"b365a":oa,"picks":picks_m})
+                            add_match(div, h, a, date_str, row)
                 except Exception as e:
-                    Log.warn(f"calendar {div}: {e}", "CAL")
+                    Log.warn(f"calendar CSV {div}: {e}", "CAL")
             matches.sort(key=lambda x:(x["date"],x["league"]))
             payload=json.dumps({"matches":matches,"dates":dates}).encode()
             self.send_response(200)
