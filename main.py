@@ -3626,7 +3626,7 @@ td.muted-td{color:var(--muted)}
         <th data-col="xg">xG</th><th data-col="status">Resultado</th>
         <th data-col="profit">Profit</th>
       </tr></thead>
-      <tbody id="picks-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
+      <tbody id="hist-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -4095,7 +4095,7 @@ function renderHistorial(){
     return true;
   });
   data.sort((a,b)=>new Date(b.date)-new Date(a.date));
-  const tbody=document.getElementById('picks-body');
+  const tbody=document.getElementById('hist-body');
   if(!tbody)return;
   if(!data.length){tbody.innerHTML='<tr><td colspan="11" class="empty">sin picks resueltos</td></tr>';return;}
   // KPI CLV Pinnacle promedio
@@ -4362,16 +4362,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("""
-                SELECT p.pick_time, p.div, p.home_team, p.away_team,
-                       p.market, p.selection, p.odd_open, p.prob_model, p.ev_open,
-                       p.result, p.stake_pct, p.profit, p.xg_home, p.xg_away,
-                       cl.clv_pct, cl.clv_ps, cl.clv_maxc, p.id
-                FROM picks_log p
-                LEFT JOIN closing_lines cl
-                    ON cl.fixture_id = CAST(p.id AS TEXT) AND cl.market = p.market
-                ORDER BY p.id DESC LIMIT 500
+                SELECT pick_time, div, home_team, away_team,
+                       market, selection, odd_open, prob_model, ev_open,
+                       result, stake_pct, profit, xg_home, xg_away, id
+                FROM picks_log ORDER BY id DESC LIMIT 500
             """)
             rows = c.fetchall()
+
+            # CLV: lookup por home+away+market en closing_lines
+            # fixture_id en closing_lines = ID externo (api-football), no p.id
+            # Por eso hacemos lookup separado por home_team/away_team/market
+            clv_map = {}
+            try:
+                clv_rows = conn.execute("""
+                    SELECT p.id, cl.clv_pct, cl.clv_pct_ps, cl.clv_pct_maxc
+                    FROM picks_log p
+                    JOIN closing_lines cl
+                        ON cl.fixture_id = p.fixture_id
+                        AND cl.market = p.market
+                        AND cl.selection = p.selection
+                    WHERE p.clv_captured = 1
+                """).fetchall()
+                for pid, cb, cp, cm in clv_rows:
+                    clv_map[pid] = (cb, cp, cm)
+            except Exception:
+                pass
             conn.close()
 
             picks = []
@@ -4386,9 +4401,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else: pending += 1
                 ev = float(r[8] or 0)
                 total_ev += ev
-                clv_b365   = float(r[14]) if len(r) > 14 and r[14] is not None else None
-                clv_ps     = float(r[15]) if len(r) > 15 and r[15] is not None else None
-                clv_maxc   = float(r[16]) if len(r) > 16 and r[16] is not None else None
+                pick_id = r[14] if len(r) > 14 else None
+                clv_tuple = clv_map.get(pick_id, (None, None, None))
+                clv_b365  = float(clv_tuple[0]) if clv_tuple[0] is not None else None
+                clv_ps    = float(clv_tuple[1]) if clv_tuple[1] is not None else None
+                clv_maxc  = float(clv_tuple[2]) if clv_tuple[2] is not None else None
                 total_pnl += float(r[11] or 0)
                 picks.append({
                     "date": r[0], "div": r[1], "home": r[2], "away": r[3],
@@ -4396,6 +4413,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "odd": r[6], "prob": r[7], "ev": r[8],
                     "status": status, "stake": r[10], "profit": r[11],
                     "xg_h": r[12], "xg_a": r[13],
+                    # r[14] = id (para CLV lookup), no lo exponemos al cliente
                     "clv_b365": round(clv_b365, 1) if clv_b365 is not None else None,
                     "clv_ps":   round(clv_ps,   1) if clv_ps   is not None else None,
                     "clv_maxc": round(clv_maxc, 1) if clv_maxc is not None else None,
