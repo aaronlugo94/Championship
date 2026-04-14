@@ -3546,6 +3546,7 @@ td.muted-td{color:var(--muted)}
 
 <!-- ══════════ TAB 2: HISTORIAL RESUELTOS ══════════ -->
 <div id="tab2" class="tab-pane">
+  <!-- ══ HISTORIAL: picks resueltos con CLV ══ -->
   <div class="stats-strip" id="stats-strip">
     <div class="scard"><div class="scard-label">Picks totales</div><div class="scard-val c-white" id="s-total">—</div><div class="scard-sub" id="s-sub-total"></div></div>
     <div class="scard"><div class="scard-label">Win</div><div class="scard-val c-green" id="s-win">—</div><div class="scard-sub" id="s-sub-win"></div></div>
@@ -3563,46 +3564,6 @@ td.muted-td{color:var(--muted)}
       <button class="seg-btn" data-f="LOSS">Loss</button>
       <button class="seg-btn" data-f="PENDING">Pending</button>
     </div>
-    <div class="seg" id="mkt-seg">
-      <button class="seg-btn active" data-m="all">Mercados</button>
-      <button class="seg-btn" data-m="UNDER">Under</button>
-      <button class="seg-btn" data-m="OVER">Over</button>
-      <button class="seg-btn" data-m="DC">DC</button>
-      <button class="seg-btn" data-m="1X2">1X2</button>
-      <button class="seg-btn" data-m="BTTS">BTTS</button>
-      <button class="seg-btn" data-m="DNB">DNB</button>
-    </div>
-    <div class="spacer"></div>
-    <input id="picks-search" type="text" placeholder="buscar equipo..." style="font-family:var(--mono);font-size:.68rem;padding:7px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
-    <button class="resolve-btn" onclick="resolveData()">resolver picks</button>
-  </div>
-  <div class="table-wrap">
-    <table>
-      <thead><tr>
-        <th data-col="date">Fecha</th>
-        <th data-col="div">Liga</th>
-        <th data-col="match">Partido</th>
-        <th data-col="market">Mkt</th>
-        <th data-col="odd">Cuota</th>
-        <th data-col="ev">EV</th>
-        <th data-col="prob">Prob</th>
-        <th data-col="stake">Stake</th>
-        <th data-col="xg">xG</th>
-        <th data-col="status">Resultado</th>
-        <th data-col="profit">Profit</th>
-      </tr></thead>
-      <tbody id="picks-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
-    </table>
-  </div>
-</div>
-
-  <!-- picks resueltos en tab2 -->
-  <div class="picks-toolbar" style="border-bottom:1px solid var(--border);padding:.75rem 1.5rem;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-    <div class="seg" id="flt-seg">
-      <button class="seg-btn active" data-f="all">Todos</button>
-      <button class="seg-btn" data-f="WIN">Win</button>
-      <button class="seg-btn" data-f="LOSS">Loss</button>
-    </div>
     <div class="seg" id="mkt-seg-h">
       <button class="seg-btn active" data-m="all">Mercados</button>
       <button class="seg-btn" data-m="UNDER">Under</button>
@@ -3611,18 +3572,17 @@ td.muted-td{color:var(--muted)}
       <button class="seg-btn" data-m="1X2">1X2</button>
     </div>
     <div class="spacer"></div>
-    <input id="picks-search" type="text" placeholder="buscar equipo..." style="font-family:var(--mono);font-size:.68rem;padding:7px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+    <input id="picks-search-h" type="text" placeholder="buscar equipo..." style="font-family:var(--mono);font-size:.68rem;padding:7px 12px;background:var(--s2);border:1px solid var(--border);color:var(--text);border-radius:7px;outline:none;width:180px">
+    <button class="resolve-btn" onclick="resolveData()">resolver picks</button>
   </div>
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th data-col="date">Fecha</th><th data-col="div">Liga</th>
-        <th data-col="match">Partido</th><th data-col="market">Mkt</th>
-        <th data-col="odd">Cuota</th><th data-col="ev">EV</th>
-        <th title="CLV vs B365 cierre" style="color:var(--amber)">CLV B365</th>
-        <th title="CLV vs Pinnacle — la métrica más importante" style="color:var(--green)">CLV PS ★</th>
-        <th data-col="xg">xG</th><th data-col="status">Resultado</th>
-        <th data-col="profit">Profit</th>
+        <th>Fecha</th><th>Liga</th><th>Partido</th><th>Mkt</th>
+        <th>Cuota</th><th>EV</th>
+        <th style="color:var(--amber)" title="CLV vs B365 cierre">CLV B365</th>
+        <th style="color:var(--green)" title="CLV vs Pinnacle">CLV PS ★</th>
+        <th>xG</th><th>Resultado</th><th>Profit</th>
       </tr></thead>
       <tbody id="hist-body"><tr><td colspan="11" class="empty">cargando...</td></tr></tbody>
     </table>
@@ -4099,13 +4059,15 @@ function renderJornada(){
 function renderHistorial(){
   const segFlt=document.getElementById('flt-seg');
   const segMkt=document.getElementById('mkt-seg-h');
-  const srch=document.getElementById('picks-search');
+  const srch=document.getElementById('picks-search-h');
   let fltF='all',mktF='all',searchF='';
   if(segFlt){const a=segFlt.querySelector('.seg-btn.active');if(a)fltF=a.dataset.f||'all';}
   if(segMkt){const a=segMkt.querySelector('.seg-btn.active');if(a)mktF=a.dataset.m||'all';}
   if(srch)searchF=srch.value.toLowerCase();
   let data=allPicks.filter(p=>{
-    if(p.status==='PENDING')return false;
+    // Si el filtro activo es 'all', mostrar todos incluyendo PENDING
+    // Si es un filtro específico, aplicar
+    if(fltF==='all'&&p.status==='PENDING')return false; // ocultar PENDING en vista todos
     if(fltF!=='all'&&p.status!==fltF)return false;
     if(mktF!=='all'&&p.market!==mktF)return false;
     if(searchF){const hay=((p.home||'')+' '+(p.away||'')+' '+(p.div||'')).toLowerCase();if(!hay.includes(searchF))return false;}
@@ -4182,7 +4144,7 @@ document.querySelectorAll('thead th[data-col]').forEach(th=>{
     th.classList.add('sorted');renderPicks();
   });
 });
-document.getElementById('picks-search').addEventListener('input',renderPicks);
+const psEl=document.getElementById('picks-search'); if(psEl) psEl.addEventListener('input',renderPicks);
 
 // ════════════════════════════════════════
 // TAB 2: HISTÓRICO
@@ -4270,7 +4232,7 @@ loadPicks().then(()=>{
   wire('flt-seg', renderHistorial);
   wire('mkt-seg-h', renderHistorial);
   wire('mkt-seg-j', renderJornada);
-  const srch=document.getElementById('picks-search');
+  const srch=document.getElementById('picks-search-h');
   if(srch) srch.addEventListener('input', renderHistorial);
 });
 loadCalendario();
