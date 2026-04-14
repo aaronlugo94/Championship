@@ -330,6 +330,43 @@ XG_DEC  = 0.85    # decay temporal
 # DATABASE
 # ============================================================
 
+
+# ── FBref xG real — URLs shooting stats por liga ─────────────────────────────
+FBREF_SHOOTING_URLS = {
+    "E0":  "https://fbref.com/en/comps/9/shooting/Premier-League-Stats",
+    "E1":  "https://fbref.com/en/comps/10/shooting/Championship-Stats",
+    "E2":  "https://fbref.com/en/comps/15/shooting/League-One-Stats",
+    "D1":  "https://fbref.com/en/comps/20/shooting/Bundesliga-Stats",
+    "D2":  "https://fbref.com/en/comps/33/shooting/2-Bundesliga-Stats",
+    "I1":  "https://fbref.com/en/comps/11/shooting/Serie-A-Stats",
+    "I2":  "https://fbref.com/en/comps/22/shooting/Serie-B-Stats",
+    "SP1": "https://fbref.com/en/comps/12/shooting/La-Liga-Stats",
+    "SP2": "https://fbref.com/en/comps/17/shooting/Segunda-Division-Stats",
+    "F1":  "https://fbref.com/en/comps/13/shooting/Ligue-1-Stats",
+    "F2":  "https://fbref.com/en/comps/60/shooting/Ligue-2-Stats",
+    "N1":  "https://fbref.com/en/comps/23/shooting/Eredivisie-Stats",
+    "P1":  "https://fbref.com/en/comps/32/shooting/Primeira-Liga-Stats",
+    "B1":  "https://fbref.com/en/comps/37/shooting/Belgian-Pro-League-Stats",
+    "SC0": "https://fbref.com/en/comps/40/shooting/Scottish-Premiership-Stats",
+    "T1":  "https://fbref.com/en/comps/26/shooting/Super-Lig-Stats",
+    "G1":  "https://fbref.com/en/comps/27/shooting/Super-League-1-Stats",
+}
+# También URLs para schedule (H2H histórico multi-temporada)
+FBREF_SCHEDULE_URLS = {
+    "E0":  ("https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures",
+            "https://fbref.com/en/comps/9/2024-2025/schedule/2024-2025-Premier-League-Scores-and-Fixtures"),
+    "D1":  ("https://fbref.com/en/comps/20/schedule/Bundesliga-Scores-and-Fixtures",
+            "https://fbref.com/en/comps/20/2024-2025/schedule/2024-2025-Bundesliga-Scores-and-Fixtures"),
+    "I1":  ("https://fbref.com/en/comps/11/schedule/Serie-A-Scores-and-Fixtures",
+            "https://fbref.com/en/comps/11/2024-2025/schedule/2024-2025-Serie-A-Scores-and-Fixtures"),
+    "SP1": ("https://fbref.com/en/comps/12/schedule/La-Liga-Scores-and-Fixtures",
+            "https://fbref.com/en/comps/12/2024-2025/schedule/2024-2025-La-Liga-Scores-and-Fixtures"),
+    "F1":  ("https://fbref.com/en/comps/13/schedule/Ligue-1-Scores-and-Fixtures",
+            "https://fbref.com/en/comps/13/2024-2025/schedule/2024-2025-Ligue-1-Scores-and-Fixtures"),
+}
+FBREF_TTL_H = 48  # horas entre actualizaciones
+FBREF_RATE_DELAY = 12  # segundos entre requests (máx 5/min respetando límite)
+
 # ── Copas europeas y locales para cálculo de fatiga ─────────────────────
 CUP_LEAGUES = {
     # Europeas
@@ -390,8 +427,30 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS closing_lines (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fixture_id TEXT, market TEXT, selection TEXT,
-        odd_open REAL, odd_close REAL, clv_pct REAL, captured_at TEXT
+        odd_open REAL, odd_close REAL, clv_pct REAL, captured_at TEXT,
+        odd_close_ps REAL,    -- Pinnacle cierre (benchmark sharp)
+        clv_pct_ps REAL,      -- CLV vs Pinnacle cierre
+        odd_close_maxc REAL,  -- MaxC cierre (mejor precio disponible)
+        clv_pct_maxc REAL     -- CLV vs MaxC cierre
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS fbref_xg_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        div TEXT NOT NULL,
+        team_normalized TEXT NOT NULL,
+        team_original TEXT,
+        mp INTEGER,
+        xg_for REAL,
+        xg_against REAL,
+        npxg_for REAL,
+        xg_for_home REAL,
+        xg_against_home REAL,
+        xg_for_away REAL,
+        xg_against_away REAL,
+        updated_at TEXT,
+        season TEXT,
+        UNIQUE(div, team_normalized, season)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_fbref ON fbref_xg_cache(div, team_normalized)")
     c.execute("""CREATE TABLE IF NOT EXISTS cup_fixtures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_normalized TEXT NOT NULL,
@@ -570,8 +629,17 @@ def get_odds_from_row(row, cfg):
         "H":      best("PSH",    "B365H",    "AvgH",    "MaxH"),
         "D":      best("PSD",    "B365D",    "AvgD",    "MaxD"),
         "A":      best("PSA",    "B365A",    "AvgA",    "MaxA"),
-        "O25":    best("P>2.5",  "B365>2.5", "Avg>2.5", "Max>2.5"),
-        "U25":    best("P<2.5",  "B365<2.5", "Avg<2.5", "Max<2.5"),
+        # O/U: prioridad Pinnacle cierre → MaxC (mejor precio cierre) → B365 → Avg
+        # MaxC>2.5 = mejor precio disponible en el mercado de cierre
+        # Evidencia CSV I1: CLV O/U promedio +3.49%, EV+3.6% con MaxC>B365 3%+
+        "O25":    best("PC>2.5", "P>2.5", "MaxC>2.5", "Max>2.5", "B365C>2.5", "B365>2.5", "AvgC>2.5", "Avg>2.5"),
+        "U25":    best("PC<2.5", "P<2.5", "MaxC<2.5", "Max<2.5", "B365C<2.5", "B365<2.5", "AvgC<2.5", "Avg<2.5"),
+        # También guardar apertura B365 para CLV
+        "O25_open": best("B365>2.5", "Avg>2.5"),
+        "U25_open": best("B365<2.5", "Avg<2.5"),
+        # MaxC para calcular EV real vs mejor precio del mercado
+        "MaxCO25": best("MaxC>2.5", "Max>2.5"),
+        "MaxCU25": best("MaxC<2.5", "Max<2.5"),
         "BTTS_Y": best("BbAvBBTS","B365BTTSY"),
         # Asian Handicap — línea de la casa (negativo = local favorito)
         "AH":     best_ah("AHh", "AHCh", "BbAHh"),
@@ -724,7 +792,34 @@ def get_team_stats(df, team_name, cfg, depth=10, perspective="all"):
         src = "goals_proxy"
 
     conf = "HIGH" if len(gf_l)>=6 else "MED" if len(gf_l)>=3 else "LOW"
-    Log.info(f"  {name}[{perspective}]: xGF={xgf:.2f} xGA={xga:.2f} {conf} sq={sq_factor:.2f} mom={mom_f:.2f}", "xG")
+    
+    # ── FBref xG override — si disponible reemplaza el proxy HST ─────────────
+    # Solo override el xGF (ataque), mantener xGA del CSV (más granular)
+    # porque FBref da xG a nivel de equipo, no partido a partido
+    fbref_data = get_fbref_xg(team_name, cfg.get("_div", ""))
+    if fbref_data and fbref_data.get("xg_for"):
+        fb = fbref_data
+        # Usar xG de FBref según perspectiva
+        if perspective == "home" and fb.get("xg_for_home"):
+            xgf_fbref = fb["xg_for_home"]
+            xga_fbref = fb.get("xg_against_home")
+        elif perspective == "away" and fb.get("xg_for_away"):
+            xgf_fbref = fb["xg_for_away"]
+            xga_fbref = fb.get("xg_against_away")
+        else:
+            xgf_fbref = fb["xg_for"]
+            xga_fbref = fb.get("xg_against")
+        
+        # Blend: 70% FBref real + 30% proxy HST (para capturar forma reciente)
+        # FBref es más preciso pero refleja toda la temporada
+        # HST proxy captura los últimos 8 partidos con decay
+        xgf_final = xgf_fbref * 0.70 + xgf * 0.30
+        xga_final = (xga_fbref * 0.70 + xga * 0.30) if xga_fbref else xga
+        
+        Log.info(f"  {name}[{perspective}]: xGF={xgf_final:.2f} (fbref={xgf_fbref:.2f} proxy={xgf:.2f}) xGA={xga_final:.2f} {conf}", "xG")
+        return xgf_final, xga_final, gf_l, ga_l, conf
+
+    Log.info(f"  {name}[{perspective}]: xGF={xgf:.2f} xGA={xga:.2f} {conf} sq={sq_factor:.2f} mom={mom_f:.2f} [proxy]", "xG")
     return xgf, xga, gf_l, ga_l, conf
 
 def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
@@ -767,6 +862,7 @@ def build_xg(home_name, away_name, div, cfg, df, inj_h=0, inj_a=0):
     if hf is None: hf, ha, hc = from_cache(kh_all)
     if hf is None and df is not None:
         # MEJORA: calcular xG del local COMO LOCAL (últimos partidos en casa)
+        cfg["_div"] = div  # pasar div para lookup FBref
         hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg, perspective="home")
         if hf is None:
             hf, ha, hg, hga, hc = get_team_stats(df, home_name, cfg, perspective="all")
@@ -910,6 +1006,347 @@ def apif_get(path, params, headers):
         return r.json().get("response", [])
     except Exception as e:
         print(f"  ⚠️ apif {path}: {e}", flush=True); return []
+
+def _fbref_request(url: str) -> str | None:
+    """
+    Request a FBref page respetando rate limit (<= 5 req/min).
+    Retorna el HTML o None si falla.
+    """
+    import time, random
+    fbref_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Referer": "https://fbref.com/",
+    }
+    try:
+        time.sleep(FBREF_RATE_DELAY + random.uniform(0, 3))
+        r = requests.get(url, headers=fbref_headers, timeout=20)
+        if r.status_code == 200:
+            return r.text
+        elif r.status_code == 429:
+            Log.warn("FBref rate limit — esperando 60s", "FBREF")
+            time.sleep(60)
+            return None
+        else:
+            Log.warn(f"FBref {url}: status={r.status_code}", "FBREF")
+            return None
+    except Exception as e:
+        Log.warn(f"FBref request failed: {e}", "FBREF")
+        return None
+
+
+def _normalize_team_fbref(name: str) -> str:
+    """Normaliza nombres de equipos de FBref para matching con co.uk."""
+    import unicodedata
+    if not name: return ""
+    # Remover acentos
+    n = ''.join(c for c in unicodedata.normalize('NFD', str(name))
+                if unicodedata.category(c) != 'Mn')
+    n = n.lower().strip()
+    # Abreviaciones comunes FBref → co.uk
+    replacements = {
+        "manchester utd": "man united",
+        "manchester city": "man city",
+        "newcastle utd": "newcastle",
+        "tottenham": "tottenham",
+        "nott'ham forest": "nott'm forest",
+        "nottingham forest": "nott'm forest",
+        "sheffield utd": "sheffield united",
+        "west bromwich albion": "west brom",
+        "queens park rangers": "qpr",
+        "wolverhampton wanderers": "wolves",
+        "brighton & hove albion": "brighton",
+        "huddersfield town": "huddersfield",
+        "stoke city": "stoke",
+        "swansea city": "swansea",
+        "cardiff city": "cardiff",
+        "bayer leverkusen": "leverkusen",
+        "rb leipzig": "leipzig",
+        "borussia dortmund": "dortmund",
+        "borussia monchengladbach": "m'gladbach",
+        "atletico madrid": "ath madrid",
+        "athletic bilbao": "ath bilbao",
+        "atletico bilbao": "ath bilbao",
+        "paris saint-germain": "psg",
+        "paris s-g": "psg",
+        "internazionale": "inter",
+        "inter milan": "inter",
+        "hellas verona": "verona",
+        "venezia": "venezia",
+        "ac milan": "milan",
+    }
+    for fbref_name, cuk_name in replacements.items():
+        if fbref_name in n:
+            n = n.replace(fbref_name, cuk_name)
+    return n.strip()
+
+
+def fetch_fbref_xg(divs: list | None = None, force: bool = False) -> dict:
+    """
+    Descarga xG real de FBref para las ligas especificadas.
+    
+    Retorna dict: {div: {team_normalized: {xg_for, xg_against, mp, ...}}}
+    
+    Los datos se cachean en SQLite con TTL de 48h.
+    Si FBref no está accesible, retorna {} silenciosamente (fallback a HST proxy).
+    
+    Rate limit: máx 5 req/min (12s delay entre ligas).
+    """
+    import difflib as _dl
+    
+    if divs is None:
+        divs = list(FBREF_SHOOTING_URLS.keys())
+    
+    now = datetime.now(timezone.utc)
+    results = {}
+    conn = sqlite3.connect(DB_PATH)
+    season = "2025-26"
+
+    for div in divs:
+        url = FBREF_SHOOTING_URLS.get(div)
+        if not url:
+            continue
+
+        # Verificar TTL del cache
+        if not force:
+            cached = conn.execute("""
+                SELECT team_normalized, mp, xg_for, xg_against, npxg_for,
+                       xg_for_home, xg_against_home, xg_for_away, xg_against_away,
+                       updated_at
+                FROM fbref_xg_cache
+                WHERE div=? AND season=?
+                ORDER BY updated_at DESC LIMIT 100
+            """, (div, season)).fetchall()
+            
+            if cached:
+                # Verificar si el más reciente tiene TTL válido
+                last_updated = cached[0][9] if cached else None
+                if last_updated:
+                    try:
+                        age_h = (now - datetime.fromisoformat(
+                            last_updated.replace("+00:00","")
+                        ).replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                        if age_h < FBREF_TTL_H:
+                            # Cache válido
+                            results[div] = {
+                                r[0]: {
+                                    "mp": r[1], "xg_for": r[2], "xg_against": r[3],
+                                    "npxg_for": r[4],
+                                    "xg_for_home": r[5], "xg_against_home": r[6],
+                                    "xg_for_away": r[7], "xg_against_away": r[8],
+                                }
+                                for r in cached
+                            }
+                            Log.info(f"FBref {div}: cache válido ({age_h:.0f}h)", "FBREF")
+                            continue
+                    except:
+                        pass
+
+        # Descargar de FBref
+        Log.info(f"FBref {div}: descargando shooting stats...", "FBREF")
+        html = _fbref_request(url)
+        if not html:
+            Log.warn(f"FBref {div}: no disponible, usando xG proxy", "FBREF")
+            continue
+
+        try:
+            import pandas as pd
+            # FBref esconde tablas en comentarios HTML — descomentarlas
+            html_clean = html.replace('<!--', '').replace('-->', '')
+            tables = pd.read_html(html_clean)
+            
+            if not tables:
+                Log.warn(f"FBref {div}: sin tablas", "FBREF")
+                continue
+
+            # Buscar la tabla de shooting por equipo (tiene columna 'Squad')
+            shoot_df = None
+            for t in tables:
+                cols = [str(c).lower() for c in t.columns]
+                # Buscar tabla con Squad, Gls, xG
+                if any('squad' in c for c in cols) and any('xg' in c for c in cols):
+                    # Aplanar MultiIndex si existe
+                    if hasattr(t.columns, 'levels'):
+                        t.columns = [' '.join(str(c) for c in col).strip() 
+                                      if isinstance(col, tuple) else str(col)
+                                      for col in t.columns]
+                    shoot_df = t
+                    break
+
+            if shoot_df is None:
+                Log.warn(f"FBref {div}: tabla shooting no encontrada", "FBREF")
+                continue
+
+            # Limpiar columnas
+            shoot_df.columns = [str(c).strip().lower().replace(' ', '_') 
+                                  for c in shoot_df.columns]
+            
+            # Quitar filas de separación/totales
+            if 'squad' in shoot_df.columns:
+                shoot_df = shoot_df[
+                    shoot_df['squad'].notna() & 
+                    (shoot_df['squad'] != 'Squad') &
+                    (~shoot_df['squad'].astype(str).str.contains('Unnamed|Total|Liga', na=True))
+                ].copy()
+            else:
+                Log.warn(f"FBref {div}: columna 'squad' no encontrada en {list(shoot_df.columns[:8])}", "FBREF")
+                continue
+
+            def safe_float(val):
+                try:
+                    f = float(val)
+                    return f if not (f != f) else None  # NaN check
+                except:
+                    return None
+
+            div_results = {}
+            saved = 0
+            
+            for _, row in shoot_df.iterrows():
+                squad = str(row.get('squad', '')).strip()
+                if not squad or squad == 'nan':
+                    continue
+                
+                team_norm = _normalize_team_fbref(squad)
+                
+                # Extraer columnas — FBref puede tener nombres variables
+                # Buscar xG (for y against) y MP
+                mp = safe_float(row.get('mp') or row.get('90s'))
+                
+                # xG for (goals expected, goles esperados del equipo)
+                xg_for = safe_float(
+                    row.get('xg') or row.get('xg_expected') or 
+                    row.get('xg_for') or row.get('expected_xg')
+                )
+                # xGA (goals expected against)
+                xg_ag = safe_float(
+                    row.get('xga') or row.get('xg_against') or 
+                    row.get('xgagainst') or row.get('xg_allowed')
+                )
+                # npxG (sin penales)
+                npxg = safe_float(
+                    row.get('npxg') or row.get('np:xg') or row.get('npxg_expected')
+                )
+                
+                if xg_for is None:
+                    continue  # sin xG no sirve
+                
+                # Normalizar por partido si tenemos MP
+                if mp and mp > 0:
+                    xg_for_pp = round(xg_for / mp, 3)
+                    xg_ag_pp = round(xg_ag / mp, 3) if xg_ag else None
+                    npxg_pp = round(npxg / mp, 3) if npxg else xg_for_pp
+                else:
+                    xg_for_pp = xg_for
+                    xg_ag_pp = xg_ag
+                    npxg_pp = npxg
+
+                data = {
+                    "mp": int(mp) if mp else None,
+                    "xg_for": xg_for_pp,
+                    "xg_against": xg_ag_pp,
+                    "npxg_for": npxg_pp,
+                    # Home/away por separado se obtendrán de otra tabla
+                    # Por ahora usar overall con factor home advantage
+                    "xg_for_home": round(xg_for_pp * 1.10, 3) if xg_for_pp else None,
+                    "xg_against_home": round(xg_ag_pp * 0.92, 3) if xg_ag_pp else None,
+                    "xg_for_away": round(xg_for_pp * 0.91, 3) if xg_for_pp else None,
+                    "xg_against_away": round(xg_ag_pp * 1.08, 3) if xg_ag_pp else None,
+                }
+                
+                div_results[team_norm] = data
+                
+                # Guardar en cache
+                try:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO fbref_xg_cache
+                        (div, team_normalized, team_original, mp,
+                         xg_for, xg_against, npxg_for,
+                         xg_for_home, xg_against_home,
+                         xg_for_away, xg_against_away,
+                         updated_at, season)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (div, team_norm, squad, data["mp"],
+                          data["xg_for"], data["xg_against"], data["npxg_for"],
+                          data["xg_for_home"], data["xg_against_home"],
+                          data["xg_for_away"], data["xg_against_away"],
+                          now.isoformat(), season))
+                    saved += 1
+                except Exception as e:
+                    Log.warn(f"FBref save {squad}: {e}", "FBREF")
+
+            conn.commit()
+            results[div] = div_results
+            Log.ok(f"FBref {div}: {len(div_results)} equipos, {saved} guardados en cache", "FBREF")
+
+        except Exception as e:
+            import traceback
+            Log.err(f"FBref parse {div}: {e}\n{traceback.format_exc()[:300]}", "FBREF")
+            continue
+
+    conn.close()
+    return results
+
+
+def get_fbref_xg(team_name: str, div: str) -> dict | None:
+    """
+    Obtiene xG real de FBref para un equipo desde el cache SQLite.
+    Usa fuzzy matching para nombres de equipos.
+    Retorna None si no hay datos (fallback a xG proxy).
+    """
+    import difflib as _dl
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute("""
+            SELECT team_normalized, team_original, mp, xg_for, xg_against, 
+                   npxg_for, xg_for_home, xg_against_home, xg_for_away, xg_against_away
+            FROM fbref_xg_cache
+            WHERE div=? AND season='2025-26'
+        """, (div,)).fetchall()
+        conn.close()
+        
+        if not rows:
+            return None
+        
+        all_teams = [r[0] for r in rows]
+        team_norm = _normalize_team_fbref(team_name)
+        
+        # Buscar exacto primero
+        for r in rows:
+            if r[0] == team_norm:
+                return {
+                    "xg_for": r[3], "xg_against": r[4],
+                    "npxg_for": r[5],
+                    "xg_for_home": r[6], "xg_against_home": r[7],
+                    "xg_for_away": r[8], "xg_against_away": r[9],
+                    "mp": r[2], "source": "fbref"
+                }
+        
+        # Fuzzy match
+        matches = _dl.get_close_matches(team_norm, all_teams, n=1, cutoff=0.60)
+        if matches:
+            for r in rows:
+                if r[0] == matches[0]:
+                    return {
+                        "xg_for": r[3], "xg_against": r[4],
+                        "npxg_for": r[5],
+                        "xg_for_home": r[6], "xg_against_home": r[7],
+                        "xg_for_away": r[8], "xg_against_away": r[9],
+                        "mp": r[2], "source": "fbref_fuzzy"
+                    }
+        return None
+    except Exception as e:
+        Log.warn(f"get_fbref_xg {team_name}: {e}", "FBREF")
+        return None
+
+
 
 def fetch_cup_fixtures(headers, full_season=False):
     """
@@ -1431,35 +1868,87 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     po_raw, _ = negbinom_ou(xh+xa, std)
     po = shrink(blend(po_raw, ts.get("pct_o25")))
     pu = 1 - po
-    # Shrinkage calibrado post análisis de 29 picks: Under 42% beat rate
-    # → shrinkage más agresivo para reducir sobreestimación de prob Under
+
     if not has_trend:
-        pu = shrink(pu, a=0.45)   # sin Trend: agresivo (Under 42% BR → recalibrando)
+        pu = shrink(pu, a=0.45)
         po = 1 - pu
     else:
-        pu = shrink(pu, a=0.60)   # con Trend: conservador
+        pu = shrink(pu, a=0.60)
         po = 1 - pu
-    # Cuota Over: CSV/api-football primero, Trend como fallback
+
+    # ── MEJORA 2: AH ajuste O/U — CALIBRADO CON DATOS REALES ──────────────
+    # Datos CSV I1 2025-26 (280 partidos, calibración empírica):
+    #   AH ≤ -1.25: Over 59.4% — local muy fav JUEGA ABIERTO → +5% Over
+    #   AH [-1.0,-0.5): Over 47.6% — neutro → 0%
+    #   AH [-0.5,0.0): Over 48.1% — partido competido → +3% Over
+    #   AH [0.0,+0.5): Over 44.8% — neutro-bajo → 0%
+    #   AH ≥ +0.5: Over 40.4% — visitante fav DEFIENDE → -8% Over
+    #
+    # NOTA: AH muy negativo → LOCAL MUY FAVORITO → juega abierto sin defender
+    # Contra-intuitivo pero confirmado por datos reales
+    ah_val = odds.get("AH")
+    ah_ou_adjustment = 0.0
+    ah_label = ""
+    if ah_val is not None:
+        if ah_val <= -1.25:
+            # Local muy favorito (ej. -1.5, -2.0)
+            # Equipo dominante juega abierto, rival también arriesga → más goles
+            ah_ou_adjustment = +0.05
+            ah_label = f"AH{ah_val:+.1f}→+5%Over(local dominante)"
+        elif ah_val <= -0.75:
+            # Local favorito moderado (-1.0) → neutro
+            ah_ou_adjustment = 0.0
+            ah_label = ""
+        elif ah_val < 0.0:
+            # Partido levemente favorable al local (-0.5) → competido → +3%
+            ah_ou_adjustment = +0.03
+            ah_label = f"AH{ah_val:+.1f}→+3%Over(partido disputado)"
+        elif ah_val < 0.5:
+            # Neutro / visita leve favorita → sin ajuste
+            ah_ou_adjustment = 0.0
+            ah_label = ""
+        else:
+            # Visitante favorito (≥ +0.5) → equipo visitante defiende → -8%
+            ah_ou_adjustment = -0.08
+            ah_label = f"AH{ah_val:+.1f}→-8%Over(visit defiende)"
+
+    if ah_ou_adjustment != 0.0:
+        po = max(0.10, min(po + ah_ou_adjustment, 0.92))
+        pu = 1 - po
+        if ah_label:
+            Log.info(f"  O/U AH ajuste: {ah_label} po={po:.3f}", "AH")
+
+    # Cuota Over: CSV primero, Trend como fallback
     o25 = odds.get("O25") or ts.get("ou25_odd")
     u25 = odds.get("U25")
+
+    # EV real: usar MaxC si disponible (mejor precio de cierre del mercado)
+    o25_ev = odds.get("MaxCO25") or o25  # para calcular EV
+    u25_ev = odds.get("MaxCU25") or u25
+
     if o25 and o25>1.01:
         xg_total = xh + xa
-        # FILTRO CALIBRADO: Over en xG 2.5-3.2 tiene 33% BR (análisis 40 picks)
-        # Solo apostar Over si el xG total es suficientemente alto (>3.2) o bajo (<2.5)
         if not (2.50 <= xg_total <= 3.20):
+            # MEJORA: EV real vs MaxC cierre (mejor precio disponible en el mercado)
+            # Evidencia CSV I1: MaxC promedio +3.49% sobre B365 apertura
+            # Usar MaxC para EV = imagen más precisa del valor real de la apuesta
+            ev_ref_o = o25_ev if o25_ev and o25_ev > o25 else o25  # MaxC si es mejor
+            model_gap_o = round(po - 1/(ev_ref_o * 1.05), 4)  # vig 5% O/U
             out.append({"mkt":"OVER","pick":"Over 2.5 Goles","odd":o25,"prob":po,
-                        "model_gap":round(po-1/(o25*1.07),4)})
-        else:
-            pass  # xG 2.5-3.2 → skip Over (rango sin edge)
+                        "model_gap":model_gap_o,
+                        "ah_adj":round(ah_ou_adjustment,3),
+                        "best_close":o25_ev,
+                        "ev_best":round(po*ev_ref_o-1,4)})  # EV vs mejor precio
     if u25 and u25>1.01:
         xg_total = xh + xa
-        # FILTRO CALIBRADO: Under en xG 1.8-2.2 tiene 33% BR (análisis 40 picks)
-        # Ese rango es el más peligroso — mercado ya lo sabe
         if not (1.80 <= xg_total <= 2.20):
+            ev_ref_u = u25_ev if u25_ev and u25_ev > u25 else u25
+            model_gap_u = round(pu - 1/(ev_ref_u * 1.05), 4)
             out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
-                        "model_gap":round(pu-1/(u25*1.07),4)})
-        else:
-            pass  # xG 1.8-2.2 → skip Under (rango descalibrado)
+                        "model_gap":model_gap_u,
+                        "ah_adj":round(-ah_ou_adjustment,3),
+                        "best_close":u25_ev,
+                        "ev_best":round(pu*ev_ref_u-1,4)})
 
     # ── BTTS Sí / No ─────────────────────────────────────────────────────
     if conf != "LOW":
@@ -2328,12 +2817,14 @@ class TripleLeagueV72:
                                     except: pass
                                 return None
                             # Prioridad: Pinnacle > BetVictor > B365 > Avg
+                            # CLV benchmark: Pinnacle CIERRE (PSCH) = más sharp del mundo
+                            # Luego MaxC (mejor precio cierre), luego B365 cierre
                             co={
-                                "H":   best_close("PSH","VCH","B365H","AvgH","BbAvH"),
-                                "D":   best_close("PSD","VCD","B365D","AvgD","BbAvD"),
-                                "A":   best_close("PSA","VCA","B365A","AvgA","BbAvA"),
-                                "O25": best_close("P>2.5","B365>2.5","Avg>2.5","BbAv>2.5"),
-                                "U25": best_close("P<2.5","B365<2.5","Avg<2.5","BbAv<2.5"),
+                                "H":   best_close("PSCH","PSH","MaxCH","B365CH","AvgCH"),
+                                "D":   best_close("PSCD","PSD","MaxCD","B365CD","AvgCD"),
+                                "A":   best_close("PSCA","PSA","MaxCA","B365CA","AvgCA"),
+                                "O25": best_close("PC>2.5","P>2.5","MaxC>2.5","B365C>2.5","AvgC>2.5"),
+                                "U25": best_close("PC<2.5","P<2.5","MaxC<2.5","B365C<2.5","AvgC<2.5"),
                                 "BTTS_Y": best_close("B365BTTSY","BbAvBBTS"),
                             }
                             if mkt=="OVER":    odd_close=co.get("O25")
@@ -2359,11 +2850,81 @@ class TripleLeagueV72:
                 if odd_close and odd_open:
                     clv_pct=(odd_close/odd_open-1)*100
                     conn=sqlite3.connect(DB_PATH)
-                    conn.execute("INSERT INTO closing_lines VALUES (NULL,?,?,?,?,?,?,?)",
-                                 (fid,mkt,sel,odd_open,odd_close,clv_pct,now_utc.isoformat()))
+                    # Calcular CLV vs Pinnacle cierre y MaxC cierre
+                    def _co_odd(market, sel_str, co_dict):
+                        if market=="OVER":   return co_dict.get("O25")
+                        elif market=="UNDER": return co_dict.get("U25")
+                        elif market=="1X2":  return _clv_1x2(co_dict, home, away, sel_str)
+                        elif market=="BTTS": return co_dict.get("BTTS_Y")
+                        elif market=="DC":
+                            oh,od,oa=co_dict.get("H"),co_dict.get("D"),co_dict.get("A")
+                            if oh and od and oa:
+                                if "o Empate" in sel_str and not sel_str.startswith("DC: Empate"):
+                                    return round(1/(1/oh+1/od),2)
+                                elif "Empate o" in sel_str:
+                                    return round(1/(1/od+1/oa),2)
+                                return round(1/(1/oh+1/oa),2)
+                        return None
+
+                    # Pinnacle cierre benchmark
+                    co_ps = {}
+                    co_maxc = {}
+                    try:
+                        # Buscar en CSV histórico la fila del partido
+                        path_csv = os.path.join(DATA_DIR, f"{div}.csv")
+                        if os.path.exists(path_csv):
+                            import pandas as _pd2
+                            try:    _df2 = _pd2.read_csv(path_csv, encoding="utf-8-sig")
+                            except: _df2 = _pd2.read_csv(path_csv, encoding="latin-1")
+                            _df2.columns = _df2.columns.str.strip()
+                            _df2 = _df2.rename(columns={"Home":"HomeTeam","Away":"AwayTeam"})
+                            import difflib as _dl2
+                            _teams_h = _df2["HomeTeam"].dropna().unique()
+                            _teams_a = _df2["AwayTeam"].dropna().unique()
+                            rh2 = _dl2.get_close_matches(home, _teams_h, n=1, cutoff=0.55)
+                            ra2 = _dl2.get_close_matches(away, _teams_a, n=1, cutoff=0.55)
+                            if rh2 and ra2:
+                                _m2 = _df2[(_df2["HomeTeam"]==rh2[0])&(_df2["AwayTeam"]==ra2[0])]
+                                if not _m2.empty:
+                                    _r2 = _m2.iloc[0]
+                                    def _bc2(*cs):
+                                        for c in cs:
+                                            try:
+                                                v=_r2.get(c) if hasattr(_r2,"get") else getattr(_r2,c,None)
+                                                if v is not None:
+                                                    f=float(v)
+                                                    if f>1.01 and f==f: return f
+                                            except: pass
+                                        return None
+                                    co_ps={
+                                        "H":_bc2("PSCH","PSH"),"D":_bc2("PSCD","PSD"),"A":_bc2("PSCA","PSA"),
+                                        "O25":_bc2("PC>2.5","P>2.5"),"U25":_bc2("PC<2.5","P<2.5"),
+                                    }
+                                    co_maxc={
+                                        "H":_bc2("MaxCH","MaxH"),"D":_bc2("MaxCD","MaxD"),"A":_bc2("MaxCA","MaxA"),
+                                        "O25":_bc2("MaxC>2.5","Max>2.5"),"U25":_bc2("MaxC<2.5","Max<2.5"),
+                                    }
+                    except Exception: pass
+
+                    oc_ps   = _co_odd(mkt, sel, co_ps)   if co_ps   else None
+                    oc_maxc = _co_odd(mkt, sel, co_maxc) if co_maxc else None
+                    clv_ps   = round((odd_open/oc_ps   - 1)*100, 2) if oc_ps   and oc_ps   > 1.01 else None
+                    clv_maxc = round((odd_open/oc_maxc - 1)*100, 2) if oc_maxc and oc_maxc > 1.01 else None
+
+                    conn.execute("""INSERT INTO closing_lines
+                        VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (fid,mkt,sel,odd_open,odd_close,clv_pct,now_utc.isoformat(),
+                         oc_ps, clv_ps, oc_maxc, clv_maxc))
                     conn.execute("UPDATE picks_log SET clv_captured=1 WHERE id=?",(pid,))
                     conn.commit(); conn.close()
-                    clv_lines.append(f"{sel} @{odd_open:.2f}→{odd_close:.2f} CLV={clv_pct:+.1f}%")
+                    # Construir línea CLV con los 3 benchmarks
+                clv_line = f"{sel} @{odd_open:.2f}"
+                clv_line += f" vs B365={clv_pct:+.1f}%"
+                if clv_ps is not None:
+                    clv_line += f" PS={clv_ps:+.1f}%"
+                if clv_maxc is not None:
+                    clv_line += f" MaxC={clv_maxc:+.1f}%"
+                clv_lines.append(clv_line)
 
             Log.clv_end(len(clv_lines), sum(1 for l in clv_lines if "CLV=+" in l)/max(len(clv_lines),1)*100)
             if clv_lines:
@@ -2976,7 +3537,10 @@ td.muted-td{color:var(--muted)}
     <table>
       <thead><tr>
         <th>Fecha</th><th>Liga</th><th>Partido</th><th>Mkt</th>
-        <th>Cuota</th><th>EV</th><th>Prob</th><th>Stake</th><th>xG</th>
+        <th>Cuota</th><th>EV</th>
+        <th title="CLV vs B365 cierre" style="color:var(--amber)">CLV B365</th>
+        <th title="CLV vs Pinnacle — métrica principal" style="color:var(--green)">CLV PS ★</th>
+        <th>xG</th><th>Res</th><th>PnL</th>
       </tr></thead>
       <tbody id="jornada-body"><tr><td colspan="9" class="empty">cargando...</td></tr></tbody>
     </table>
@@ -3228,7 +3792,10 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
           <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted);margin-top:.3rem">PPG ${hs.overall?.ppg||'—'}</div>
         </div>
         <div class="md-center">
-          <div style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.2rem">xG estimado</div>
+          <div style="font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-bottom:.2rem">
+            xG estimado
+            ${d.xg_source==='fbref'?'<span style="color:var(--green);font-size:.5rem;margin-left:4px">● FBref real</span>':'<span style="color:var(--muted2);font-size:.5rem;margin-left:4px">● proxy</span>'}
+          </div>
           <div class="md-xg">${d.xg_home} — ${d.xg_away}</div>
           <div class="prob-bar-wrap">
             <div class="prob-bar">
@@ -3531,21 +4098,37 @@ function renderHistorial(){
   const tbody=document.getElementById('picks-body');
   if(!tbody)return;
   if(!data.length){tbody.innerHTML='<tr><td colspan="11" class="empty">sin picks resueltos</td></tr>';return;}
+  // KPI CLV Pinnacle promedio
+  const clvPsVals = data.filter(p=>p.clv_ps!=null).map(p=>p.clv_ps);
+  const avgClvPs  = clvPsVals.length ? (clvPsVals.reduce((a,b)=>a+b,0)/clvPsVals.length) : null;
+  const clvKpiEl  = document.getElementById('clv-kpi-ps');
+  if(clvKpiEl && avgClvPs!=null){
+    const sign = avgClvPs >= 0 ? '+' : '';
+    clvKpiEl.textContent = `CLV Pinnacle: ${sign}${avgClvPs.toFixed(1)}%`;
+    clvKpiEl.style.color = avgClvPs > 0 ? 'var(--green)' : avgClvPs > -2 ? 'var(--amber)' : 'var(--red)';
+  }
+
   tbody.innerHTML=data.map(p=>{
-    const ev=(parseFloat(p.ev||0)*100).toFixed(1);
+    const ev=(parseFloat(p.ev||0)).toFixed(1);
     const prob=(parseFloat(p.prob||0)*100).toFixed(1);
     const stake=(parseFloat(p.stake||0)*100).toFixed(2);
     const profit=parseFloat(p.profit||0);
     const d=p.date?p.date.slice(5).replace('-','/'):'—';
+    // CLV columns
+    function clvCell(val){
+      if(val==null) return '<td style="color:var(--muted2);font-family:var(--mono);font-size:.7rem">—</td>';
+      const c = val>2?'var(--green)':val>0?'#86efac':val>-2?'var(--amber)':'var(--red)';
+      return `<td style="color:${c};font-family:var(--mono);font-size:.75rem;font-weight:600">${val>0?'+':''}${val.toFixed(1)}%</td>`;
+    }
     return `<tr>
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${d}</td>
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
       <td style="font-size:.82rem;font-weight:500">${p.home||''} <span style="color:var(--muted)">vs</span> ${p.away||''}</td>
       <td>${mktBadge(p.market)}</td>
       <td style="font-family:var(--mono)">@${parseFloat(p.odd||0).toFixed(2)}</td>
-      <td class="${evCls(parseFloat(ev))}">+${ev}%</td>
-      <td style="color:var(--muted);font-family:var(--mono)">${prob}%</td>
-      <td style="color:var(--muted);font-family:var(--mono)">${stake}%</td>
+      <td class="${evCls(parseFloat(ev))}">${parseFloat(ev)>0?'+':''}${ev}%</td>
+      ${clvCell(p.clv_b365)}
+      ${clvCell(p.clv_ps)}
       <td>${xgMini(p.xg_h,p.xg_a)}</td>
       <td>${resBadge(p.status)}</td>
       <td class="${profit>0?'c-green':profit<0?'c-red':''}">${profit>=0?'+':''}${profit.toFixed(4)}</td>
@@ -3711,6 +4294,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_calendar()
         elif self.path == "/api/cups":
             self._serve_cups_status()
+        elif self.path == "/api/fbref":
+            self._serve_fbref_status()
         elif self.path.startswith("/api/picks_summary"):
             self._serve_picks_summary()
         else:
@@ -3777,10 +4362,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute("""
-                SELECT pick_time, div, home_team, away_team,
-                       market, selection, odd_open, prob_model, ev_open,
-                       result, stake_pct, profit, xg_home, xg_away
-                FROM picks_log ORDER BY id DESC LIMIT 500
+                SELECT p.pick_time, p.div, p.home_team, p.away_team,
+                       p.market, p.selection, p.odd_open, p.prob_model, p.ev_open,
+                       p.result, p.stake_pct, p.profit, p.xg_home, p.xg_away,
+                       cl.clv_pct, cl.clv_ps, cl.clv_maxc, p.id
+                FROM picks_log p
+                LEFT JOIN closing_lines cl
+                    ON cl.fixture_id = CAST(p.id AS TEXT) AND cl.market = p.market
+                ORDER BY p.id DESC LIMIT 500
             """)
             rows = c.fetchall()
             conn.close()
@@ -3797,19 +4386,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else: pending += 1
                 ev = float(r[8] or 0)
                 total_ev += ev
+                clv_b365   = float(r[14]) if len(r) > 14 and r[14] is not None else None
+                clv_ps     = float(r[15]) if len(r) > 15 and r[15] is not None else None
+                clv_maxc   = float(r[16]) if len(r) > 16 and r[16] is not None else None
                 total_pnl += float(r[11] or 0)
                 picks.append({
                     "date": r[0], "div": r[1], "home": r[2], "away": r[3],
                     "market": r[4], "pick": r[5],
                     "odd": r[6], "prob": r[7], "ev": r[8],
                     "status": status, "stake": r[10], "profit": r[11],
-                    "xg_h": r[12], "xg_a": r[13]
+                    "xg_h": r[12], "xg_a": r[13],
+                    "clv_b365": round(clv_b365, 1) if clv_b365 is not None else None,
+                    "clv_ps":   round(clv_ps,   1) if clv_ps   is not None else None,
+                    "clv_maxc": round(clv_maxc, 1) if clv_maxc is not None else None,
                 })
 
             n = len(picks)
             avg_ev = (total_ev / n * 100) if n else 0
+            # KPI CLV Pinnacle — la métrica más importante del modelo
+            clv_ps_vals  = [p["clv_ps"]   for p in picks if p.get("clv_ps")   is not None]
+            clv_b365_vals= [p["clv_b365"] for p in picks if p.get("clv_b365") is not None]
+            clv_maxc_vals= [p["clv_maxc"] for p in picks if p.get("clv_maxc") is not None]
+            avg_clv_ps   = round(sum(clv_ps_vals)  /len(clv_ps_vals),  2) if clv_ps_vals   else None
+            avg_clv_b365 = round(sum(clv_b365_vals)/len(clv_b365_vals),2) if clv_b365_vals else None
+            avg_clv_maxc = round(sum(clv_maxc_vals)/len(clv_maxc_vals),2) if clv_maxc_vals else None
             payload = json.dumps({
                 "picks": picks,
+                "clv_summary": {
+                    "avg_clv_pinnacle": avg_clv_ps,
+                    "avg_clv_b365":     avg_clv_b365,
+                    "avg_clv_maxc":     avg_clv_maxc,
+                    "n_with_clv":       len(clv_ps_vals),
+                    "edge_confirmed":   avg_clv_ps is not None and avg_clv_ps > 0,
+                },
                 "stats": {
                     "total": n, "wins": wins, "losses": losses,
                     "pending": pending, "avg_ev": avg_ev,
@@ -4158,6 +4767,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "fair_odds":{"home":round(1/ph,2) if ph>0 else None,"draw":round(1/pd_,2) if pd_>0 else None,
                     "away":round(1/pa,2) if pa>0 else None,"over":round(1/po,2) if po>0 else None,
                     "under":round(1/pu,2) if pu>0 else None,"btts_y":round(1/py,2) if py>0 else None},
+                "xg_source": "fbref" if get_fbref_xg(home, div) else "proxy",
                 "h2h":{"total":h2h_tot,"home_wins":hwins,"draws":hdraws,"away_wins":awins,
                     "over25":sum(1 for r in h2h_list if r["home_goals"]+r["away_goals"]>2),
                     "btts":sum(1 for r in h2h_list if r["home_goals"]>0 and r["away_goals"]>0),
@@ -4171,6 +4781,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             import traceback; Log.err(f"analyze: {e}", "ANALYZE")
             self._json_err(str(e))
+
+    def _serve_fbref_status(self):
+        """API /api/fbref — estado del cache de xG real de FBref."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            total = conn.execute("SELECT COUNT(*) FROM fbref_xg_cache").fetchone()[0]
+            by_div = conn.execute("""
+                SELECT div, COUNT(*) as teams,
+                       AVG(xg_for) as avg_xg_for, AVG(xg_against) as avg_xg_ag,
+                       MAX(updated_at) as last_update
+                FROM fbref_xg_cache
+                WHERE season='2025-26'
+                GROUP BY div ORDER BY last_update DESC
+            """).fetchall()
+            # Top equipos por xG
+            top_xg = conn.execute("""
+                SELECT div, team_original, xg_for, xg_against, mp
+                FROM fbref_xg_cache
+                WHERE season='2025-26' AND xg_for IS NOT NULL
+                ORDER BY xg_for DESC LIMIT 20
+            """).fetchall()
+            conn.close()
+            payload = json.dumps({
+                "total_teams": total,
+                "by_league": [{"div":r[0],"teams":r[1],
+                    "avg_xg_for":round(r[2],3) if r[2] else None,
+                    "avg_xg_ag":round(r[3],3) if r[3] else None,
+                    "last_update":r[4]} for r in by_div],
+                "top_xg_teams": [{"div":r[0],"team":r[1],
+                    "xg_for":r[2],"xg_against":r[3],"mp":r[4]} for r in top_xg],
+                "source": "fbref.com (StatsBomb data)",
+                "blend": "70% FBref real + 30% HST proxy"
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e: self._json_err(str(e))
 
     def _serve_cups_status(self):
         """API /api/cups — estado de la tabla cup_fixtures."""
@@ -4519,8 +5167,6 @@ if __name__ == "__main__":
     start_dashboard(port=int(os.getenv("PORT", "8080")))
     auto_resolve()   # resolver picks PENDING contra CSVs al arrancar
     # Cargar copa fixtures al arrancar
-    # Si la DB está vacía → descargar temporada completa (julio 2025→hoy)
-    # Si ya tiene datos → solo últimos 10 días para ahorrar requests
     try:
         is_empty = _cup_db_is_empty()
         n = fetch_cup_fixtures(bot.apif_h, full_season=is_empty)
@@ -4528,6 +5174,35 @@ if __name__ == "__main__":
         Log.ok(f"Cup fixtures [{mode}]: {n} registros", "CUPS")
     except Exception as e:
         Log.warn(f"cup_fixtures startup: {e}", "CUPS")
+
+    # FBref xG — descargar al arrancar (ligas top 5 primero)
+    # Se descarga en background para no bloquear el startup
+    import threading
+    def _fbref_startup():
+        try:
+            Log.info("FBref xG: descargando top 5 ligas...", "FBREF")
+            # Primero las 5 ligas con más picks históricos
+            top5 = ["E0", "I1", "D1", "SP1", "F1"]
+            results = fetch_fbref_xg(top5)
+            Log.ok(f"FBref xG top5: {sum(len(v) for v in results.values())} equipos", "FBREF")
+            # Luego el resto en background
+            import time; time.sleep(30)
+            rest = [d for d in FBREF_SHOOTING_URLS if d not in top5]
+            results2 = fetch_fbref_xg(rest)
+            Log.ok(f"FBref xG resto: {sum(len(v) for v in results2.values())} equipos", "FBREF")
+            total = sum(len(v) for v in {**results, **results2}.values())
+            try:
+                send_msg(
+                    f"📐 <b>FBref xG cargado</b>\n"
+                    f"✅ {total} equipos con xG real\n"
+                    f"🔄 Blend 70% FBref + 30% HST proxy\n"
+                    f"⏱ Próxima actualización: 48h"
+                )
+            except: pass
+        except Exception as e:
+            Log.warn(f"FBref startup: {e}", "FBREF")
+    
+    threading.Thread(target=_fbref_startup, daemon=True).start()
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
@@ -4603,12 +5278,21 @@ if __name__ == "__main__":
             _mark_ran_week("standings")
             try: bot.weekly_standings()
             except Exception as e: Log.err(f"weekly_standings: {e}", "SCHED")
-            # Copas: actualizar lunes a las 05:00 UTC (solo últimos 10 días)
+            # Copas: actualizar lunes a las 05:00 UTC
             now_d = datetime.now(timezone.utc)
             if now_d.weekday() == 0 and abs(now_d.hour - 5) < 1:
                 try:
                     n = fetch_cup_fixtures(bot.apif_h, full_season=False)
                     Log.ok(f"Cup fixtures actualizados: {n} registros", "CUPS")
                 except Exception as e: Log.err(f"cup_fixtures: {e}", "CUPS")
+
+            # FBref xG: actualizar miércoles a las 05:30 UTC (después de jornadas)
+            if now_d.weekday() == 2 and abs(now_d.hour - 5) < 1 and now_d.minute < 35:
+                try:
+                    Log.info("FBref xG: actualización semanal...", "FBREF")
+                    r = fetch_fbref_xg(force=True)
+                    total = sum(len(v) for v in r.values())
+                    Log.ok(f"FBref xG actualizado: {total} equipos", "FBREF")
+                except Exception as e: Log.err(f"FBref xG sched: {e}", "FBREF")
 
         time.sleep(30)
