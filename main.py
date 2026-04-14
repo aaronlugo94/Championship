@@ -4109,7 +4109,7 @@ function renderHistorial(){
   }
 
   tbody.innerHTML=data.map(p=>{
-    const ev=(parseFloat(p.ev||0)).toFixed(1);
+    const ev=(parseFloat(p.ev||0)*100).toFixed(1);
     const prob=(parseFloat(p.prob||0)*100).toFixed(1);
     const stake=(parseFloat(p.stake||0)*100).toFixed(2);
     const profit=parseFloat(p.profit||0);
@@ -4361,17 +4361,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
+            # Query principal — columnas fijas, sin JOIN para evitar errores
             c.execute("""
-                SELECT pick_time, div, home_team, away_team,
+                SELECT id, pick_time, div, home_team, away_team,
                        market, selection, odd_open, prob_model, ev_open,
-                       result, stake_pct, profit, xg_home, xg_away, id
+                       result, stake_pct, profit, xg_home, xg_away
                 FROM picks_log ORDER BY id DESC LIMIT 500
             """)
             rows = c.fetchall()
 
-            # CLV: lookup por home+away+market en closing_lines
-            # fixture_id en closing_lines = ID externo (api-football), no p.id
-            # Por eso hacemos lookup separado por home_team/away_team/market
+            # CLV lookup — join por fixture_id que existe en ambas tablas
             clv_map = {}
             try:
                 clv_rows = conn.execute("""
@@ -4379,14 +4378,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     FROM picks_log p
                     JOIN closing_lines cl
                         ON cl.fixture_id = p.fixture_id
-                        AND cl.market = p.market
+                        AND cl.market    = p.market
                         AND cl.selection = p.selection
                     WHERE p.clv_captured = 1
                 """).fetchall()
-                for pid, cb, cp, cm in clv_rows:
-                    clv_map[pid] = (cb, cp, cm)
+                for row in clv_rows:
+                    clv_map[row[0]] = (row[1], row[2], row[3])
             except Exception:
-                pass
+                pass  # CLV no disponible aún — OK
             conn.close()
 
             picks = []
@@ -4395,28 +4394,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             resolved = 0
 
             for r in rows:
-                status = r[9] or "PENDING"
-                if status == "WIN": wins += 1; resolved += 1
+                # r: id(0) pick_time(1) div(2) home(3) away(4)
+                #    market(5) selection(6) odd_open(7) prob_model(8) ev_open(9)
+                #    result(10) stake_pct(11) profit(12) xg_home(13) xg_away(14)
+                pid    = r[0]
+                status = r[10] or "PENDING"
+                if status == "WIN":  wins += 1; resolved += 1
                 elif status == "LOSS": losses += 1; resolved += 1
                 else: pending += 1
-                ev = float(r[8] or 0)
+                ev = float(r[9] or 0)
                 total_ev += ev
-                pick_id = r[14] if len(r) > 14 else None
-                clv_tuple = clv_map.get(pick_id, (None, None, None))
-                clv_b365  = float(clv_tuple[0]) if clv_tuple[0] is not None else None
-                clv_ps    = float(clv_tuple[1]) if clv_tuple[1] is not None else None
-                clv_maxc  = float(clv_tuple[2]) if clv_tuple[2] is not None else None
-                total_pnl += float(r[11] or 0)
+                total_pnl += float(r[12] or 0)
+                clv_tuple = clv_map.get(pid, (None, None, None))
+                def _cf(v):
+                    try: return round(float(v), 1) if v is not None else None
+                    except: return None
                 picks.append({
-                    "date": r[0], "div": r[1], "home": r[2], "away": r[3],
-                    "market": r[4], "pick": r[5],
-                    "odd": r[6], "prob": r[7], "ev": r[8],
-                    "status": status, "stake": r[10], "profit": r[11],
-                    "xg_h": r[12], "xg_a": r[13],
-                    # r[14] = id (para CLV lookup), no lo exponemos al cliente
-                    "clv_b365": round(clv_b365, 1) if clv_b365 is not None else None,
-                    "clv_ps":   round(clv_ps,   1) if clv_ps   is not None else None,
-                    "clv_maxc": round(clv_maxc, 1) if clv_maxc is not None else None,
+                    "date":    r[1],  "div":    r[2],
+                    "home":    r[3],  "away":   r[4],
+                    "market":  r[5],  "pick":   r[6],
+                    "odd":     r[7],  "prob":   r[8],
+                    "ev":      ev,  # decimal (0.094) — JS multiplica por 100
+                    "status":  status,
+                    "stake":   r[11], "profit": r[12],
+                    "xg_h":    r[13], "xg_a":   r[14],
+                    "clv_b365": _cf(clv_tuple[0]),
+                    "clv_ps":   _cf(clv_tuple[1]),
+                    "clv_maxc": _cf(clv_tuple[2]),
                 })
 
             n = len(picks)
