@@ -3975,6 +3975,8 @@ const statusBadge=s=>{
   return `<span class="badge ${map[s]||''}">${icon[s]||''}${s}</span>`;
 };
 const evClass=v=>v>=0.10?'ev-h':v>=0.05?'ev-m':'ev-l';
+const evCls=evClass;  // alias usado en renderJornada y renderHistorial
+const resBadge=statusBadge;  // alias usado en renderHistorial
 const fmtDate=d=>{if(!d)return'—';const p=d.split('T')[0].split('-');return`${p[2]}/${p[1]}/${p[0].slice(2)}`;};
 const xgMini=(h,a)=>{
   const t=(h||0)+(a||0);if(!t)return'—';
@@ -3983,7 +3985,8 @@ const xgMini=(h,a)=>{
 };
 
 function updateStats(s){
-  const res=s.wins+s.losses;
+  if(!s) return;  // guard contra null/undefined
+  const res=(s.wins||0)+(s.losses||0);
   const br=res?s.wins/res:0;
   document.getElementById('s-total').textContent=s.total;
   document.getElementById('s-sub-total').textContent=`${res} resueltos`;
@@ -4007,7 +4010,8 @@ function updateStats(s){
 }
 
 function renderPicks(){
-  const search=document.getElementById('picks-search').value.toLowerCase();
+  const searchEl=document.getElementById('picks-search');
+  const search=searchEl?searchEl.value.toLowerCase():'';
   let data=allPicks.filter(p=>{
     if(activeFlt!=='all'&&p.status!==activeFlt)return false;
     if(activeMkt!=='all'&&p.market!==activeMkt)return false;
@@ -4048,8 +4052,15 @@ async function loadPicks(){
     const r=await fetch('/api/picks');
     const d=await r.json();
     allPicks=d.picks||[];
-    updateStats(d.stats);
-  }catch(e){console.error('loadPicks:',e);}
+    if(d.stats) updateStats(d.stats);
+  }catch(e){
+    console.error('loadPicks error:',e);
+    // Mostrar error en tablas para debugging
+    ['picks-body','hist-body','jornada-body'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.innerHTML=`<tr><td colspan="11" style="color:red;font-family:monospace;font-size:.7rem">Error: ${e.message}</td></tr>`;
+    });
+  }
 }
 
 function renderJornada(){
@@ -4442,9 +4453,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "edge_confirmed":   avg_clv_ps is not None and avg_clv_ps > 0,
                 },
                 "stats": {
-                    "total": n, "wins": wins, "losses": losses,
-                    "pending": pending, "avg_ev": avg_ev,
-                    "pnl": total_pnl, "resolved": resolved
+                    "total":    int(n),
+                    "wins":     int(wins),
+                    "losses":   int(losses),
+                    "pending":  int(pending),
+                    "avg_ev":   float(avg_ev),
+                    "pnl":      float(total_pnl),
+                    "resolved": int(resolved)
                 }
             }).encode("utf-8")
 
