@@ -3537,10 +3537,7 @@ td.muted-td{color:var(--muted)}
     <table>
       <thead><tr>
         <th>Fecha</th><th>Liga</th><th>Partido</th><th>Mkt</th>
-        <th>Cuota</th><th>EV</th>
-        <th title="CLV vs B365 cierre" style="color:var(--amber)">CLV B365</th>
-        <th title="CLV vs Pinnacle — métrica principal" style="color:var(--green)">CLV PS ★</th>
-        <th>xG</th><th>Res</th><th>PnL</th>
+        <th>Cuota</th><th>EV</th><th>Prob</th><th>Stake</th><th>xG</th>
       </tr></thead>
       <tbody id="jornada-body"><tr><td colspan="9" class="empty">cargando...</td></tr></tbody>
     </table>
@@ -3622,7 +3619,8 @@ td.muted-td{color:var(--muted)}
         <th data-col="date">Fecha</th><th data-col="div">Liga</th>
         <th data-col="match">Partido</th><th data-col="market">Mkt</th>
         <th data-col="odd">Cuota</th><th data-col="ev">EV</th>
-        <th data-col="prob">Prob</th><th data-col="stake">Stake</th>
+        <th title="CLV vs B365 cierre" style="color:var(--amber)">CLV B365</th>
+        <th title="CLV vs Pinnacle — la métrica más importante" style="color:var(--green)">CLV PS ★</th>
         <th data-col="xg">xG</th><th data-col="status">Resultado</th>
         <th data-col="profit">Profit</th>
       </tr></thead>
@@ -3977,7 +3975,15 @@ const statusBadge=s=>{
 const evClass=v=>v>=0.10?'ev-h':v>=0.05?'ev-m':'ev-l';
 const evCls=evClass;  // alias usado en renderJornada y renderHistorial
 const resBadge=statusBadge;  // alias usado en renderHistorial
-const fmtDate=d=>{if(!d)return'—';const p=d.split('T')[0].split('-');return`${p[2]}/${p[1]}/${p[0].slice(2)}`;};
+const fmtDate=d=>{
+  if(!d||d==='null'||d==='undefined')return'—';
+  const s=String(d);
+  // Intentar parsear ISO: "2026-04-11T06:31..." o "2026-04-11"
+  const iso=s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(iso) return `${iso[3]}/${iso[2]}/${iso[1].slice(2)}`;
+  // Fallback: mostrar primeros 10 chars
+  return s.slice(0,10);
+};
 const xgMini=(h,a)=>{
   const t=(h||0)+(a||0);if(!t)return'—';
   const hw=Math.round((h/t)*50);
@@ -4075,7 +4081,7 @@ function renderJornada(){
     const ev=(parseFloat(p.ev||0)*100).toFixed(1);
     const prob=(parseFloat(p.prob||0)*100).toFixed(1);
     const stake=(parseFloat(p.stake||0)*100).toFixed(2);
-    const d=p.date?p.date.slice(5).replace('-','/'):'—';
+    const d=fmtDate(p.date);
     return `<tr>
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${d}</td>
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
@@ -4124,7 +4130,7 @@ function renderHistorial(){
     const prob=(parseFloat(p.prob||0)*100).toFixed(1);
     const stake=(parseFloat(p.stake||0)*100).toFixed(2);
     const profit=parseFloat(p.profit||0);
-    const d=p.date?p.date.slice(5).replace('-','/'):'—';
+    const d=fmtDate(p.date);
     // CLV columns
     function clvCell(val){
       if(val==null) return '<td style="color:var(--muted2);font-family:var(--mono);font-size:.7rem">—</td>';
