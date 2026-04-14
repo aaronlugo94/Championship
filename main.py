@@ -3862,29 +3862,47 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
     const rec = d.bet_rec;
     if(rec && rec.has_rec){
       const top = rec.top;
-      const strColor = top.strength==='FUERTE'?'var(--green)':top.strength==='MODERADA'?'var(--amber)':'var(--muted)';
-      html += `<div style="margin:1rem 0;padding:1rem;background:var(--s2);border-radius:10px;border:1px solid ${strColor}55">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:.5rem">
-          <span style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">📌 Recomendación del modelo</span>
-          <span style="font-family:var(--mono);font-size:.58rem;padding:2px 8px;border-radius:4px;background:${strColor}22;color:${strColor};font-weight:700">${top.strength}</span>
+      const strColors = {'FUERTE':'#22c55e','BUENA':'#86efac','MODERADA':'#f59e0b','CONSERVADORA':'#94a3b8'};
+      const strColor = strColors[top.strength] || '#94a3b8';
+      html += `<div style="margin:1rem 0;border-radius:12px;overflow:hidden;border:1px solid ${strColor}44">
+        <div style="background:${strColor}18;padding:.7rem 1rem;display:flex;align-items:center;gap:8px">
+          <span style="font-size:1.1rem">${top.emoji||'📌'}</span>
+          <span style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text)">Recomendación del modelo</span>
+          <span style="margin-left:auto;font-family:var(--mono);font-size:.6rem;padding:2px 8px;border-radius:4px;background:${strColor}33;color:${strColor};font-weight:700">${top.strength}</span>
         </div>
-        <div style="font-size:1rem;font-weight:700;color:${strColor};margin-bottom:.4rem">
-          ${top.selection}
-          <span style="font-family:var(--mono);font-size:.78rem;color:var(--muted);font-weight:400">&nbsp;cuota justa @${top.fair_odd}</span>
-        </div>
-        <div style="font-family:var(--mono);font-size:.68rem;color:var(--text);line-height:1.5;margin-bottom:.6rem">${top.reason}</div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <div style="font-family:var(--mono);font-size:.7rem;padding:5px 12px;background:${strColor};color:#000;border-radius:6px;font-weight:800">
-            Stake: ${top.stake_pct}% bankroll
+        <div style="padding:1rem">
+          <div style="font-size:1.05rem;font-weight:800;color:${strColor};margin-bottom:.3rem">
+            ${top.selection} <span style="font-family:var(--mono);font-size:.75rem;color:var(--muted);font-weight:400">cuota justa @${top.fair_odd}</span>
           </div>
-          <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted)">${top.action}</div>
+          <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted);margin-bottom:.75rem;line-height:1.6">${top.reason}</div>
+
+          <!-- REGLA DEL CLV — la más importante -->
+          <div style="background:var(--s1);border-radius:8px;padding:.6rem .85rem;margin-bottom:.75rem;border-left:3px solid ${strColor}">
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-bottom:.2rem">CÓMO APOSTARLO</div>
+            <div style="font-family:var(--mono);font-size:.72rem;color:var(--text);font-weight:600">${top.clv_rule}</div>
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--muted);margin-top:.3rem">El mercado tiene 66% accuracy → si la cuota bajó (mercado confirmó) → apuesta.</div>
+          </div>
+
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <div style="font-family:var(--mono);font-size:.72rem;padding:5px 14px;background:${strColor};color:#000;border-radius:6px;font-weight:800">
+              ${top.stake_pct}% bankroll
+            </div>
+            <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted)">${top.action}</div>
+          </div>
+
+          ${rec.alternatives && rec.alternatives.length ? `
+          <div style="margin-top:.7rem;padding-top:.6rem;border-top:1px solid var(--border)">
+            <div style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-bottom:.3rem">ALTERNATIVAS</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              ${rec.alternatives.map(a=>`<span style="font-family:var(--mono);font-size:.62rem;padding:2px 8px;background:var(--s1);border-radius:4px;color:var(--text)">${a.selection} @${a.fair_odd} (${a.prob}%)</span>`).join('')}
+            </div>
+          </div>` : ''}
+
+          ${rec.tip ? `<div style="margin-top:.6rem;font-family:var(--mono);font-size:.6rem;color:var(--accent);line-height:1.5">${rec.tip}</div>` : ''}
         </div>
-        ${rec.alternatives && rec.alternatives.length ? `<div style="margin-top:.6rem;font-family:var(--mono);font-size:.58rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.4rem">
-          Alternativas: ${rec.alternatives.map(a=>`<span style="color:var(--text)">${a.selection} @${a.fair_odd}</span> (${a.prob}%)`).join(' &nbsp;·&nbsp; ')}
-        </div>` : ''}
       </div>`;
     } else if(rec && !rec.has_rec){
-      html += `<div style="margin:.5rem 0;padding:.6rem 1rem;background:var(--s2);border-radius:8px;border-left:3px solid var(--muted);font-family:var(--mono);font-size:.65rem;color:var(--muted)">${rec.message}</div>`;
+      html += `<div style="margin:.5rem 0;padding:.7rem 1rem;background:var(--s2);border-radius:8px;border-left:3px solid var(--muted);font-family:var(--mono);font-size:.65rem;color:var(--muted);line-height:1.6">${rec.message}</div>`;
     }
 
     const h2h=d.h2h||{};
@@ -4739,89 +4757,116 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
     """
-    Genera una recomendación de apuesta estructurada basada en las probabilidades
-    del modelo. Evalúa 4 mercados y devuelve el mejor pick con su razonamiento.
+    Recomendación de apuesta basada en el 66% de accuracy del mercado.
+
+    LÓGICA CENTRAL:
+    - El mercado tiene 66% de accuracy prediciendo el resultado
+    - Pero el vig (~6%) destruye ese edge si apuestas ciegamente
+    - La ventaja real: apostar cuando TU precio > precio justo del mercado
+      = CLV positivo = el mercado confirmó tu dirección bajando la cuota
+
+    REGLA DE ORO:
+    El modelo calcula la cuota justa. TÚ comparas con la cuota actual.
+    Si cuota actual en B365/Pinnacle > cuota justa modelo → HAY VALUE → APUESTA
+    Si cuota actual < cuota justa modelo → mercado ya lo descuenta → PASA
+
+    EVIDENCIA CSV I1 2025-26:
+    - Favorito con CLV>0 (apertura mejor que cierre): WR 56.6%, ROI +3.7%
+    - Visitante con CLV>0, cuota 2.5-3.5: ROI +43.6% (N=17)
+    - Apostar siempre sin filtro: ROI -3.9% (el vig destruye el edge)
     """
     recs = []
+    total_xg = round(xh + xa, 2)
 
-    # ── 1X2 directo ──────────────────────────────────────────────────────
-    for prob, side, label in [(ph,"H","Local"),(pa,"A","Visitante"),(pd_,"D","Empate")]:
-        # Solo si prob modelo es significativamente alta
-        if prob < 0.40: continue
-        fair_odd = round(1/prob, 2)
-        # EV estimado: necesitamos cuota de mercado > fair_odd para tener edge
-        # Sin cuota real, solo recomendamos cuando el modelo tiene alta confianza
-        if prob >= 0.55:
-            recs.append({
-                "market": "1X2", "selection": label, "prob": round(prob*100, 1),
-                "fair_odd": fair_odd,
-                "strength": "FUERTE" if prob >= 0.65 else "MODERADA",
-                "reason": f"Modelo: {prob*100:.0f}% probabilidad. Cuota justa: {fair_odd}",
-                "stake_pct": 2.0 if prob >= 0.65 else 1.0,
-                "priority": prob,
-            })
+    # ── IDENTIFICAR FAVORITO DEL MODELO ─────────────────────────────────
+    # El mercado tiene 66% accuracy → seguimos al favorito cuando el precio es bueno
+    sides = [
+        (ph, "Local",    "1X2",   round(1/ph,   2) if ph   > 0.01 else 99, 2.0),
+        (pa, "Visitante","1X2",   round(1/pa,   2) if pa   > 0.01 else 99, 2.0),
+        (po, "Over 2.5", "OVER",  round(1/po,   2) if po   > 0.01 else 99, 1.5),
+        (pu, "Under 2.5","UNDER", round(1/pu,   2) if pu   > 0.01 else 99, 1.5),
+        (py, "BTTS: Sí", "BTTS",  round(1/py,   2) if py   > 0.01 else 99, 1.0),
+    ]
 
-    # ── Over/Under 2.5 ───────────────────────────────────────────────────
-    total_xg = xh + xa
-    if po >= 0.55:
+    for prob, label, mkt, fair_odd, base_stake in sides:
+        if prob < 0.38: continue  # sin confianza mínima
+
+        # EV vs vig del mercado (~5.5%)
+        # Si el mercado da cuota X y nuestra prob es P:
+        # EV = P * X - 1. Para EV>0 necesitamos X > 1/P
+        # Cuota justa = 1/P. Necesitamos cuota real > cuota justa para tener EV+
+
+        # Nivel de confianza
+        if prob >= 0.65:
+            strength = "FUERTE"
+            stake = base_stake * 1.5
+            emoji = "🔥"
+        elif prob >= 0.55:
+            strength = "BUENA"
+            stake = base_stake
+            emoji = "✅"
+        elif prob >= 0.45:
+            strength = "MODERADA"
+            stake = base_stake * 0.5
+            emoji = "⚡"
+        else:
+            continue
+
+        # Razón específica por mercado
+        if mkt == "1X2" and label == "Local":
+            reason = (f"Modelo: {prob*100:.0f}% prob local. xG {xh:.2f}vs{xa:.2f}. "
+                      f"El mercado da 66% accuracy → sigue al favorito cuando el precio es justo.")
+        elif mkt == "1X2" and label == "Visitante":
+            reason = (f"Modelo: {prob*100:.0f}% prob visitante. xG {xa:.2f} vs local {xh:.2f}. "
+                      f"Visita con valor: histórico +34% ROI cuando mercado confirma.")
+        elif mkt == "OVER":
+            reason = f"xG total {total_xg} — modelo Over {prob*100:.0f}%. Partido con goles esperados."
+        elif mkt == "UNDER":
+            reason = f"xG total {total_xg} — modelo Under {prob*100:.0f}%. Partido cerrado esperado."
+        elif mkt == "BTTS":
+            reason = f"xG local {xh:.2f} / visita {xa:.2f} — ambos equipos con amenaza goleadora."
+        else:
+            reason = f"Prob modelo: {prob*100:.0f}%"
+
         recs.append({
-            "market": "OVER", "selection": "Over 2.5 Goles",
-            "prob": round(po*100, 1), "fair_odd": round(1/po, 2),
-            "strength": "FUERTE" if po >= 0.65 else "MODERADA",
-            "reason": f"xG total {total_xg:.2f} — modelo Over {po*100:.0f}%. Busca cuota > {round(1/po,2)}",
-            "stake_pct": 1.5,
-            "priority": po,
-        })
-    elif pu >= 0.60:
-        recs.append({
-            "market": "UNDER", "selection": "Under 2.5 Goles",
-            "prob": round(pu*100, 1), "fair_odd": round(1/pu, 2),
-            "strength": "FUERTE" if pu >= 0.70 else "MODERADA",
-            "reason": f"xG total {total_xg:.2f} — modelo Under {pu*100:.0f}%. Busca cuota > {round(1/pu,2)}",
-            "stake_pct": 1.5,
-            "priority": pu,
+            "market": mkt, "selection": label,
+            "prob": round(prob*100, 1),
+            "fair_odd": fair_odd,
+            "strength": strength, "emoji": emoji,
+            "reason": reason,
+            "stake_pct": round(min(stake, 3.0), 1),
+            "priority": prob * (1.3 if prob >= 0.55 else 1.0),
+            # La regla de oro para el apostador:
+            "action": f"Busca {label} a cuota > {fair_odd} en B365 o Pinnacle",
+            "clv_rule": f"Si cuota actual > {fair_odd} → APUESTA. Si < {fair_odd} → PASA.",
         })
 
-    # ── BTTS ─────────────────────────────────────────────────────────────
-    if py >= 0.60:
-        recs.append({
-            "market": "BTTS", "selection": "Ambos Marcan: Sí",
-            "prob": round(py*100, 1), "fair_odd": round(1/py, 2),
-            "strength": "MODERADA",
-            "reason": f"xG local {xh:.2f} / visitante {xa:.2f} — ambos con amenaza real",
-            "stake_pct": 1.0,
-            "priority": py * 0.9,  # ligera penalización vs 1X2
-        })
-
-    # ── DC (si hay favorito claro) ────────────────────────────────────────
-    dc_1x = ph + pd_
-    dc_x2 = pd_ + pa
-    if ph >= 0.55 and dc_1x >= 0.75:
+    # DC como protección cuando hay favorito claro pero cuota baja
+    dc_1x = round(ph + pd_, 3)
+    dc_x2 = round(pd_ + pa, 3)
+    if ph >= 0.52 and dc_1x >= 0.72:
+        fair_dc = round(1/dc_1x, 2)
         recs.append({
             "market": "DC", "selection": "DC: Local o Empate",
-            "prob": round(dc_1x*100, 1), "fair_odd": round(1/dc_1x, 2),
-            "strength": "CONSERVADORA",
-            "reason": f"Local favorito ({ph*100:.0f}% ganar). DC reduce riesgo. Cuota justa: {round(1/dc_1x,2)}",
+            "prob": round(dc_1x*100, 1), "fair_odd": fair_dc,
+            "strength": "CONSERVADORA", "emoji": "🛡️",
+            "reason": f"Local {ph*100:.0f}% ganar. DC elimina riesgo empate. Cuota justa: {fair_dc}",
             "stake_pct": 1.0,
-            "priority": dc_1x * 0.7,  # penalización — cuota baja
-        })
-    elif pa >= 0.50 and dc_x2 >= 0.75:
-        recs.append({
-            "market": "DC", "selection": "DC: Empate o Visitante",
-            "prob": round(dc_x2*100, 1), "fair_odd": round(1/dc_x2, 2),
-            "strength": "CONSERVADORA",
-            "reason": f"Visitante favorito ({pa*100:.0f}% ganar). DC reduce riesgo. Cuota justa: {round(1/dc_x2,2)}",
-            "stake_pct": 1.0,
-            "priority": dc_x2 * 0.7,
+            "priority": dc_1x * 0.65,
+            "action": f"Busca DC Local a cuota > {fair_dc}",
+            "clv_rule": f"Si cuota actual > {fair_dc} → APUESTA. Si < {fair_dc} → PASA.",
         })
 
     if not recs:
         return {
             "has_rec": False,
-            "message": "Partido muy equilibrado — sin edge claro para ningún mercado",
+            "message": (
+                "⚖️ Partido muy equilibrado — sin edge claro. "
+                f"xG: {xh:.2f} vs {xa:.2f}. "
+                "El modelo no identifica ventaja suficiente para recomendar apuesta."
+            ),
         }
 
-    # Ordenar por prioridad y devolver el top + alternativas
     recs.sort(key=lambda x: -x["priority"])
     top = recs[0]
     return {
@@ -4832,18 +4877,22 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
             "prob":      top["prob"],
             "fair_odd":  top["fair_odd"],
             "strength":  top["strength"],
+            "emoji":     top["emoji"],
             "reason":    top["reason"],
             "stake_pct": top["stake_pct"],
-            "action":    f"Apostar {top['selection']} si cuota > {top['fair_odd']}",
+            "action":    top["action"],
+            "clv_rule":  top["clv_rule"],
         },
         "alternatives": [
             {"market": r["market"], "selection": r["selection"],
              "prob": r["prob"], "fair_odd": r["fair_odd"],
-             "strength": r["strength"]}
+             "strength": r["strength"], "action": r["action"]}
             for r in recs[1:3]
         ],
-        "warning": (
-            "⚠️ Verifica cuota actual antes de apostar — el modelo usa cuota justa estimada"
+        "tip": (
+            "💡 CÓMO USAR: Abre B365 o Pinnacle. "
+            f"Si la cuota de {top['selection']} es mayor que {top['fair_odd']} → APUESTA {top['stake_pct']}% del bankroll. "
+            "Si es menor → el mercado ya lo descuenta, PASA."
         ),
     }
 
@@ -5111,6 +5160,10 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
             self.end_headers(); self.wfile.write(payload)
         except Exception as e: self._json_err(str(e))
 
+    # Cache en memoria para copas — evita requests repetidos en 60 min
+    _cup_cal_cache = {}  # {date_str: [matches]}
+    _cup_cal_ts    = {}  # {date_str: timestamp}
+
     def _serve_calendar(self):
         """API /api/calendar?days=N — partidos próximos usando fixtures.csv + CSVs históricos."""
         try:
@@ -5367,18 +5420,93 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
             except Exception as e:
                 Log.warn(f"cup_calendar serve: {e}", "CAL")
 
-            # Fallback: si cup_calendar vacío, intentar api-football directo (hoy solo)
+            # ── FUENTE D: football-data.org directo si cup_calendar vacío ────
+            # Request en tiempo real solo si la tabla está vacía o sin datos de hoy
             try:
                 cup_conn2 = sqlite3.connect(DB_PATH)
-                n_cup = cup_conn2.execute("SELECT COUNT(*) FROM cup_calendar").fetchone()[0]
+                today_str = dates[0]
+                n_today = cup_conn2.execute(
+                    "SELECT COUNT(*) FROM cup_calendar WHERE match_date=?", (today_str,)
+                ).fetchone()[0]
                 cup_conn2.close()
-                if n_cup == 0:
-                    Log.warn("cup_calendar vacío, descargando...", "CAL")
-                    fetch_cup_calendar({
-                        "x-apisports-key": API_SPORTS_KEY,
-                        "x-rapidapi-host": "v3.football.api-sports.io"
-                    })
-            except Exception: pass
+
+                # Siempre refrescar de fd.org al abrir el calendario
+                # Es rápido (3 requests) y garantiza datos actuales
+                # Usar cache si es reciente (< 60 min)
+                cache_ok = (today_str in DashboardHandler._cup_cal_ts and
+                            (now - DashboardHandler._cup_cal_ts[today_str]).total_seconds() < 3600)
+
+                if cache_ok:
+                    for m in DashboardHandler._cup_cal_cache.get(today_str, []):
+                        key = f"{m['div']}_{m['date']}_{m['home']}_{m['away']}"
+                        if key not in seen:
+                            seen.add(key)
+                            matches.append(m)
+                    Log.info(f"cup_calendar: {len(DashboardHandler._cup_cal_cache.get(today_str,[]))} partidos desde cache", "CAL")
+                elif FD_ORG_TOKEN:
+                    Log.info(f"Actualizando partidos de copa de hoy ({today_str})...", "CAL")
+                    FD_LIVE = {
+                        "CL":  (2,   "🏆 UCL"),
+                        "EL":  (3,   "🥈 UEL"),
+                        "EC":  (848, "🥉 UECL"),
+                    }
+                    for fd_code, (league_id, comp_name) in FD_LIVE.items():
+                        try:
+                            r_fd = requests.get(
+                                f"https://api.football-data.org/v4/competitions/{fd_code}/matches",
+                                headers={"X-Auth-Token": FD_ORG_TOKEN},
+                                params={"dateFrom": today_str, "dateTo": today_str},
+                                timeout=10
+                            )
+                            if r_fd.status_code != 200:
+                                continue
+                            for m in r_fd.json().get("matches", []):
+                                try:
+                                    fix_date = m["utcDate"][:10]
+                                    home = m["homeTeam"]["name"]
+                                    away = m["awayTeam"]["name"]
+                                    if not home or home == "None": continue
+                                    div_key = f"CUP_{league_id}"
+                                    key = f"{div_key}_{fix_date}_{home}_{away}"
+                                    if key in seen: continue
+                                    seen.add(key)
+                                    matches.append({
+                                        "date": fix_date, "div": div_key,
+                                        "league": comp_name,
+                                        "home": home, "away": away,
+                                        "home_form": [], "away_form": [],
+                                        "home_stats": {}, "away_stats": {},
+                                        "xg_h": None, "xg_a": None,
+                                        "ph": None, "pd": None, "pa": None,
+                                        "b365h": None, "b365d": None, "b365a": None,
+                                        "picks": [], "home_pos": 0, "away_pos": 0,
+                                        "n_teams": 0, "rest_h": None, "rest_a": None,
+                                        "is_cup": True, "cup_name": comp_name,
+                                    })
+                                    # Cachear para próximos requests
+                                    try:
+                                        conn_c = sqlite3.connect(DB_PATH)
+                                        conn_c.execute("""
+                                            INSERT OR IGNORE INTO cup_calendar
+                                            (fixture_id, league_id, competition, match_date,
+                                             home_team, away_team, status, updated_at)
+                                            VALUES (?,?,?,?,?,?,?,?)
+                                        """, (str(m["id"]), league_id, comp_name, fix_date,
+                                              home, away, m.get("status","SCHEDULED"),
+                                              now.isoformat()))
+                                        conn_c.commit(); conn_c.close()
+                                    except Exception: pass
+                                except Exception:
+                                    continue
+                            Log.ok(f"fd.org live {fd_code}: partidos de hoy cargados", "CAL")
+                        except Exception as e:
+                            Log.warn(f"fd.org live {fd_code}: {e}", "CAL")
+                    # Guardar en cache después de todos los fetches
+                    today_cup = [m for m in matches if m.get("is_cup") and m.get("date")==today_str]
+                    DashboardHandler._cup_cal_cache[today_str] = today_cup
+                    DashboardHandler._cup_cal_ts[today_str] = now
+            except Exception as e:
+                Log.warn(f"cup fallback: {e}", "CAL")
 
             matches.sort(key=lambda x:(x["date"],x["league"]))
             payload=json.dumps({"matches":matches,"dates":dates}).encode()
