@@ -3896,6 +3896,7 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
         <div class="sg-val left${aW?' winner':''}">${av}</div>
       </div>`;
     }
+    let html = '';
     // ── RECOMENDACIÓN DE APUESTA ──────────────────────────────────────
     const rec = d.bet_rec;
     if(rec && rec.has_rec){
@@ -3944,7 +3945,7 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
     }
 
     const h2h=d.h2h||{};
-    detEl.innerHTML=`
+    detEl.innerHTML= html + `
       <div class="md-header">
         <div class="md-team">
           <div class="md-team-name">${d.home}</div>
@@ -4610,7 +4611,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             div  = qs.get("div", [""])[0].strip().upper()
             if not home or not away: self._json_err("Faltan home/away"); return
             found_div=found_home=found_away=None
-            for d in ([div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())):
+
+            # Partidos de copa: buscar equipos en todas las ligas con cutoff bajo
+            is_cup = div.startswith("CUP_")
+            search_divs = list(TARGET_LEAGUES.keys()) if is_cup else (
+                [div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())
+            )
+            # Normalizar nombre de copa (e.g. "Liverpool FC" → "Liverpool")
+            def norm_team(name):
+                for suffix in [" FC", " CF", " SC", " AC", " BC", " City", " Town",
+                                " United", " Athletic", " Atlético", " Saint-Germain"]:
+                    if name.endswith(suffix):
+                        name = name[:-len(suffix)]
+                return name.strip()
+            home_search = norm_team(home) if is_cup else home
+            away_search = norm_team(away) if is_cup else away
+            cutoff = 0.35 if is_cup else 0.45
+
+            for d in search_divs:
                 if d in ("BSA","MEX"): continue
                 path=os.path.join(DATA_DIR,f"{d}.csv")
                 if not os.path.exists(path): continue
@@ -4620,11 +4638,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     df_t.columns=df_t.columns.str.strip()
                     df_t=df_t.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
                     teams=pd.concat([df_t["HomeTeam"],df_t["AwayTeam"]]).dropna().unique()
-                    rh=difflib.get_close_matches(home,teams,n=1,cutoff=0.45)
-                    ra=difflib.get_close_matches(away,teams,n=1,cutoff=0.45)
+                    rh=difflib.get_close_matches(home_search,teams,n=1,cutoff=cutoff)
+                    ra=difflib.get_close_matches(away_search,teams,n=1,cutoff=cutoff)
                     if rh and ra: found_div=d; found_home=rh[0]; found_away=ra[0]; break
                 except: continue
-            if not found_div: self._json_err(f"No se encontró '{home}' o '{away}'"); return
+            if not found_div: self._json_err(f"No se encontró '{home_search}' o '{away_search}' en ligas disponibles"); return
             div=found_div; home=found_home; away=found_away
             cfg=TARGET_LEAGUES[div]
             try:    df=pd.read_csv(os.path.join(DATA_DIR,f"{div}.csv"),encoding="utf-8-sig")
