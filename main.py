@@ -3944,6 +3944,40 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
       html += `<div style="margin:.5rem 0;padding:.7rem 1rem;background:var(--s2);border-radius:8px;border-left:3px solid var(--muted);font-family:var(--mono);font-size:.65rem;color:var(--muted);line-height:1.6">${rec.message}</div>`;
     }
 
+    // ── RESULTADO DE IDA (copa, doble partido) ───────────────────────
+    if(d.leg1 && d.leg1.home_goals !== null){
+      const l1h = d.leg1.home_goals, l1a = d.leg1.away_goals;
+      const agg_h = l1h, agg_a = l1a; // ida ya es desde perspectiva del home actual
+      // Situación para la vuelta
+      let situation = '';
+      if(l1h > l1a) situation = `<span style="color:var(--green)">Gana ${d.home} ${l1h}-${l1a} en el global</span>`;
+      else if(l1h < l1a) situation = `<span style="color:var(--green)">Gana ${d.away} ${l1a}-${l1h} en el global</span>`;
+      else situation = `<span style="color:var(--amber)">Empate ${l1h}-${l1a} — decide el de visitante</span>`;
+
+      // DC y DNB ajustados al agregado
+      const ph = d.probs?.home||0, pa = d.probs?.away||0, pd_ = d.probs?.draw||0;
+      const dc_h = ph + pd_; // DC local (gana o empata en 90min)
+      const fair_dc = dc_h > 0 ? (1/dc_h).toFixed(2) : '—';
+      const fair_dnb = ph > 0 ? (1/ph).toFixed(2) : '—';
+
+      html += `<div style="margin:.5rem 0 1rem;padding:.85rem 1rem;background:var(--s2);border-radius:10px;border-left:3px solid var(--amber)">
+        <div style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-bottom:.4rem;text-transform:uppercase;letter-spacing:.06em">⚽ Doble partido — Resultado Ida</div>
+        <div style="font-size:1rem;font-weight:700;margin-bottom:.3rem">${d.home} ${l1h} – ${l1a} ${d.away}</div>
+        <div style="font-family:var(--mono);font-size:.68rem;margin-bottom:.6rem">${situation}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${l1h < l1a || l1h === l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
+            DC local @${fair_dc} — ${d.home} gana o empata en 90min → pasa en global
+          </div>` : ''}
+          ${l1h < l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
+            DNB local @${fair_dnb} — ${d.home} necesita ganar (sin devolución en empate)
+          </div>` : ''}
+          ${l1h > l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
+            DC visita @${(1/(pa+pd_)).toFixed(2)} — ${d.away} remonta empata o gana
+          </div>` : ''}
+        </div>
+      </div>`;
+    }
+
     const h2h=d.h2h||{};
     detEl.innerHTML= html + `
       <div class="md-header">
@@ -4790,6 +4824,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "home_team":r["HomeTeam"],"away_team":r["AwayTeam"],
                     "home_goals":int(r["FTHG"]),"away_goals":int(r["FTAG"])})
             h2h_tot=hwins+hdraws+awins
+
+            # ── H2H real de copa + resultado IDA via football-data.org ───
+            leg1_home_goals = leg1_away_goals = None
+            if is_cup and FD_ORG_TOKEN:
+                try:
+                    league_id_cup = int(div.replace("CUP_",""))
+                    fd_comp = {2:"CL", 3:"EL", 848:"EC"}.get(league_id_cup)
+                    if fd_comp:
+                        r_fd = requests.get(
+                            f"https://api.football-data.org/v4/competitions/{fd_comp}/matches",
+                            headers={"X-Auth-Token": FD_ORG_TOKEN},
+                            params={"season": 2025, "status": "FINISHED"},
+                            timeout=10
+                        )
+                        if r_fd.status_code == 200:
+                            import difflib as _dl2
+                            for fm in r_fd.json().get("matches", []):
+                                fh = fm["homeTeam"]["name"] or ""
+                                fa = fm["awayTeam"]["name"] or ""
+                                fh_n = norm_team(fh); fa_n = norm_team(fa)
+                                h_n = norm_team(home); a_n = norm_team(away)
+                                # Mismo enfrentamiento en cualquier orden
+                                same_ha = (_dl2.get_close_matches(h_n,[fh_n],n=1,cutoff=0.4) and
+                                           _dl2.get_close_matches(a_n,[fa_n],n=1,cutoff=0.4))
+                                same_ah = (_dl2.get_close_matches(h_n,[fa_n],n=1,cutoff=0.4) and
+                                           _dl2.get_close_matches(a_n,[fh_n],n=1,cutoff=0.4))
+                                if not (same_ha or same_ah): continue
+                                ft = fm.get("score",{}).get("fullTime",{})
+                                gh, ga_s = ft.get("home"), ft.get("away")
+                                if gh is None or ga_s is None: continue
+                                # Orientar desde perspectiva del home actual
+                                hg = int(gh) if same_ha else int(ga_s)
+                                ag = int(ga_s) if same_ha else int(gh)
+                                h2h_list.insert(0, {
+                                    "date": fm["utcDate"][:10],
+                                    "home_team": fh, "away_team": fa,
+                                    "home_goals": int(gh), "away_goals": int(ga_s),
+                                    "competition": fd_comp
+                                })
+                                if hg > ag: hwins += 1
+                                elif hg == ag: hdraws += 1
+                                else: awins += 1
+                                h2h_tot += 1
+                                if leg1_home_goals is None:
+                                    leg1_home_goals = hg
+                                    leg1_away_goals = ag
+                except Exception as _ec:
+                    Log.warn(f"H2H copa: {_ec}", "ANALYZE")
+
             payload=json.dumps({"home":home,"away":away,"div":div,"league":cfg.get("name",""),
                 "home_stats":hs,"away_stats":as_,
                 "xg_home":xh,"xg_away":xa,"xg_total":xt,
@@ -4804,6 +4887,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "over25":sum(1 for r in h2h_list if r["home_goals"]+r["away_goals"]>2),
                     "btts":sum(1 for r in h2h_list if r["home_goals"]>0 and r["away_goals"]>0),
                     "matches":h2h_list},
+                "leg1":{"home_goals":leg1_home_goals,"away_goals":leg1_away_goals} if leg1_home_goals is not None else None,
                 "home_ou":home_ou, "away_ou":away_ou,
                 "home_pos":home_pos, "away_pos":away_pos}).encode()
             self.send_response(200)
@@ -5132,6 +5216,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "picks": [], "home_pos": 0, "away_pos": 0, "n_teams": 0,
                         "rest_h": None, "rest_a": None,
                         "is_cup": True, "cup_name": comp,
+                        "fixture_id": str(lid), "league_id": lid,
                     })
                 Log.info(f"cup_calendar: {len(cup_rows)} partidos de copa en calendario", "CAL")
             except Exception as e:
@@ -5199,6 +5284,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                                         "picks": [], "home_pos": 0, "away_pos": 0,
                                         "n_teams": 0, "rest_h": None, "rest_a": None,
                                         "is_cup": True, "cup_name": comp_name,
+                                        "fixture_id": str(m["id"]),
+                                        "league_id": league_id,
                                     })
                                     # Cachear para próximos requests
                                     try:
