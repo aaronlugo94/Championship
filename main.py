@@ -4124,7 +4124,7 @@ const fmtDate=d=>{
   if(!d||d==='null'||d==='undefined')return'—';
   const s=String(d);
   // Intentar parsear ISO: "2026-04-11T06:31..." o "2026-04-11"
-  const iso=s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const iso=s.match(/^([0-9]{4})-([0-9]{2})-([0-9]{2})/);
   if(iso) return `${iso[3]}/${iso[2]}/${iso[1].slice(2)}`;
   // Fallback: mostrar primeros 10 chars
   return s.slice(0,10);
@@ -4435,355 +4435,6 @@ setInterval(()=>{
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
-class DashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # silenciar logs HTTP
-
-    def do_GET(self):
-        try:
-            if self.path == "/" or self.path == "/dashboard":
-                self._serve_html()
-            elif self.path == "/api/picks":
-                self._serve_api()
-            elif self.path == "/api/sync":
-                self._serve_sync()
-            elif self.path == "/api/resolve":
-                self._serve_resolve()
-            elif self.path.startswith("/api/analyze"):
-                self._serve_analyze()
-            elif self.path == "/stats":
-                self._serve_stats_html()
-            elif self.path.startswith("/api/stats"):
-                self._serve_stats_api()
-            elif self.path.startswith("/api/calendar"):
-                self._serve_calendar()
-            elif self.path == "/api/cups":
-                self._serve_cups_status()
-            elif self.path == "/api/fbref":
-                self._serve_fbref_status()
-            elif self.path.startswith("/api/picks_summary"):
-                self._serve_picks_summary()
-            else:
-                self.send_response(404); self.end_headers()
-        except Exception as _e:
-            import traceback as _tb
-            Log.err(f"do_GET {self.path}: {_e}\n{_tb.format_exc()}", "HTTP")
-            try:
-                self._json_err(str(_e))
-            except Exception:
-                pass
-
-    def _serve_sync(self):
-        """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
-        try:
-            import csv as csvmod
-            synced = 0
-            if os.path.exists(AUDIT_CSV):
-                with open(AUDIT_CSV, "r", encoding="utf-8") as f:
-                    reader = csvmod.reader(f)
-                    header = next(reader)
-                    rows = list(reader)
-                conn_s = sqlite3.connect(DB_PATH)
-                # Cargar todos los picks PENDING de la DB indexados por equipo+mercado
-                pending = conn_s.execute(
-                    "SELECT id, home_team, away_team, market FROM picks_log WHERE result='PENDING'"
-                ).fetchall()
-                # Construir índice: (home_lower, away_lower, market) → id
-                idx = {}
-                for pid, ht, at, mk in pending:
-                    key = (ht.lower()[:6], at.lower()[:6], mk)
-                    idx[key] = pid
-                for row in rows:
-                    if len(row) < 12: continue
-                    status = row[9]
-                    if status not in ("WIN", "LOSS"): continue
-                    home, away, mkt = row[2], row[3], row[5]
-                    try: profit = float(row[11] or 0)
-                    except: profit = 0.0
-                    key = (home.lower()[:6], away.lower()[:6], mkt)
-                    if key in idx:
-                        conn_s.execute(
-                            "UPDATE picks_log SET result=?, profit=? WHERE id=?",
-                            (status, profit, idx[key])
-                        )
-                        synced += 1
-                conn_s.commit(); conn_s.close()
-            payload = json.dumps({"ok": True, "synced": synced}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
-
-    def _serve_html(self):
-        content = DASHBOARD_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", len(content))
-        self.end_headers()
-        self.wfile.write(content)
-
-    def _serve_api(self):
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            # Query principal — columnas fijas, sin JOIN para evitar errores
-            c.execute("""
-                SELECT id, pick_time, div, home_team, away_team,
-                       market, selection, odd_open, prob_model, ev_open,
-                       result, stake_pct, profit, xg_home, xg_away
-                FROM picks_log ORDER BY id DESC LIMIT 500
-            """)
-            rows = c.fetchall()
-
-            # CLV lookup — join por fixture_id que existe en ambas tablas
-            clv_map = {}
-            try:
-                clv_rows = conn.execute("""
-                    SELECT p.id, cl.clv_pct, cl.clv_pct_ps, cl.clv_pct_maxc
-                    FROM picks_log p
-                    JOIN closing_lines cl
-                        ON cl.fixture_id = p.fixture_id
-                        AND cl.market    = p.market
-                        AND cl.selection = p.selection
-                    WHERE p.clv_captured = 1
-                """).fetchall()
-                for row in clv_rows:
-                    clv_map[row[0]] = (row[1], row[2], row[3])
-            except Exception:
-                pass  # CLV no disponible aún — OK
-            conn.close()
-
-            picks = []
-            wins = losses = pending = 0
-            total_ev = total_pnl = 0.0
-            resolved = 0
-
-            for r in rows:
-                # r: id(0) pick_time(1) div(2) home(3) away(4)
-                #    market(5) selection(6) odd_open(7) prob_model(8) ev_open(9)
-                #    result(10) stake_pct(11) profit(12) xg_home(13) xg_away(14)
-                pid    = r[0]
-                status = r[10] or "PENDING"
-                if status == "WIN":  wins += 1; resolved += 1
-                elif status == "LOSS": losses += 1; resolved += 1
-                else: pending += 1
-                ev = float(r[9] or 0)
-                total_ev += ev
-                total_pnl += float(r[12] or 0)
-                clv_tuple = clv_map.get(pid, (None, None, None))
-                def _cf(v):
-                    try: return round(float(v), 1) if v is not None else None
-                    except: return None
-                picks.append({
-                    "date":    r[1],  "div":    r[2],
-                    "home":    r[3],  "away":   r[4],
-                    "market":  r[5],  "pick":   r[6],
-                    "odd":     r[7],  "prob":   r[8],
-                    "ev":      ev,  # decimal (0.094) — JS multiplica por 100
-                    "status":  status,
-                    "stake":   r[11], "profit": r[12],
-                    "xg_h":    r[13], "xg_a":   r[14],
-                    "clv_b365": _cf(clv_tuple[0]),
-                    "clv_ps":   _cf(clv_tuple[1]),
-                    "clv_maxc": _cf(clv_tuple[2]),
-                })
-
-            n = len(picks)
-            avg_ev = (total_ev / n * 100) if n else 0
-            # KPI CLV Pinnacle — la métrica más importante del modelo
-            clv_ps_vals  = [p["clv_ps"]   for p in picks if p.get("clv_ps")   is not None]
-            clv_b365_vals= [p["clv_b365"] for p in picks if p.get("clv_b365") is not None]
-            clv_maxc_vals= [p["clv_maxc"] for p in picks if p.get("clv_maxc") is not None]
-            avg_clv_ps   = round(sum(clv_ps_vals)  /len(clv_ps_vals),  2) if clv_ps_vals   else None
-            avg_clv_b365 = round(sum(clv_b365_vals)/len(clv_b365_vals),2) if clv_b365_vals else None
-            avg_clv_maxc = round(sum(clv_maxc_vals)/len(clv_maxc_vals),2) if clv_maxc_vals else None
-            payload = json.dumps({
-                "picks": picks,
-                "clv_summary": {
-                    "avg_clv_pinnacle": avg_clv_ps,
-                    "avg_clv_b365":     avg_clv_b365,
-                    "avg_clv_maxc":     avg_clv_maxc,
-                    "n_with_clv":       len(clv_ps_vals),
-                    "edge_confirmed":   avg_clv_ps is not None and avg_clv_ps > 0,
-                },
-                "stats": {
-                    "total":    int(n),
-                    "wins":     int(wins),
-                    "losses":   int(losses),
-                    "pending":  int(pending),
-                    "avg_ev":   float(avg_ev),
-                    "pnl":      float(total_pnl),
-                    "resolved": int(resolved)
-                }
-            }).encode("utf-8")
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(payload))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
-
-    def _serve_resolve(self):
-        """Resuelve picks PENDING contra los CSVs de co.uk directamente."""
-        try:
-            import pandas as pd
-            resolved = wins = losses = 0
-            conn_r = sqlite3.connect(DB_PATH)
-            pending = conn_r.execute("""
-                SELECT id, div, home_team, away_team, market, selection,
-                       odd_open, stake_pct
-                FROM picks_log WHERE result='PENDING'
-            """).fetchall()
-
-            for pid, div, home, away, mkt, pick, odd, stake in pending:
-                path = os.path.join(DATA_DIR, f"{div}.csv")
-                if not os.path.exists(path):
-                    continue
-                try:
-                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
-                    except: df = pd.read_csv(path, encoding="latin-1")
-                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
-                                            "HG":"FTHG","AG":"FTAG"})
-                    played = df.dropna(subset=["FTHG","FTAG"])
-                    teams = pd.concat([played["HomeTeam"],played["AwayTeam"]]).unique()
-                    import difflib as dl
-                    rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
-                    ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
-                    if not rh or not ra:
-                        continue
-                    m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
-                    if m.empty:
-                        continue
-                    fthg = float(m.iloc[-1]["FTHG"])
-                    ftag = float(m.iloc[-1]["FTAG"])
-                    res = check_result(pick, mkt, fthg, ftag,
-                                       home_name=rh[0], away_name=ra[0])
-                    if res not in ("WIN","LOSS"):
-                        continue
-                    profit = round(float(stake or 0)*float(odd or 0) - float(stake or 0)
-                                   if res=="WIN" else -float(stake or 0), 4)
-                    conn_r.execute(
-                        "UPDATE picks_log SET result=?, profit=? WHERE id=?",
-                        (res, profit, pid)
-                    )
-                    resolved += 1
-                    if res=="WIN": wins += 1
-                    else: losses += 1
-                except Exception:
-                    continue
-
-            conn_r.commit(); conn_r.close()
-            payload = json.dumps({
-                "ok": True, "resolved": resolved,
-                "wins": wins, "losses": losses
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(err)
-
-    def _json_err(self, msg):
-        payload = json.dumps({"error": msg}).encode()
-        self.send_response(500)
-        self.send_header("Content-Type","application/json")
-        self.end_headers(); self.wfile.write(payload)
-
-    def _serve_stats_html(self):
-        self.send_response(200)
-        self.send_header("Content-Type","text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(STATS_HTML.encode("utf-8"))
-
-    def _serve_stats_api(self):
-        """API /api/stats?league=E1"""
-        try:
-            import pandas as pd
-            from urllib.parse import urlparse, parse_qs
-            qs  = parse_qs(urlparse(self.path).query)
-            div = qs.get("league",["E1"])[0].upper()
-            cfg = TARGET_LEAGUES.get(div)
-            if not cfg: self._json_err(f"Liga {div} no encontrada"); return
-            path = os.path.join(DATA_DIR, f"{div}.csv")
-            if not os.path.exists(path): self._json_err(f"CSV {div} no disponible"); return
-            try:    df = pd.read_csv(path, encoding="utf-8-sig")
-            except: df = pd.read_csv(path, encoding="latin-1")
-            df.columns = df.columns.str.strip()
-            df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
-            df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-            played = df.dropna(subset=["FTHG","FTAG"]).copy()
-            played["FTHG"] = played["FTHG"].astype(float)
-            played["FTAG"] = played["FTAG"].astype(float)
-            if played.empty: self._json_err("Sin partidos jugados"); return
-            teams = {}
-            for _, r in played.iterrows():
-                for side in ["home","away"]:
-                    t = r["HomeTeam"] if side=="home" else r["AwayTeam"]
-                    gf= r["FTHG"] if side=="home" else r["FTAG"]
-                    ga= r["FTAG"] if side=="home" else r["FTHG"]
-                    if t not in teams:
-                        teams[t]={"pj":0,"pg":0,"pe":0,"pp":0,"gf":0,"ga":0,"pts":0,"form":[],"btts":0,"over25":0}
-                    teams[t]["pj"]+=1; teams[t]["gf"]+=gf; teams[t]["ga"]+=ga
-                    teams[t]["btts"] += 1 if (r["FTHG"]>0 and r["FTAG"]>0) else 0
-                    teams[t]["over25"] += 1 if (r["FTHG"]+r["FTAG"])>2.5 else 0
-                    if gf>ga: teams[t]["pg"]+=1; teams[t]["pts"]+=3; teams[t]["form"].append("W")
-                    elif gf==ga: teams[t]["pe"]+=1; teams[t]["pts"]+=1; teams[t]["form"].append("D")
-                    else: teams[t]["pp"]+=1; teams[t]["form"].append("L")
-            table = sorted([{"team":t,"pj":d["pj"],"pg":d["pg"],"pe":d["pe"],"pp":d["pp"],
-                "gf":int(d["gf"]),"ga":int(d["ga"]),"gd":int(d["gf"]-d["ga"]),"pts":d["pts"],
-                "form":d["form"][-5:],"btts_pct":round(d["btts"]/d["pj"]*100,1) if d["pj"] else 0,
-                "over25_pct":round(d["over25"]/d["pj"]*100,1) if d["pj"] else 0,
-                "avg_gf":round(d["gf"]/d["pj"],2) if d["pj"] else 0,
-                "avg_ga":round(d["ga"]/d["pj"],2) if d["pj"] else 0,
-                "xgf":None,"xga":None}
-                for t,d in teams.items() if d["pj"]>0],
-                key=lambda x:(-x["pts"],-x["gd"],-x["gf"]))
-            future = df[df["FTHG"].isna()].copy()
-            future["Date"] = pd.to_datetime(future["Date"], dayfirst=True, errors="coerce")
-            upcoming = []
-            for _, r in future.sort_values("Date").head(15).iterrows():
-                h=str(r.get("HomeTeam","")).strip(); a=str(r.get("AwayTeam","")).strip()
-                if not h or not a: continue
-                upcoming.append({"date":r["Date"].strftime("%d/%m") if pd.notna(r["Date"]) else "?",
-                    "home":h,"away":a,"xg_h":None,"xg_a":None,"ph":None,"pd":None,"pa":None,
-                    "b365h":float(r["B365H"]) if "B365H" in r and pd.notna(r.get("B365H")) else None,
-                    "b365d":float(r["B365D"]) if "B365D" in r and pd.notna(r.get("B365D")) else None,
-                    "b365a":float(r["B365A"]) if "B365A" in r and pd.notna(r.get("B365A")) else None})
-            total=len(played)
-            league_stats={"name":cfg.get("name",""),"total_games":total,
-                "avg_goals":round((played["FTHG"]+played["FTAG"]).mean(),2),
-                "btts_pct":round(((played["FTHG"]>0)&(played["FTAG"]>0)).mean()*100,1),
-                "over25_pct":round(((played["FTHG"]+played["FTAG"])>2.5).mean()*100,1),
-                "home_win_pct":round((played["FTHG"]>played["FTAG"]).mean()*100,1),
-                "draw_pct":round((played["FTHG"]==played["FTAG"]).mean()*100,1),
-                "away_win_pct":round((played["FTHG"]<played["FTAG"]).mean()*100,1)}
-            payload=json.dumps({"table":table,"upcoming":upcoming,"league_stats":league_stats,"div":div}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type","application/json")
-            self.send_header("Access-Control-Allow-Origin","*")
-            self.end_headers(); self.wfile.write(payload)
-        except Exception as e: self._json_err(str(e))
-
 def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
     """
     Recomendación de apuesta basada en el 66% de accuracy del mercado.
@@ -4925,6 +4576,11 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
         ),
     }
 
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """HTTP handler del dashboard V7.2."""
+
+    def log_message(self, format, *args): pass  # suprimir logs HTTP
 
     def _serve_analyze(self):
         """API /api/analyze — análisis de partido estilo footystats."""
@@ -5577,6 +5233,351 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
             self.end_headers(); self.wfile.write(payload)
         except Exception as e: self._json_err(str(e))
 
+
+    def do_GET(self):
+        try:
+            if self.path == "/" or self.path == "/dashboard":
+                self._serve_html()
+            elif self.path == "/api/picks":
+                self._serve_api()
+            elif self.path == "/api/sync":
+                self._serve_sync()
+            elif self.path == "/api/resolve":
+                self._serve_resolve()
+            elif self.path.startswith("/api/analyze"):
+                self._serve_analyze()
+            elif self.path == "/stats":
+                self._serve_stats_html()
+            elif self.path.startswith("/api/stats"):
+                self._serve_stats_api()
+            elif self.path.startswith("/api/calendar"):
+                self._serve_calendar()
+            elif self.path == "/api/cups":
+                self._serve_cups_status()
+            elif self.path == "/api/fbref":
+                self._serve_fbref_status()
+            elif self.path.startswith("/api/picks_summary"):
+                self._serve_picks_summary()
+            else:
+                self.send_response(404); self.end_headers()
+        except Exception as _e:
+            import traceback as _tb
+            Log.err(f"do_GET {self.path}: {_e}\n{_tb.format_exc()}", "HTTP")
+            try:
+                self._json_err(str(_e))
+            except Exception:
+                pass
+
+    def _serve_sync(self):
+        """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
+        try:
+            import csv as csvmod
+            synced = 0
+            if os.path.exists(AUDIT_CSV):
+                with open(AUDIT_CSV, "r", encoding="utf-8") as f:
+                    reader = csvmod.reader(f)
+                    header = next(reader)
+                    rows = list(reader)
+                conn_s = sqlite3.connect(DB_PATH)
+                # Cargar todos los picks PENDING de la DB indexados por equipo+mercado
+                pending = conn_s.execute(
+                    "SELECT id, home_team, away_team, market FROM picks_log WHERE result='PENDING'"
+                ).fetchall()
+                # Construir índice: (home_lower, away_lower, market) → id
+                idx = {}
+                for pid, ht, at, mk in pending:
+                    key = (ht.lower()[:6], at.lower()[:6], mk)
+                    idx[key] = pid
+                for row in rows:
+                    if len(row) < 12: continue
+                    status = row[9]
+                    if status not in ("WIN", "LOSS"): continue
+                    home, away, mkt = row[2], row[3], row[5]
+                    try: profit = float(row[11] or 0)
+                    except: profit = 0.0
+                    key = (home.lower()[:6], away.lower()[:6], mkt)
+                    if key in idx:
+                        conn_s.execute(
+                            "UPDATE picks_log SET result=?, profit=? WHERE id=?",
+                            (status, profit, idx[key])
+                        )
+                        synced += 1
+                conn_s.commit(); conn_s.close()
+            payload = json.dumps({"ok": True, "synced": synced}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+    def _serve_html(self):
+        content = DASHBOARD_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(content))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _serve_api(self):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            # Query principal — columnas fijas, sin JOIN para evitar errores
+            c.execute("""
+                SELECT id, pick_time, div, home_team, away_team,
+                       market, selection, odd_open, prob_model, ev_open,
+                       result, stake_pct, profit, xg_home, xg_away
+                FROM picks_log ORDER BY id DESC LIMIT 500
+            """)
+            rows = c.fetchall()
+
+            # CLV lookup — join por fixture_id que existe en ambas tablas
+            clv_map = {}
+            try:
+                clv_rows = conn.execute("""
+                    SELECT p.id, cl.clv_pct, cl.clv_pct_ps, cl.clv_pct_maxc
+                    FROM picks_log p
+                    JOIN closing_lines cl
+                        ON cl.fixture_id = p.fixture_id
+                        AND cl.market    = p.market
+                        AND cl.selection = p.selection
+                    WHERE p.clv_captured = 1
+                """).fetchall()
+                for row in clv_rows:
+                    clv_map[row[0]] = (row[1], row[2], row[3])
+            except Exception:
+                pass  # CLV no disponible aún — OK
+            conn.close()
+
+            picks = []
+            wins = losses = pending = 0
+            total_ev = total_pnl = 0.0
+            resolved = 0
+
+            for r in rows:
+                # r: id(0) pick_time(1) div(2) home(3) away(4)
+                #    market(5) selection(6) odd_open(7) prob_model(8) ev_open(9)
+                #    result(10) stake_pct(11) profit(12) xg_home(13) xg_away(14)
+                pid    = r[0]
+                status = r[10] or "PENDING"
+                if status == "WIN":  wins += 1; resolved += 1
+                elif status == "LOSS": losses += 1; resolved += 1
+                else: pending += 1
+                ev = float(r[9] or 0)
+                total_ev += ev
+                total_pnl += float(r[12] or 0)
+                clv_tuple = clv_map.get(pid, (None, None, None))
+                def _cf(v):
+                    try: return round(float(v), 1) if v is not None else None
+                    except: return None
+                picks.append({
+                    "date":    r[1],  "div":    r[2],
+                    "home":    r[3],  "away":   r[4],
+                    "market":  r[5],  "pick":   r[6],
+                    "odd":     r[7],  "prob":   r[8],
+                    "ev":      ev,  # decimal (0.094) — JS multiplica por 100
+                    "status":  status,
+                    "stake":   r[11], "profit": r[12],
+                    "xg_h":    r[13], "xg_a":   r[14],
+                    "clv_b365": _cf(clv_tuple[0]),
+                    "clv_ps":   _cf(clv_tuple[1]),
+                    "clv_maxc": _cf(clv_tuple[2]),
+                })
+
+            n = len(picks)
+            avg_ev = (total_ev / n * 100) if n else 0
+            # KPI CLV Pinnacle — la métrica más importante del modelo
+            clv_ps_vals  = [p["clv_ps"]   for p in picks if p.get("clv_ps")   is not None]
+            clv_b365_vals= [p["clv_b365"] for p in picks if p.get("clv_b365") is not None]
+            clv_maxc_vals= [p["clv_maxc"] for p in picks if p.get("clv_maxc") is not None]
+            avg_clv_ps   = round(sum(clv_ps_vals)  /len(clv_ps_vals),  2) if clv_ps_vals   else None
+            avg_clv_b365 = round(sum(clv_b365_vals)/len(clv_b365_vals),2) if clv_b365_vals else None
+            avg_clv_maxc = round(sum(clv_maxc_vals)/len(clv_maxc_vals),2) if clv_maxc_vals else None
+            payload = json.dumps({
+                "picks": picks,
+                "clv_summary": {
+                    "avg_clv_pinnacle": avg_clv_ps,
+                    "avg_clv_b365":     avg_clv_b365,
+                    "avg_clv_maxc":     avg_clv_maxc,
+                    "n_with_clv":       len(clv_ps_vals),
+                    "edge_confirmed":   avg_clv_ps is not None and avg_clv_ps > 0,
+                },
+                "stats": {
+                    "total":    int(n),
+                    "wins":     int(wins),
+                    "losses":   int(losses),
+                    "pending":  int(pending),
+                    "avg_ev":   float(avg_ev),
+                    "pnl":      float(total_pnl),
+                    "resolved": int(resolved)
+                }
+            }).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(payload))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+    def _serve_resolve(self):
+        """Resuelve picks PENDING contra los CSVs de co.uk directamente."""
+        try:
+            import pandas as pd
+            resolved = wins = losses = 0
+            conn_r = sqlite3.connect(DB_PATH)
+            pending = conn_r.execute("""
+                SELECT id, div, home_team, away_team, market, selection,
+                       odd_open, stake_pct
+                FROM picks_log WHERE result='PENDING'
+            """).fetchall()
+
+            for pid, div, home, away, mkt, pick, odd, stake in pending:
+                path = os.path.join(DATA_DIR, f"{div}.csv")
+                if not os.path.exists(path):
+                    continue
+                try:
+                    try:    df = pd.read_csv(path, encoding="utf-8-sig")
+                    except: df = pd.read_csv(path, encoding="latin-1")
+                    df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                            "HG":"FTHG","AG":"FTAG"})
+                    played = df.dropna(subset=["FTHG","FTAG"])
+                    teams = pd.concat([played["HomeTeam"],played["AwayTeam"]]).unique()
+                    import difflib as dl
+                    rh = dl.get_close_matches(home, teams, n=1, cutoff=0.55)
+                    ra = dl.get_close_matches(away, teams, n=1, cutoff=0.55)
+                    if not rh or not ra:
+                        continue
+                    m = played[(played["HomeTeam"]==rh[0])&(played["AwayTeam"]==ra[0])]
+                    if m.empty:
+                        continue
+                    fthg = float(m.iloc[-1]["FTHG"])
+                    ftag = float(m.iloc[-1]["FTAG"])
+                    res = check_result(pick, mkt, fthg, ftag,
+                                       home_name=rh[0], away_name=ra[0])
+                    if res not in ("WIN","LOSS"):
+                        continue
+                    profit = round(float(stake or 0)*float(odd or 0) - float(stake or 0)
+                                   if res=="WIN" else -float(stake or 0), 4)
+                    conn_r.execute(
+                        "UPDATE picks_log SET result=?, profit=? WHERE id=?",
+                        (res, profit, pid)
+                    )
+                    resolved += 1
+                    if res=="WIN": wins += 1
+                    else: losses += 1
+                except Exception:
+                    continue
+
+            conn_r.commit(); conn_r.close()
+            payload = json.dumps({
+                "ok": True, "resolved": resolved,
+                "wins": wins, "losses": losses
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(err)
+
+    def _json_err(self, msg):
+        payload = json.dumps({"error": msg}).encode()
+        self.send_response(500)
+        self.send_header("Content-Type","application/json")
+        self.end_headers(); self.wfile.write(payload)
+
+    def _serve_stats_html(self):
+        self.send_response(200)
+        self.send_header("Content-Type","text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(STATS_HTML.encode("utf-8"))
+
+    def _serve_stats_api(self):
+        """API /api/stats?league=E1"""
+        try:
+            import pandas as pd
+            from urllib.parse import urlparse, parse_qs
+            qs  = parse_qs(urlparse(self.path).query)
+            div = qs.get("league",["E1"])[0].upper()
+            cfg = TARGET_LEAGUES.get(div)
+            if not cfg: self._json_err(f"Liga {div} no encontrada"); return
+            path = os.path.join(DATA_DIR, f"{div}.csv")
+            if not os.path.exists(path): self._json_err(f"CSV {div} no disponible"); return
+            try:    df = pd.read_csv(path, encoding="utf-8-sig")
+            except: df = pd.read_csv(path, encoding="latin-1")
+            df.columns = df.columns.str.strip()
+            df = df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+            df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+            played = df.dropna(subset=["FTHG","FTAG"]).copy()
+            played["FTHG"] = played["FTHG"].astype(float)
+            played["FTAG"] = played["FTAG"].astype(float)
+            if played.empty: self._json_err("Sin partidos jugados"); return
+            teams = {}
+            for _, r in played.iterrows():
+                for side in ["home","away"]:
+                    t = r["HomeTeam"] if side=="home" else r["AwayTeam"]
+                    gf= r["FTHG"] if side=="home" else r["FTAG"]
+                    ga= r["FTAG"] if side=="home" else r["FTHG"]
+                    if t not in teams:
+                        teams[t]={"pj":0,"pg":0,"pe":0,"pp":0,"gf":0,"ga":0,"pts":0,"form":[],"btts":0,"over25":0}
+                    teams[t]["pj"]+=1; teams[t]["gf"]+=gf; teams[t]["ga"]+=ga
+                    teams[t]["btts"] += 1 if (r["FTHG"]>0 and r["FTAG"]>0) else 0
+                    teams[t]["over25"] += 1 if (r["FTHG"]+r["FTAG"])>2.5 else 0
+                    if gf>ga: teams[t]["pg"]+=1; teams[t]["pts"]+=3; teams[t]["form"].append("W")
+                    elif gf==ga: teams[t]["pe"]+=1; teams[t]["pts"]+=1; teams[t]["form"].append("D")
+                    else: teams[t]["pp"]+=1; teams[t]["form"].append("L")
+            table = sorted([{"team":t,"pj":d["pj"],"pg":d["pg"],"pe":d["pe"],"pp":d["pp"],
+                "gf":int(d["gf"]),"ga":int(d["ga"]),"gd":int(d["gf"]-d["ga"]),"pts":d["pts"],
+                "form":d["form"][-5:],"btts_pct":round(d["btts"]/d["pj"]*100,1) if d["pj"] else 0,
+                "over25_pct":round(d["over25"]/d["pj"]*100,1) if d["pj"] else 0,
+                "avg_gf":round(d["gf"]/d["pj"],2) if d["pj"] else 0,
+                "avg_ga":round(d["ga"]/d["pj"],2) if d["pj"] else 0,
+                "xgf":None,"xga":None}
+                for t,d in teams.items() if d["pj"]>0],
+                key=lambda x:(-x["pts"],-x["gd"],-x["gf"]))
+            future = df[df["FTHG"].isna()].copy()
+            future["Date"] = pd.to_datetime(future["Date"], dayfirst=True, errors="coerce")
+            upcoming = []
+            for _, r in future.sort_values("Date").head(15).iterrows():
+                h=str(r.get("HomeTeam","")).strip(); a=str(r.get("AwayTeam","")).strip()
+                if not h or not a: continue
+                upcoming.append({"date":r["Date"].strftime("%d/%m") if pd.notna(r["Date"]) else "?",
+                    "home":h,"away":a,"xg_h":None,"xg_a":None,"ph":None,"pd":None,"pa":None,
+                    "b365h":float(r["B365H"]) if "B365H" in r and pd.notna(r.get("B365H")) else None,
+                    "b365d":float(r["B365D"]) if "B365D" in r and pd.notna(r.get("B365D")) else None,
+                    "b365a":float(r["B365A"]) if "B365A" in r and pd.notna(r.get("B365A")) else None})
+            total=len(played)
+            league_stats={"name":cfg.get("name",""),"total_games":total,
+                "avg_goals":round((played["FTHG"]+played["FTAG"]).mean(),2),
+                "btts_pct":round(((played["FTHG"]>0)&(played["FTAG"]>0)).mean()*100,1),
+                "over25_pct":round(((played["FTHG"]+played["FTAG"])>2.5).mean()*100,1),
+                "home_win_pct":round((played["FTHG"]>played["FTAG"]).mean()*100,1),
+                "draw_pct":round((played["FTHG"]==played["FTAG"]).mean()*100,1),
+                "away_win_pct":round((played["FTHG"]<played["FTAG"]).mean()*100,1)}
+            payload=json.dumps({"table":table,"upcoming":upcoming,"league_stats":league_stats,"div":div}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e: self._json_err(str(e))
 
 def auto_resolve():
     """Resuelve picks PENDING contra CSVs al arrancar. Sin requests externos."""
