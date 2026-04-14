@@ -1140,6 +1140,11 @@ def fetch_fbref_xg(divs: list | None = None, force: bool = False) -> dict:
     season = "2025-26"
 
     for div in divs:
+        # Si FBref está bloqueado (403), salir inmediatamente
+        if _FBREF_BLOCKED:
+            Log.warn("FBref bloqueado — saltando todas las ligas", "FBREF")
+            break
+
         url = FBREF_SHOOTING_URLS.get(div)
         if not url:
             continue
@@ -4435,30 +4440,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass  # silenciar logs HTTP
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/dashboard":
-            self._serve_html()
-        elif self.path == "/api/picks":
-            self._serve_api()
-        elif self.path == "/api/sync":
-            self._serve_sync()
-        elif self.path == "/api/resolve":
-            self._serve_resolve()
-        elif self.path.startswith("/api/analyze"):
-            self._serve_analyze()
-        elif self.path == "/stats":
-            self._serve_stats_html()
-        elif self.path.startswith("/api/stats"):
-            self._serve_stats_api()
-        elif self.path.startswith("/api/calendar"):
-            self._serve_calendar()
-        elif self.path == "/api/cups":
-            self._serve_cups_status()
-        elif self.path == "/api/fbref":
-            self._serve_fbref_status()
-        elif self.path.startswith("/api/picks_summary"):
-            self._serve_picks_summary()
-        else:
-            self.send_response(404); self.end_headers()
+        try:
+            if self.path == "/" or self.path == "/dashboard":
+                self._serve_html()
+            elif self.path == "/api/picks":
+                self._serve_api()
+            elif self.path == "/api/sync":
+                self._serve_sync()
+            elif self.path == "/api/resolve":
+                self._serve_resolve()
+            elif self.path.startswith("/api/analyze"):
+                self._serve_analyze()
+            elif self.path == "/stats":
+                self._serve_stats_html()
+            elif self.path.startswith("/api/stats"):
+                self._serve_stats_api()
+            elif self.path.startswith("/api/calendar"):
+                self._serve_calendar()
+            elif self.path == "/api/cups":
+                self._serve_cups_status()
+            elif self.path == "/api/fbref":
+                self._serve_fbref_status()
+            elif self.path.startswith("/api/picks_summary"):
+                self._serve_picks_summary()
+            else:
+                self.send_response(404); self.end_headers()
+        except Exception as _e:
+            import traceback as _tb
+            Log.err(f"do_GET {self.path}: {_e}\n{_tb.format_exc()}", "HTTP")
+            try:
+                self._json_err(str(_e))
+            except Exception:
+                pass
 
     def _serve_sync(self):
         """Sincroniza CSV → picks_log DB para picks históricos sin resultado."""
@@ -5178,6 +5191,7 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
 
     def _serve_calendar(self):
         """API /api/calendar?days=N — partidos próximos usando fixtures.csv + CSVs históricos."""
+        global _CUP_CAL_CACHE, _CUP_CAL_TS
         try:
             import pandas as pd
             from urllib.parse import urlparse, parse_qs
@@ -5644,34 +5658,9 @@ if __name__ == "__main__":
     except Exception as e:
         Log.warn(f"cup_calendar startup: {e}", "CAL")
 
-    # FBref xG — descargar al arrancar (ligas top 5 primero)
-    # Se descarga en background para no bloquear el startup
-    import threading
-    def _fbref_startup():
-        try:
-            Log.info("FBref xG: descargando top 5 ligas...", "FBREF")
-            # Primero las 5 ligas con más picks históricos
-            top5 = ["E0", "I1", "D1", "SP1", "F1"]
-            results = fetch_fbref_xg(top5)
-            Log.ok(f"FBref xG top5: {sum(len(v) for v in results.values())} equipos", "FBREF")
-            # Luego el resto en background
-            import time; time.sleep(30)
-            rest = [d for d in FBREF_SHOOTING_URLS if d not in top5]
-            results2 = fetch_fbref_xg(rest)
-            Log.ok(f"FBref xG resto: {sum(len(v) for v in results2.values())} equipos", "FBREF")
-            total = sum(len(v) for v in {**results, **results2}.values())
-            try:
-                send_msg(
-                    f"📐 <b>FBref xG cargado</b>\n"
-                    f"✅ {total} equipos con xG real\n"
-                    f"🔄 Blend 70% FBref + 30% HST proxy\n"
-                    f"⏱ Próxima actualización: 48h"
-                )
-            except: pass
-        except Exception as e:
-            Log.warn(f"FBref startup: {e}", "FBREF")
-    
-    threading.Thread(target=_fbref_startup, daemon=True).start()
+    # FBref xG — desactivado: Railway bloqueado (403) por FBref
+    # Usando xG proxy HST×conv_rate (funcionando correctamente)
+    Log.warn("FBref xG desactivado — IP de Railway bloqueada por FBref (403). Usando xG proxy.", "FBREF")
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
@@ -5765,13 +5754,7 @@ if __name__ == "__main__":
                     Log.ok(f"Cup fixtures actualizados: {n} registros", "CUPS")
                 except Exception as e: Log.err(f"cup_fixtures: {e}", "CUPS")
 
-            # FBref xG: actualizar miércoles a las 05:30 UTC (después de jornadas)
-            if now_d.weekday() == 2 and abs(now_d.hour - 5) < 1 and now_d.minute < 35:
-                try:
-                    Log.info("FBref xG: actualización semanal...", "FBREF")
-                    r = fetch_fbref_xg(force=True)
-                    total = sum(len(v) for v in r.values())
-                    Log.ok(f"FBref xG actualizado: {total} equipos", "FBREF")
-                except Exception as e: Log.err(f"FBref xG sched: {e}", "FBREF")
+            # FBref xG: desactivado — Railway bloqueado por FBref (403)
+            # pass
 
         time.sleep(30)
