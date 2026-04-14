@@ -461,6 +461,20 @@ def init_db():
         UNIQUE(team_normalized, competition, match_date)
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_cup ON cup_fixtures(team_normalized, match_date)")
+    # Tabla para partidos de copa próximos (calendario)
+    c.execute("""CREATE TABLE IF NOT EXISTS cup_calendar (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fixture_id TEXT,
+        league_id INTEGER,
+        competition TEXT,
+        match_date TEXT NOT NULL,
+        home_team TEXT,
+        away_team TEXT,
+        status TEXT,
+        odd_h REAL, odd_d REAL, odd_a REAL,
+        updated_at TEXT,
+        UNIQUE(league_id, match_date, home_team, away_team)
+    )""")
     conn.commit(); conn.close()
 
 # ============================================================
@@ -1346,6 +1360,72 @@ def get_fbref_xg(team_name: str, div: str) -> dict | None:
         Log.warn(f"get_fbref_xg {team_name}: {e}", "FBREF")
         return None
 
+
+
+def fetch_cup_calendar(headers):
+    """
+    Descarga partidos próximos (hoy + 7 días) de UCL/UEL/UECL y copas nacionales
+    desde api-football y los cachea en cup_calendar SQLite.
+    Costo: 6 copas = 6 requests. Se corre al arrancar y cada mañana.
+    El calendario los sirve desde SQLite — rápido y sin requests extra.
+    """
+    now = datetime.now(timezone.utc)
+    CUP_CAL = {
+        2:   "🏆 UCL",
+        3:   "🥈 UEL",
+        848: "🥉 UECL",
+        45:  "🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup",
+        143: "🇪🇸 Copa Rey",
+        137: "🇮🇹 Coppa Italia",
+    }
+    date_from = now.strftime("%Y-%m-%d")
+    date_to   = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    total = 0
+
+    for league_id, comp_name in CUP_CAL.items():
+        try:
+            res = apif_get("fixtures", {
+                "league":  league_id,
+                "season":  2025,
+                "from":    date_from,
+                "to":      date_to,
+            }, headers)
+
+            for fix in (res or []):
+                try:
+                    fix_date = fix["fixture"]["date"][:10]
+                    fix_id   = str(fix["fixture"]["id"])
+                    status   = fix["fixture"]["status"]["short"]
+                    home     = fix["teams"]["home"]["name"]
+                    away     = fix["teams"]["away"]["name"]
+                    # Cuotas desde bookmakers si disponibles
+                    oh = od = oa = None
+                    for bk in fix.get("bookmakers", []):
+                        for bet in bk.get("bets", []):
+                            if bet.get("name") == "Match Winner":
+                                for v in bet.get("values", []):
+                                    if v["value"] == "Home": oh = float(v["odd"])
+                                    elif v["value"] == "Draw": od = float(v["odd"])
+                                    elif v["value"] == "Away": oa = float(v["odd"])
+                    conn.execute("""
+                        INSERT OR REPLACE INTO cup_calendar
+                        (fixture_id, league_id, competition, match_date,
+                         home_team, away_team, status, odd_h, odd_d, odd_a, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (fix_id, league_id, comp_name, fix_date,
+                          home, away, status, oh, od, oa, now.isoformat()))
+                    total += 1
+                except Exception:
+                    continue
+            Log.ok(f"cup_calendar {comp_name}: {len(res or [])} partidos", "CAL")
+        except Exception as e:
+            Log.warn(f"cup_calendar {comp_name}: {e}", "CAL")
+
+    conn.commit(); conn.close()
+    Log.ok(f"cup_calendar: {total} partidos próximos cacheados", "CAL")
+    return total
 
 
 def fetch_cup_fixtures(headers, full_season=False):
@@ -3179,6 +3259,9 @@ const LEAGUES = {
   "N1":"🇳🇱 Eredivisie","P1":"🇵🇹 Primeira",
   "B1":"🇧🇪 Jupiler","SC0":"🏴󠁧󠁢󠁳󠁣󠁴 Premiership",
   "T1":"🇹🇷 Süper Lig","G1":"🇬🇷 Super League",
+  // Copas europeas y nacionales
+  "CUP_2":"🏆 UCL","CUP_3":"🥈 UEL","CUP_848":"🥉 UECL",
+  "CUP_45":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup","CUP_143":"🇪🇸 Copa Rey","CUP_137":"🇮🇹 Coppa Italia",
 };
 let currentLeague = "E1", tableData = [], sortCol = "pts", sortDir = -1;
 
@@ -3632,6 +3715,9 @@ const LEAGUES = {
   "N1":"🇳🇱 Eredivisie","P1":"🇵🇹 Primeira",
   "B1":"🇧🇪 Jupiler","SC0":"🏴󠁧󠁢󠁳󠁣󠁴 Premiership",
   "T1":"🇹🇷 Süper Lig","G1":"🇬🇷 Super League",
+  // Copas europeas y nacionales
+  "CUP_2":"🏆 UCL","CUP_3":"🥈 UEL","CUP_848":"🥉 UECL",
+  "CUP_45":"🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup","CUP_143":"🇪🇸 Copa Rey","CUP_137":"🇮🇹 Coppa Italia",
 };
 
 function fd(r){
@@ -5076,82 +5162,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 Log.warn(f"cup calendar: {e}", "CAL")
 
-            # ── FUENTE C REAL: api-football /fixtures para partidos de copa ───
+            # ── FUENTE C: copa calendar desde SQLite (cacheado al arrancar) ────
             try:
-                cup_league_ids = list(CUP_LEAGUES.keys())  # UCL=2, UEL=3, UECL=848, etc.
-                # Nombres display de copas europeas
-                cup_display = {
-                    2: "🏆 UCL", 3: "🥈 UEL", 848: "🥉 UECL",
-                    45: "🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup", 48: "🏴󠁧󠁢󠁥󠁮󠁧󠁿 EFL Cup",
-                    143: "🇪🇸 Copa Rey", 529: "🇩🇪 DFB Pokal",
-                    137: "🇮🇹 Coppa Italia", 66: "🇫🇷 Coupe France",
-                }
-                # Solo buscar fechas dentro del rango (hoy + 7 días)
-                # Limitar a hoy + 2 días y solo copas europeas (3 × 3 = 9 req máx)
-                # Para preservar el límite de 100/día de api-football
-                CUP_CAL_IDS = {2: "UCL", 3: "UEL", 848: "UECL",
-                               45: "FA Cup", 143: "Copa Rey", 137: "Coppa Italia"}
-                for date_str in dates[:3]:  # solo hoy + 2 días
-                    for league_id, comp_name in CUP_CAL_IDS.items():
-                        try:
-                            res = apif_get("fixtures", {
-                                "league": league_id,
-                                "season": 2025,
-                                "date": date_str,
-                            }, {
-                                "x-apisports-key": API_SPORTS_KEY,
-                                "x-rapidapi-host": "v3.football.api-sports.io"
-                            })
-                            for fix in (res or []):
-                                try:
-                                    status = fix["fixture"]["status"]["short"]
-                                    # Solo próximos (NS=not started) o en curso
-                                    if status not in ("NS","1H","2H","HT","ET","P","LIVE","FT","AET","PEN"):
-                                        continue
-                                    h_name = fix["teams"]["home"]["name"]
-                                    a_name = fix["teams"]["away"]["name"]
-                                    display = cup_display.get(league_id, comp_name)
-                                    div_key = f"CUP_{league_id}"
-                                    key = f"{div_key}_{date_str}_{h_name}_{a_name}"
-                                    if key in seen: continue
-                                    seen.add(key)
-                                    # Cuotas si disponibles
-                                    goals = fix.get("goals", {})
-                                    score = fix.get("score", {})
-                                    oh = od = oa = None
-                                    try:
-                                        bkm = fix.get("bookmakers", [])
-                                        if bkm:
-                                            for b in bkm:
-                                                for bet in b.get("bets", []):
-                                                    if bet.get("name") == "Match Winner":
-                                                        for v in bet.get("values", []):
-                                                            if v["value"] == "Home": oh = float(v["odd"])
-                                                            elif v["value"] == "Draw": od = float(v["odd"])
-                                                            elif v["value"] == "Away": oa = float(v["odd"])
-                                    except: pass
-                                    # Stats del equipo desde cup_fixtures (solo historial)
-                                    matches.append({
-                                        "date": date_str,
-                                        "div": div_key,
-                                        "league": display,
-                                        "home": h_name, "away": a_name,
-                                        "home_form": [], "away_form": [],
-                                        "home_stats": {}, "away_stats": {},
-                                        "xg_h": None, "xg_a": None,
-                                        "ph": None, "pd": None, "pa": None,
-                                        "b365h": oh, "b365d": od, "b365a": oa,
-                                        "picks": [],
-                                        "home_pos": 0, "away_pos": 0, "n_teams": 0,
-                                        "rest_h": None, "rest_a": None,
-                                        "is_cup": True, "cup_name": comp_name,
-                                    })
-                                except Exception:
-                                    continue
-                        except Exception:
-                            continue
+                cup_conn = sqlite3.connect(DB_PATH)
+                cup_rows = cup_conn.execute("""
+                    SELECT league_id, competition, match_date, home_team, away_team,
+                           status, odd_h, odd_d, odd_a
+                    FROM cup_calendar
+                    WHERE match_date >= ?
+                    ORDER BY match_date, competition
+                """, (dates[0],)).fetchall()
+                cup_conn.close()
+                for (lid, comp, fix_date, home, away, status, oh, od, oa) in cup_rows:
+                    if fix_date not in dates: continue
+                    div_key = f"CUP_{lid}"
+                    key = f"{div_key}_{fix_date}_{home}_{away}"
+                    if key in seen: continue
+                    seen.add(key)
+                    matches.append({
+                        "date": fix_date, "div": div_key,
+                        "league": comp, "home": home, "away": away,
+                        "home_form": [], "away_form": [],
+                        "home_stats": {}, "away_stats": {},
+                        "xg_h": None, "xg_a": None,
+                        "ph": None, "pd": None, "pa": None,
+                        "b365h": oh, "b365d": od, "b365a": oa,
+                        "picks": [], "home_pos": 0, "away_pos": 0, "n_teams": 0,
+                        "rest_h": None, "rest_a": None,
+                        "is_cup": True, "cup_name": comp,
+                    })
+                Log.info(f"cup_calendar: {len(cup_rows)} partidos de copa en calendario", "CAL")
             except Exception as e:
-                Log.warn(f"cup fixtures calendar: {e}", "CAL")
+                Log.warn(f"cup_calendar serve: {e}", "CAL")
+
+            # Fallback: si cup_calendar vacío, intentar api-football directo (hoy solo)
+            try:
+                cup_conn2 = sqlite3.connect(DB_PATH)
+                n_cup = cup_conn2.execute("SELECT COUNT(*) FROM cup_calendar").fetchone()[0]
+                cup_conn2.close()
+                if n_cup == 0:
+                    Log.warn("cup_calendar vacío, descargando...", "CAL")
+                    fetch_cup_calendar({
+                        "x-apisports-key": API_SPORTS_KEY,
+                        "x-rapidapi-host": "v3.football.api-sports.io"
+                    })
+            except Exception: pass
 
             matches.sort(key=lambda x:(x["date"],x["league"]))
             payload=json.dumps({"matches":matches,"dates":dates}).encode()
@@ -5266,6 +5321,12 @@ if __name__ == "__main__":
         Log.ok(f"Cup fixtures [{mode}]: {n} registros", "CUPS")
     except Exception as e:
         Log.warn(f"cup_fixtures startup: {e}", "CUPS")
+    # Cargar partidos próximos de copa para el calendario
+    try:
+        nc = fetch_cup_calendar(bot.apif_h)
+        Log.ok(f"cup_calendar: {nc} partidos próximos", "CAL")
+    except Exception as e:
+        Log.warn(f"cup_calendar startup: {e}", "CAL")
 
     # FBref xG — descargar al arrancar (ligas top 5 primero)
     # Se descarga en background para no bloquear el startup
@@ -5326,6 +5387,14 @@ if __name__ == "__main__":
     while True:
         now = datetime.now(timezone.utc)
         hh, mm = now.hour, now.minute
+
+        # 05:45 — actualizar cup_calendar (partidos próximos de copa)
+        if (hh, mm) == (5, 45) and not _ran_today("cup_cal"):
+            _mark_ran("cup_cal")
+            try:
+                nc = fetch_cup_calendar(bot.apif_h)
+                Log.ok(f"cup_calendar refresh: {nc} partidos", "CAL")
+            except Exception as e: Log.err(f"cup_calendar: {e}", "CAL")
 
         # 06:00 — refresh CSVs
         if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
