@@ -1364,35 +1364,75 @@ def get_fbref_xg(team_name: str, div: str) -> dict | None:
 
 def fetch_cup_calendar(headers):
     """
-    Descarga partidos próximos (hoy + 7 días) de UCL/UEL/UECL y copas nacionales
-    desde api-football y los cachea en cup_calendar SQLite.
-    Costo: 6 copas = 6 requests. Se corre al arrancar y cada mañana.
-    El calendario los sirve desde SQLite — rápido y sin requests extra.
+    Descarga partidos próximos de copas europeas usando football-data.org (free).
+    UCL/UEL via /competitions/CL|EL/matches — sin límite diario, 10 req/min.
+    Copas nacionales via api-football como fallback.
+    Se corre al arrancar y cada mañana a las 05:45 UTC.
     """
     now = datetime.now(timezone.utc)
-    CUP_CAL = {
-        2:   "🏆 UCL",
-        3:   "🥈 UEL",
-        848: "🥉 UECL",
-        45:  "🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup",
-        143: "🇪🇸 Copa Rey",
-        137: "🇮🇹 Coppa Italia",
-    }
+    date_to = (now + timedelta(days=8)).strftime("%Y-%m-%d")
     date_from = now.strftime("%Y-%m-%d")
-    date_to   = (now + timedelta(days=7)).strftime("%Y-%m-%d")
-
     conn = sqlite3.connect(DB_PATH)
     total = 0
 
-    for league_id, comp_name in CUP_CAL.items():
+    # ── FUENTE A: football-data.org (UCL + UEL + ligas principales) ──
+    # Free tier incluye CL (UCL) y EL (UEL) sin restricciones
+    FD_CUPS = {
+        "CL":  (2,   "🏆 UCL"),
+        "EL":  (3,   "🥈 UEL"),
+        "EC":  (848, "🥉 UECL"),  # solo en torneos grandes
+    }
+    if FD_ORG_TOKEN:
+        for fd_code, (league_id, comp_name) in FD_CUPS.items():
+            try:
+                r = requests.get(
+                    f"https://api.football-data.org/v4/competitions/{fd_code}/matches",
+                    headers={"X-Auth-Token": FD_ORG_TOKEN},
+                    params={"dateFrom": date_from, "dateTo": date_to,
+                            "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"},
+                    timeout=12
+                )
+                if r.status_code != 200:
+                    Log.warn(f"fd.org {fd_code}: {r.status_code}", "CAL")
+                    continue
+                data = r.json()
+                matches_fd = data.get("matches", [])
+                for m in matches_fd:
+                    try:
+                        utc_date = m["utcDate"][:10]
+                        fix_id   = str(m["id"])
+                        status   = m["status"]
+                        home     = m["homeTeam"]["name"] or m["homeTeam"].get("shortName","")
+                        away     = m["awayTeam"]["name"] or m["awayTeam"].get("shortName","")
+                        conn.execute("""
+                            INSERT OR REPLACE INTO cup_calendar
+                            (fixture_id, league_id, competition, match_date,
+                             home_team, away_team, status, odd_h, odd_d, odd_a, updated_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """, (fix_id, league_id, comp_name, utc_date,
+                              home, away, status, None, None, None, now.isoformat()))
+                        total += 1
+                    except Exception:
+                        continue
+                Log.ok(f"cup_calendar fd.org {fd_code}: {len(matches_fd)} partidos", "CAL")
+                time.sleep(0.5)  # respetar 10 req/min
+            except Exception as e:
+                Log.warn(f"cup_calendar fd.org {fd_code}: {e}", "CAL")
+
+    # ── FUENTE B: api-football para copas nacionales ──────────────────
+    CUP_APIF = {
+        45:  "🏴󠁧󠁢󠁥󠁮󠁧󠁿 FA Cup",
+        143: "🇪🇸 Copa Rey",
+        137: "🇮🇹 Coppa Italia",
+        529: "🇩🇪 DFB Pokal",
+        66:  "🇫🇷 Coupe France",
+    }
+    for league_id, comp_name in CUP_APIF.items():
         try:
             res = apif_get("fixtures", {
-                "league":  league_id,
-                "season":  2025,
-                "from":    date_from,
-                "to":      date_to,
+                "league": league_id, "season": 2025,
+                "from": date_from, "to": date_to,
             }, headers)
-
             for fix in (res or []):
                 try:
                     fix_date = fix["fixture"]["date"][:10]
@@ -1400,31 +1440,22 @@ def fetch_cup_calendar(headers):
                     status   = fix["fixture"]["status"]["short"]
                     home     = fix["teams"]["home"]["name"]
                     away     = fix["teams"]["away"]["name"]
-                    # Cuotas desde bookmakers si disponibles
-                    oh = od = oa = None
-                    for bk in fix.get("bookmakers", []):
-                        for bet in bk.get("bets", []):
-                            if bet.get("name") == "Match Winner":
-                                for v in bet.get("values", []):
-                                    if v["value"] == "Home": oh = float(v["odd"])
-                                    elif v["value"] == "Draw": od = float(v["odd"])
-                                    elif v["value"] == "Away": oa = float(v["odd"])
                     conn.execute("""
                         INSERT OR REPLACE INTO cup_calendar
                         (fixture_id, league_id, competition, match_date,
                          home_team, away_team, status, odd_h, odd_d, odd_a, updated_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """, (fix_id, league_id, comp_name, fix_date,
-                          home, away, status, oh, od, oa, now.isoformat()))
+                          home, away, status, None, None, None, now.isoformat()))
                     total += 1
                 except Exception:
                     continue
-            Log.ok(f"cup_calendar {comp_name}: {len(res or [])} partidos", "CAL")
+            Log.ok(f"cup_calendar apif {comp_name}: {len(res or [])} partidos", "CAL")
         except Exception as e:
-            Log.warn(f"cup_calendar {comp_name}: {e}", "CAL")
+            Log.warn(f"cup_calendar apif {comp_name}: {e}", "CAL")
 
     conn.commit(); conn.close()
-    Log.ok(f"cup_calendar: {total} partidos próximos cacheados", "CAL")
+    Log.ok(f"cup_calendar: {total} partidos próximos cacheados ({date_from}→{date_to})", "CAL")
     return total
 
 
@@ -3827,6 +3858,35 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
         <div class="sg-val left${aW?' winner':''}">${av}</div>
       </div>`;
     }
+    // ── RECOMENDACIÓN DE APUESTA ──────────────────────────────────────
+    const rec = d.bet_rec;
+    if(rec && rec.has_rec){
+      const top = rec.top;
+      const strColor = top.strength==='FUERTE'?'var(--green)':top.strength==='MODERADA'?'var(--amber)':'var(--muted)';
+      html += `<div style="margin:1rem 0;padding:1rem;background:var(--s2);border-radius:10px;border:1px solid ${strColor}55">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:.5rem">
+          <span style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">📌 Recomendación del modelo</span>
+          <span style="font-family:var(--mono);font-size:.58rem;padding:2px 8px;border-radius:4px;background:${strColor}22;color:${strColor};font-weight:700">${top.strength}</span>
+        </div>
+        <div style="font-size:1rem;font-weight:700;color:${strColor};margin-bottom:.4rem">
+          ${top.selection}
+          <span style="font-family:var(--mono);font-size:.78rem;color:var(--muted);font-weight:400">&nbsp;cuota justa @${top.fair_odd}</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:.68rem;color:var(--text);line-height:1.5;margin-bottom:.6rem">${top.reason}</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div style="font-family:var(--mono);font-size:.7rem;padding:5px 12px;background:${strColor};color:#000;border-radius:6px;font-weight:800">
+            Stake: ${top.stake_pct}% bankroll
+          </div>
+          <div style="font-family:var(--mono);font-size:.62rem;color:var(--muted)">${top.action}</div>
+        </div>
+        ${rec.alternatives && rec.alternatives.length ? `<div style="margin-top:.6rem;font-family:var(--mono);font-size:.58rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.4rem">
+          Alternativas: ${rec.alternatives.map(a=>`<span style="color:var(--text)">${a.selection} @${a.fair_odd}</span> (${a.prob}%)`).join(' &nbsp;·&nbsp; ')}
+        </div>` : ''}
+      </div>`;
+    } else if(rec && !rec.has_rec){
+      html += `<div style="margin:.5rem 0;padding:.6rem 1rem;background:var(--s2);border-radius:8px;border-left:3px solid var(--muted);font-family:var(--mono);font-size:.65rem;color:var(--muted)">${rec.message}</div>`;
+    }
+
     const h2h=d.h2h||{};
     detEl.innerHTML=`
       <div class="md-header">
@@ -4677,6 +4737,117 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(payload)
         except Exception as e: self._json_err(str(e))
 
+def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
+    """
+    Genera una recomendación de apuesta estructurada basada en las probabilidades
+    del modelo. Evalúa 4 mercados y devuelve el mejor pick con su razonamiento.
+    """
+    recs = []
+
+    # ── 1X2 directo ──────────────────────────────────────────────────────
+    for prob, side, label in [(ph,"H","Local"),(pa,"A","Visitante"),(pd_,"D","Empate")]:
+        # Solo si prob modelo es significativamente alta
+        if prob < 0.40: continue
+        fair_odd = round(1/prob, 2)
+        # EV estimado: necesitamos cuota de mercado > fair_odd para tener edge
+        # Sin cuota real, solo recomendamos cuando el modelo tiene alta confianza
+        if prob >= 0.55:
+            recs.append({
+                "market": "1X2", "selection": label, "prob": round(prob*100, 1),
+                "fair_odd": fair_odd,
+                "strength": "FUERTE" if prob >= 0.65 else "MODERADA",
+                "reason": f"Modelo: {prob*100:.0f}% probabilidad. Cuota justa: {fair_odd}",
+                "stake_pct": 2.0 if prob >= 0.65 else 1.0,
+                "priority": prob,
+            })
+
+    # ── Over/Under 2.5 ───────────────────────────────────────────────────
+    total_xg = xh + xa
+    if po >= 0.55:
+        recs.append({
+            "market": "OVER", "selection": "Over 2.5 Goles",
+            "prob": round(po*100, 1), "fair_odd": round(1/po, 2),
+            "strength": "FUERTE" if po >= 0.65 else "MODERADA",
+            "reason": f"xG total {total_xg:.2f} — modelo Over {po*100:.0f}%. Busca cuota > {round(1/po,2)}",
+            "stake_pct": 1.5,
+            "priority": po,
+        })
+    elif pu >= 0.60:
+        recs.append({
+            "market": "UNDER", "selection": "Under 2.5 Goles",
+            "prob": round(pu*100, 1), "fair_odd": round(1/pu, 2),
+            "strength": "FUERTE" if pu >= 0.70 else "MODERADA",
+            "reason": f"xG total {total_xg:.2f} — modelo Under {pu*100:.0f}%. Busca cuota > {round(1/pu,2)}",
+            "stake_pct": 1.5,
+            "priority": pu,
+        })
+
+    # ── BTTS ─────────────────────────────────────────────────────────────
+    if py >= 0.60:
+        recs.append({
+            "market": "BTTS", "selection": "Ambos Marcan: Sí",
+            "prob": round(py*100, 1), "fair_odd": round(1/py, 2),
+            "strength": "MODERADA",
+            "reason": f"xG local {xh:.2f} / visitante {xa:.2f} — ambos con amenaza real",
+            "stake_pct": 1.0,
+            "priority": py * 0.9,  # ligera penalización vs 1X2
+        })
+
+    # ── DC (si hay favorito claro) ────────────────────────────────────────
+    dc_1x = ph + pd_
+    dc_x2 = pd_ + pa
+    if ph >= 0.55 and dc_1x >= 0.75:
+        recs.append({
+            "market": "DC", "selection": "DC: Local o Empate",
+            "prob": round(dc_1x*100, 1), "fair_odd": round(1/dc_1x, 2),
+            "strength": "CONSERVADORA",
+            "reason": f"Local favorito ({ph*100:.0f}% ganar). DC reduce riesgo. Cuota justa: {round(1/dc_1x,2)}",
+            "stake_pct": 1.0,
+            "priority": dc_1x * 0.7,  # penalización — cuota baja
+        })
+    elif pa >= 0.50 and dc_x2 >= 0.75:
+        recs.append({
+            "market": "DC", "selection": "DC: Empate o Visitante",
+            "prob": round(dc_x2*100, 1), "fair_odd": round(1/dc_x2, 2),
+            "strength": "CONSERVADORA",
+            "reason": f"Visitante favorito ({pa*100:.0f}% ganar). DC reduce riesgo. Cuota justa: {round(1/dc_x2,2)}",
+            "stake_pct": 1.0,
+            "priority": dc_x2 * 0.7,
+        })
+
+    if not recs:
+        return {
+            "has_rec": False,
+            "message": "Partido muy equilibrado — sin edge claro para ningún mercado",
+        }
+
+    # Ordenar por prioridad y devolver el top + alternativas
+    recs.sort(key=lambda x: -x["priority"])
+    top = recs[0]
+    return {
+        "has_rec": True,
+        "top": {
+            "market":    top["market"],
+            "selection": top["selection"],
+            "prob":      top["prob"],
+            "fair_odd":  top["fair_odd"],
+            "strength":  top["strength"],
+            "reason":    top["reason"],
+            "stake_pct": top["stake_pct"],
+            "action":    f"Apostar {top['selection']} si cuota > {top['fair_odd']}",
+        },
+        "alternatives": [
+            {"market": r["market"], "selection": r["selection"],
+             "prob": r["prob"], "fair_odd": r["fair_odd"],
+             "strength": r["strength"]}
+            for r in recs[1:3]
+        ],
+        "warning": (
+            "⚠️ Verifica cuota actual antes de apostar — el modelo usa cuota justa estimada"
+        ),
+    }
+
+
     def _serve_analyze(self):
         """API /api/analyze — análisis de partido estilo footystats."""
         try:
@@ -4859,6 +5030,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "away":round(1/pa,2) if pa>0 else None,"over":round(1/po,2) if po>0 else None,
                     "under":round(1/pu,2) if pu>0 else None,"btts_y":round(1/py,2) if py>0 else None},
                 "xg_source": "fbref" if get_fbref_xg(home, div) else "proxy",
+                "bet_rec": _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn),
                 "h2h":{"total":h2h_tot,"home_wins":hwins,"draws":hdraws,"away_wins":awins,
                     "over25":sum(1 for r in h2h_list if r["home_goals"]+r["away_goals"]>2),
                     "btts":sum(1 for r in h2h_list if r["home_goals"]>0 and r["away_goals"]>0),
