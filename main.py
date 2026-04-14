@@ -3040,7 +3040,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:1.2
 .section-title{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.75rem}
 
 /* Tabla de posiciones */
-.table-wrap{overflow-x:auto}
+.table-wrap{overflow-x:auto;overflow-y:visible}
 table{width:100%;border-collapse:collapse;font-size:.75rem}
 thead th{font-family:var(--mono);font-size:.55rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);background:var(--s1);cursor:pointer;white-space:nowrap}
 thead th:hover{color:var(--text)}
@@ -3440,9 +3440,9 @@ header{display:flex;align-items:center;gap:12px;padding:1rem 2rem;border-bottom:
 .c-green{color:var(--green)}.c-red{color:var(--red)}.c-blue{color:var(--accent)}.c-amber{color:var(--amber)}.c-white{color:var(--text)}
 
 /* Tabla de picks */
-.table-wrap{overflow-x:auto}
+.table-wrap{overflow-x:auto;overflow-y:visible}
 table{width:100%;border-collapse:collapse;font-size:.75rem}
-thead th{font-family:var(--mono);font-size:.56rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:9px 14px;text-align:left;border-bottom:1px solid var(--border);background:var(--s1);cursor:pointer;white-space:nowrap;position:sticky;top:57px}
+thead th{font-family:var(--mono);font-size:.56rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);padding:9px 14px;text-align:left;border-bottom:1px solid var(--border);background:var(--s1);cursor:pointer;white-space:nowrap}
 thead th:hover{color:var(--text)}
 thead th.sorted{color:var(--accent)}
 tbody tr{border-bottom:1px solid var(--border);transition:background .1s;cursor:pointer}
@@ -4022,7 +4022,7 @@ async function loadPicks(){
   }catch(e){
     console.error('loadPicks error:',e);
     // Mostrar error en tablas para debugging
-    ['picks-body','hist-body','jornada-body'].forEach(id=>{
+    ['hist-body','jornada-body'].forEach(id=>{
       const el=document.getElementById(id);
       if(el) el.innerHTML=`<tr><td colspan="11" style="color:red;font-family:monospace;font-size:.7rem">Error: ${e.message}</td></tr>`;
     });
