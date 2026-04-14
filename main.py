@@ -479,6 +479,22 @@ def init_db():
         updated_at TEXT,
         UNIQUE(league_id, match_date, home_team, away_team)
     )""")
+    # Migración: agregar columnas nuevas si no existen (ALTER TABLE seguro)
+    _migrations = [
+        ("picks_log",    "ht_alerted",    "INTEGER DEFAULT 0"),
+        ("picks_log",    "clv_captured",  "INTEGER DEFAULT 0"),
+        ("closing_lines","odd_close_ps",  "REAL"),
+        ("closing_lines","clv_pct_ps",    "REAL"),
+        ("closing_lines","odd_close_maxc","REAL"),
+        ("closing_lines","clv_pct_maxc",  "REAL"),
+    ]
+    for table, col, typedef in _migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+            conn.commit()
+        except Exception:
+            pass  # columna ya existe — ignorar
+
     conn.commit(); conn.close()
 
 # ============================================================
@@ -1614,6 +1630,7 @@ def get_true_rest_days(team_name: str, before_date, div: str, df_league=None) ->
     Retorna los días desde el último partido en CUALQUIER competición.
     """
     import difflib as _dl
+    import pandas as pd  # necesario para pd.Timestamp, pd.concat, etc.
     candidates = []
 
     # ── Fuente 1: CSV de liga ─────────────────────────────────────────
