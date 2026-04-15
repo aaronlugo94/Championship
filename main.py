@@ -1428,7 +1428,11 @@ def fetch_live_odds(divs=None):
         return {}
     
     now = datetime.now(timezone.utc)
-    divs = divs or list(ODDS_API_SPORT_MAP.keys())
+    # ODDS_DAILY: ligas con más picks, corridas diarias (17 req/día = 510/mes)  
+    # Usar subset para scheduler diario y lista completa solo al arrancar
+    ODDS_DAILY = ["E0","E1","SP1","D1","I1","F1","N1","P1","B1","T1",
+                  "CUP_2","CUP_3","CUP_848"]  # 13 req/día = 390/mes ✅
+    divs = divs or ODDS_DAILY
     results = {}  # {(home, away, div): {h: odd, d: odd, a: odd, ou: {over: odd, under: odd}}}
     
     conn = sqlite3.connect(DB_PATH)
@@ -3958,6 +3962,12 @@ function matchRowHTML(m){
   const pickBadge=hasPick?`<span class="pick-badge">🎯 ${m.pick.market} @${toUS(m.pick.odd)}</span>`:'';
   const fh=(m.form_h||[]).map(fd).join('');
   const fa=(m.form_a||[]).map(fd).join('');
+  // Pinnacle live odds
+  const pinH=m.pin_h||null, pinA=m.pin_a||null;
+  const pinHus=pinH?toUS(pinH):null, pinAus=pinA?toUS(pinA):null;
+  const fairH=m.ph>0?1/m.ph:null, fairA=m.pa>0?1/m.pa:null;
+  const hasValueH=!!(pinH&&fairH&&pinH>fairH);
+  const hasValueA=!!(pinA&&fairA&&pinA>fairA);
   return `
     <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a,pin_h:m.pin_h,pin_d:m.pin_d,pin_a:m.pin_a,pin_over:m.pin_over,pin_under:m.pin_under,odds_updated:m.odds_updated})}'>
       <div class="mr-time">${m.time||m.date?.slice(5)||''}</div>
