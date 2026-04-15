@@ -188,6 +188,7 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 API_SPORTS_KEY   = os.getenv("API_SPORTS_KEY", "")
 FD_ORG_TOKEN     = os.getenv("FD_ORG_TOKEN", "")
+ODDS_API_KEY     = os.getenv("ODDS_API_KEY", "")   # the-odds-api.com
 
 DB_DIR   = os.getenv("DB_DIR", "./data")
 DATA_DIR = os.path.join(DB_DIR, "csv")   # siempre /app/data/csv — Railway crea el subdir
@@ -209,6 +210,21 @@ RUN_TIME_STANDINGS  = "09:00"   # martes
 # ============================================================
 # CONFIGURACIÓN DE LIGAS
 # ============================================================
+
+# ── The Odds API — mapeo de ligas a sport keys ───────────────────────────────
+ODDS_API_SPORT_MAP = {
+    "E0": "soccer_epl", "E1": "soccer_efl_champ", "E2": "soccer_league_one",
+    "SP1": "soccer_spain_la_liga", "SP2": "soccer_spain_segunda_division",
+    "D1": "soccer_germany_bundesliga", "D2": "soccer_germany_bundesliga2",
+    "I1": "soccer_italy_serie_a", "I2": "soccer_italy_serie_b",
+    "F1": "soccer_france_ligue_one", "F2": "soccer_france_ligue_two",
+    "N1": "soccer_netherlands_eredivisie", "P1": "soccer_portugal_primeira_liga",
+    "B1": "soccer_belgium_first_div", "T1": "soccer_turkey_super_league",
+    "G1": "soccer_greece_super_league", "SC0": "soccer_scotland_premiership",
+    "CUP_2": "soccer_uefa_champs_league",
+    "CUP_3": "soccer_uefa_europa_league",
+    "CUP_848": "soccer_uefa_europa_conference_league",
+}
 
 TARGET_LEAGUES = {
     # ── Europeas — CSV co.uk con shots HST/AST ────────────────────────────
@@ -1397,6 +1413,103 @@ def get_fbref_xg(team_name: str, div: str) -> dict | None:
         Log.warn(f"get_fbref_xg {team_name}: {e}", "FBREF")
         return None
 
+
+
+def fetch_live_odds(divs=None):
+    """
+    Obtiene cuotas en tiempo real de Pinnacle via The Odds API.
+    Guarda en SQLite tabla live_odds para consulta del bot y dashboard.
+    Costo: 1 request por liga. Con 500/mes gratis = 17 ligas/día × 29 días.
+    
+    The Odds API: https://the-odds-api.com
+    Env: ODDS_API_KEY (Railway variable)
+    """
+    if not ODDS_API_KEY:
+        return {}
+    
+    now = datetime.now(timezone.utc)
+    divs = divs or list(ODDS_API_SPORT_MAP.keys())
+    results = {}  # {(home, away, div): {h: odd, d: odd, a: odd, ou: {over: odd, under: odd}}}
+    
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS live_odds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        div TEXT, sport_key TEXT, home_team TEXT, away_team TEXT,
+        commence_time TEXT,
+        pin_h REAL, pin_d REAL, pin_a REAL,
+        pin_over REAL, pin_under REAL,
+        b365_h REAL, b365_d REAL, b365_a REAL,
+        updated_at TEXT,
+        UNIQUE(sport_key, home_team, away_team, commence_time)
+    )""")
+    conn.commit()
+
+    for div, sport_key in ODDS_API_SPORT_MAP.items():
+        if div not in divs: continue
+        try:
+            r = requests.get(
+                f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "eu",
+                    "markets": "h2h,totals",
+                    "bookmakers": "pinnacle,betfair_ex_eu,bet365",
+                    "oddsFormat": "decimal",
+                },
+                timeout=15
+            )
+            remaining = r.headers.get("x-requests-remaining", "?")
+            if r.status_code != 200:
+                Log.warn(f"Odds API {div}: {r.status_code}", "ODDS")
+                continue
+            
+            games = r.json()
+            for game in games:
+                home = game.get("home_team", "")
+                away = game.get("away_team", "")
+                commence = game.get("commence_time", "")[:19]
+                
+                pin_h = pin_d = pin_a = pin_over = pin_under = None
+                b365_h = b365_d = b365_a = None
+                
+                for bk in game.get("bookmakers", []):
+                    bk_key = bk.get("key", "")
+                    for mkt in bk.get("markets", []):
+                        if mkt["key"] == "h2h":
+                            odds_map = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
+                            if bk_key == "pinnacle":
+                                pin_h = odds_map.get(home)
+                                pin_d = odds_map.get("Draw")
+                                pin_a = odds_map.get(away)
+                            elif bk_key == "bet365":
+                                b365_h = odds_map.get(home)
+                                b365_d = odds_map.get("Draw")
+                                b365_a = odds_map.get(away)
+                        elif mkt["key"] == "totals" and bk_key == "pinnacle":
+                            for o in mkt.get("outcomes", []):
+                                if o["name"] == "Over": pin_over = o["price"]
+                                elif o["name"] == "Under": pin_under = o["price"]
+                
+                conn.execute("""
+                    INSERT OR REPLACE INTO live_odds
+                    (div, sport_key, home_team, away_team, commence_time,
+                     pin_h, pin_d, pin_a, pin_over, pin_under,
+                     b365_h, b365_d, b365_a, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (div, sport_key, home, away, commence,
+                      pin_h, pin_d, pin_a, pin_over, pin_under,
+                      b365_h, b365_d, b365_a, now.isoformat()))
+                
+                results[(home, away, div)] = {
+                    "pin_h": pin_h, "pin_d": pin_d, "pin_a": pin_a,
+                    "pin_over": pin_over, "pin_under": pin_under,
+                }
+            Log.ok(f"Odds API {div}: {len(games)} partidos (remaining={remaining})", "ODDS")
+        except Exception as e:
+            Log.warn(f"Odds API {div}: {e}", "ODDS")
+    
+    conn.commit(); conn.close()
+    return results
 
 
 def fetch_cup_calendar(headers):
@@ -3842,11 +3955,11 @@ function matchRowHTML(m){
   const pd=m.pd?`${(m.pd*100).toFixed(0)}%`:'—';
   const pa=m.pa?`${(m.pa*100).toFixed(0)}%`:'—';
   const xg=m.xg_h&&m.xg_a?`${m.xg_h}—${m.xg_a}`:'';
-  const pickBadge=hasPick?`<span class="pick-badge">🎯 ${m.pick.market} @${m.pick.odd.toFixed(2)}</span>`:'';
+  const pickBadge=hasPick?`<span class="pick-badge">🎯 ${m.pick.market} @${toUS(m.pick.odd)}</span>`:'';
   const fh=(m.form_h||[]).map(fd).join('');
   const fa=(m.form_a||[]).map(fd).join('');
   return `
-    <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a})}'>
+    <div class="match-row${hasPick?' has-pick':''}" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a,pin_h:m.pin_h,pin_d:m.pin_d,pin_a:m.pin_a,pin_over:m.pin_over,pin_under:m.pin_under,odds_updated:m.odds_updated})}'>
       <div class="mr-time">${m.time||m.date?.slice(5)||''}</div>
       <div class="mr-home">
         <div class="team-name">${m.home}</div>
@@ -3865,6 +3978,10 @@ function matchRowHTML(m){
       <div class="mr-xg">
         ${m.home_pos&&m.away_pos?`<span style="font-family:var(--mono);font-size:.55rem;color:var(--muted)">#${m.home_pos} vs #${m.away_pos}</span><br>`:''}
         ${xg}
+        ${pinH?`<div style="margin-top:3px;font-size:.58rem;font-family:var(--mono);display:flex;gap:4px;flex-wrap:wrap">
+          <span style="padding:1px 5px;border-radius:3px;background:${hasValueH?'#22c55e22':'#ffffff0a'};color:${hasValueH?'#22c55e':'#64748b'}">${hasValueH?'▲ ':''}${pinHus}</span>
+          ${pinA?`<span style="padding:1px 5px;border-radius:3px;background:${hasValueA?'#22c55e22':'#ffffff0a'};color:${hasValueA?'#22c55e':'#64748b'}">${hasValueA?'▲ ':''}${pinAus}</span>`:''}
+        </div>`:''}
         ${(m.rest_h||m.rest_a)?`<div style="font-family:var(--mono);font-size:.52rem;margin-top:2px">
           <span style="color:${m.rest_h<=4?'var(--red)':m.rest_h>7?'var(--green)':'var(--muted)'}">${m.rest_h?m.rest_h+'d':'-'}</span>
           <span style="color:var(--muted)">vs</span>
@@ -3872,7 +3989,7 @@ function matchRowHTML(m){
         </div>`:''}
       </div>
     </div>
-    <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a})}'>
+    <div class="match-detail" data-home="${m.home}" data-away="${m.away}" data-div="${m.div}" data-match='${JSON.stringify({b365h:m.b365h,b365d:m.b365d,b365a:m.b365a,rest_h:m.rest_h,rest_a:m.rest_a,home_pos:m.home_pos,away_pos:m.away_pos,n_teams:m.n_teams,ph:m.ph,pd:m.pd,pa:m.pa,xg_h:m.xg_h,xg_a:m.xg_a,pin_h:m.pin_h,pin_d:m.pin_d,pin_a:m.pin_a,pin_over:m.pin_over,pin_under:m.pin_under,odds_updated:m.odds_updated})}'>
       <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted)">cargando análisis...</div>
     </div>`;
 }
@@ -3885,7 +4002,7 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
     const hs=d.home_stats, as_=d.away_stats;
     const hh=hs.home, ah=as_.away;
     function pct(v){return v!=null?`${(v*100).toFixed(1)}%`:'—';}
-    function fair(v){return v?`@${v} fair`:''}
+    function fair(v){return v?`${fmtOddS(v)}<span style='opacity:.5;font-size:.8em'> fair</span>`:'' }
     function statRow(lbl,hv,av,hib=true){
       const hN=parseFloat(hv)||0, aN=parseFloat(av)||0;
       const hW=hib?(hN>aN):(hN<aN&&hN!==aN);
@@ -3911,7 +4028,7 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
         </div>
         <div style="padding:1rem">
           <div style="font-size:1.05rem;font-weight:800;color:${strColor};margin-bottom:.3rem">
-            ${top.selection} <span style="font-family:var(--mono);font-size:.75rem;color:var(--muted);font-weight:400">cuota justa @${top.fair_odd}</span>
+            ${top.selection} <span style="font-family:var(--mono);font-size:.75rem;color:var(--muted);font-weight:400">${fmtOddS(top.fair_odd)}<span style="opacity:.5"> fair</span></span>
           </div>
           <div style="font-family:var(--mono);font-size:.65rem;color:var(--muted);margin-bottom:.75rem;line-height:1.6">${top.reason}</div>
 
@@ -3957,8 +4074,8 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
       // DC y DNB ajustados al agregado
       const ph = d.probs?.home||0, pa = d.probs?.away||0, pd_ = d.probs?.draw||0;
       const dc_h = ph + pd_; // DC local (gana o empata en 90min)
-      const fair_dc = dc_h > 0 ? (1/dc_h).toFixed(2) : '—';
-      const fair_dnb = ph > 0 ? (1/ph).toFixed(2) : '—';
+      const fair_dc = dc_h > 0 ? toUS(1/dc_h) : '—';
+      const fair_dnb = ph > 0 ? toUS(1/ph) : '—';
 
       html += `<div style="margin:.5rem 0 1rem;padding:.85rem 1rem;background:var(--s2);border-radius:10px;border-left:3px solid var(--amber)">
         <div style="font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-bottom:.4rem;text-transform:uppercase;letter-spacing:.06em">⚽ Doble partido — Resultado Ida</div>
@@ -3966,13 +4083,13 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
         <div style="font-family:var(--mono);font-size:.68rem;margin-bottom:.6rem">${situation}</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           ${l1h < l1a || l1h === l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
-            DC local @${fair_dc} — ${d.home} gana o empata en 90min → pasa en global
+            DC local ${fmtOddS(fair_dc)} — ${d.home} gana o empata en 90min → pasa en global
           </div>` : ''}
           ${l1h < l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
-            DNB local @${fair_dnb} — ${d.home} necesita ganar (sin devolución en empate)
+            DNB local ${fmtOddS(fair_dnb)} — ${d.home} necesita ganar (sin devolución en empate)
           </div>` : ''}
           ${l1h > l1a ? `<div style="font-family:var(--mono);font-size:.65rem;padding:4px 10px;background:var(--s1);border-radius:5px">
-            DC visita @${(1/(pa+pd_)).toFixed(2)} — ${d.away} remonta empata o gana
+            DC visita ${fmtOddS(1/(pa+pd_))} — ${d.away} remonta empata o gana
           </div>` : ''}
         </div>
       </div>`;
@@ -4172,6 +4289,23 @@ const statusBadge=s=>{
 const evClass=v=>v>=0.10?'ev-h':v>=0.05?'ev-m':'ev-l';
 const evCls=evClass;  // alias usado en renderJornada y renderHistorial
 const resBadge=statusBadge;  // alias usado en renderHistorial
+// Conversión decimal → americana
+const toUS=d=>{
+  if(!d||isNaN(d))return'—';
+  const f=parseFloat(d);
+  if(f<=1.01)return'—';
+  if(f>=2.0) return'+'+(Math.round((f-1)*100));
+  return ''+(Math.round(-100/(f-1)));
+};
+// Mostrar cuota: americana principal + decimal pequeño
+const fmtOdd=d=>{
+  if(!d||isNaN(d))return'—';
+  const us=toUS(d);
+  return `${us}<span style="font-size:.7em;opacity:.5;margin-left:2px">(${parseFloat(d).toFixed(2)})</span>`;
+};
+// Solo americana sin decimal (para espacios pequeños)
+const fmtOddS=d=>toUS(d);
+
 const fmtDate=d=>{
   if(!d||d==='null'||d==='undefined')return'—';
   const s=String(d);
@@ -4239,7 +4373,7 @@ function renderPicks(){
       <td class="muted-td">${p.div||'—'}</td>
       <td class="party">${p.home||''} <span style="color:var(--muted);font-weight:300">vs</span> ${p.away||''}</td>
       <td>${mktBadge(p.market)}</td>
-      <td>@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td>${fmtOddS(p.odd)}</td>
       <td class="${evClass(ev)}">+${(ev*100).toFixed(1)}%</td>
       <td class="muted-td">${prob.toFixed(1)}%</td>
       <td class="muted-td">${stake.toFixed(2)}%</td>
@@ -4284,7 +4418,7 @@ function renderJornada(){
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
       <td style="font-size:.82rem;font-weight:500">${p.home||''} <span style="color:var(--muted)">vs</span> ${p.away||''}</td>
       <td>${mktBadge(p.market)}</td>
-      <td style="font-family:var(--mono)">@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td style="font-family:var(--mono)">${fmtOddS(p.odd)}<br><span style="font-size:.65em;opacity:.45">${parseFloat(p.odd||0).toFixed(2)}</span></td>
       <td class="${evCls(parseFloat(ev))}">+${ev}%</td>
       <td style="color:var(--muted);font-family:var(--mono)">${prob}%</td>
       <td style="color:var(--muted);font-family:var(--mono)">${stake}%</td>
@@ -4341,7 +4475,7 @@ function renderHistorial(){
       <td style="color:var(--muted);font-family:var(--mono);font-size:.7rem">${p.div||'—'}</td>
       <td style="font-size:.82rem;font-weight:500">${p.home||''} <span style="color:var(--muted)">vs</span> ${p.away||''}</td>
       <td>${mktBadge(p.market)}</td>
-      <td style="font-family:var(--mono)">@${parseFloat(p.odd||0).toFixed(2)}</td>
+      <td style="font-family:var(--mono)">${fmtOddS(p.odd)}<br><span style="font-size:.65em;opacity:.45">${parseFloat(p.odd||0).toFixed(2)}</span></td>
       <td class="${evCls(parseFloat(ev))}">${parseFloat(ev)>0?'+':''}${ev}%</td>
       ${clvCell(p.clv_b365)}
       ${clvCell(p.clv_ps)}
@@ -4487,6 +4621,13 @@ setInterval(()=>{
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
+def _dec_to_us(dec):
+    """Decimal → americana: 2.15 → +114, 1.65 → -153"""
+    if not dec or dec <= 1.0: return "—"
+    if dec >= 2.0: return f"+{int((dec-1)*100)}"
+    return f"{int(-100/(dec-1))}"
+
+
 def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
     """
     Recomendación de apuesta basada en el 66% de accuracy del mercado.
@@ -4570,7 +4711,7 @@ def _build_bet_rec(xh, xa, ph, pd_, pa, po, pu, py, pn):
             "priority": prob * (1.3 if prob >= 0.55 else 1.0),
             # La regla de oro para el apostador:
             "action": f"Busca {label} a cuota > {fair_odd} en B365 o Pinnacle",
-            "clv_rule": f"Si cuota actual > {fair_odd} → APUESTA. Si < {fair_odd} → PASA.",
+            "clv_rule": f"Si ves {_dec_to_us(fair_odd)} o mejor → APUESTA. Si no llega → PASA.",
         })
 
     # DC como protección cuando hay favorito claro pero cuota baja
@@ -4648,6 +4789,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             # Partidos de copa: buscar equipos en todas las ligas con cutoff bajo
             is_cup = div.startswith("CUP_")
+            cup_league_id_orig = int(div.replace("CUP_","")) if is_cup else None
             search_divs = list(TARGET_LEAGUES.keys()) if is_cup else (
                 [div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())
             )
@@ -4829,7 +4971,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             leg1_home_goals = leg1_away_goals = None
             if is_cup and FD_ORG_TOKEN:
                 try:
-                    league_id_cup = int(div.replace("CUP_",""))
+                    # cup_league_id_orig se guardó antes de que div cambiara a found_div
+                    if cup_league_id_orig is None:
+                        raise ValueError("no es partido de copa")
+                    league_id_cup = cup_league_id_orig
                     fd_comp = {2:"CL", 3:"EL", 848:"EC"}.get(league_id_cup)
                     if fd_comp:
                         r_fd = requests.get(
@@ -5312,6 +5457,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 Log.warn(f"cup fallback: {e}", "CAL")
 
+            # ── Enriquecer con cuotas Pinnacle actuales de live_odds ────
+            if ODDS_API_KEY:
+                try:
+                    conn_lo = sqlite3.connect(DB_PATH)
+                    lo_rows = conn_lo.execute("""
+                        SELECT home_team, away_team, div, sport_key,
+                               pin_h, pin_d, pin_a, pin_over, pin_under, updated_at
+                        FROM live_odds
+                        WHERE updated_at >= datetime('now', '-6 hours')
+                        ORDER BY updated_at DESC
+                    """).fetchall()
+                    conn_lo.close()
+                    # Índice fuzzy: (home_norm, away_norm) → odds
+                    import difflib as _dl_lo
+                    lo_idx = {}
+                    for row in lo_rows:
+                        lo_idx[(row[0], row[1])] = {
+                            "pin_h": row[4], "pin_d": row[5], "pin_a": row[6],
+                            "pin_over": row[7], "pin_under": row[8],
+                            "odds_updated": row[9],
+                        }
+                    for m in matches:
+                        # Buscar match fuzzy en live_odds
+                        best = None; best_score = 0
+                        for (lh, la), odds in lo_idx.items():
+                            sh = _dl_lo.SequenceMatcher(None, m["home"].lower(), lh.lower()).ratio()
+                            sa = _dl_lo.SequenceMatcher(None, m["away"].lower(), la.lower()).ratio()
+                            score = (sh + sa) / 2
+                            if score > best_score and score > 0.6:
+                                best_score = score; best = odds
+                        if best:
+                            m.update(best)
+                except Exception as _elo:
+                    Log.warn(f"live_odds calendar: {_elo}", "ODDS")
+
             matches.sort(key=lambda x:(x["date"],x["league"]))
             payload=json.dumps({"matches":matches,"dates":dates}).encode()
             self.send_response(200)
@@ -5782,8 +5962,18 @@ if __name__ == "__main__":
         Log.warn(f"cup_calendar startup: {e}", "CAL")
 
     # FBref xG — desactivado: Railway bloqueado (403) por FBref
-    # Usando xG proxy HST×conv_rate (funcionando correctamente)
     Log.warn("FBref xG desactivado — IP de Railway bloqueada por FBref (403). Usando xG proxy.", "FBREF")
+
+    # The Odds API — cuotas Pinnacle en tiempo real
+    if ODDS_API_KEY:
+        try:
+            Log.info("Odds API: descargando cuotas Pinnacle...", "ODDS")
+            fetch_live_odds()
+            Log.ok("Odds API: cuotas cargadas", "ODDS")
+        except Exception as e:
+            Log.warn(f"Odds API startup: {e}", "ODDS")
+    else:
+        Log.warn("ODDS_API_KEY no configurada — sin cuotas Pinnacle en tiempo real", "ODDS")
     bot = TripleLeagueV72()
 
     # Registro de última ejecución por tarea (fecha UTC)
@@ -5824,6 +6014,15 @@ if __name__ == "__main__":
                 nc = fetch_cup_calendar(_h2)
                 Log.ok(f"cup_calendar refresh: {nc} partidos", "CAL")
             except Exception as e: Log.err(f"cup_calendar: {e}", "CAL")
+
+        # 20:00 UTC — actualizar cuotas Pinnacle (D-0 antes de cierre de líneas)
+        if (hh, mm) == (20, 0) and not _ran_today("odds_live"):
+            _mark_ran("odds_live")
+            if ODDS_API_KEY:
+                try:
+                    fetch_live_odds()
+                    Log.ok("Odds API: cuotas actualizadas (20:00 UTC)", "ODDS")
+                except Exception as e: Log.err(f"Odds API: {e}", "ODDS")
 
         # 06:00 — refresh CSVs
         if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
