@@ -4800,19 +4800,123 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Partidos de copa: buscar equipos en todas las ligas con cutoff bajo
             is_cup = div.startswith("CUP_")
             cup_league_id_orig = int(div.replace("CUP_","")) if is_cup else None
-            search_divs = list(TARGET_LEAGUES.keys()) if is_cup else (
-                [div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())
-            )
+            # Para copas, buscar primero en la liga doméstica del equipo
+            # Luego en el resto si no encuentra
+            _CUP_HOME_LEAGUES = {
+                # Premier League
+                "Liverpool": "E0", "Arsenal": "E0", "Man City": "E0",
+                "Man United": "E0", "Chelsea": "E0", "Tottenham": "E0",
+                "Newcastle": "E0", "Aston Villa": "E0",
+                # La Liga
+                "Real Madrid": "SP1", "Barcelona": "SP1", "Atletico Madrid": "SP1",
+                "Sevilla": "SP1", "Villarreal": "SP1", "Sociedad": "SP1",
+                "Betis": "SP1", "Athletic Club": "SP1", "Osasuna": "SP1",
+                # Bundesliga
+                "Bayern Munich": "D1", "Dortmund": "D1", "Leverkusen": "D1",
+                "RB Leipzig": "D1", "Frankfurt": "D1", "Stuttgart": "D1",
+                # Serie A
+                "Inter": "I1", "Milan": "I1", "Juventus": "I1",
+                "Napoli": "I1", "Roma": "I1", "Lazio": "I1", "Atalanta": "I1",
+                # Ligue 1
+                "PSG": "F1", "Monaco": "F1", "Marseille": "F1",
+                "Lyon": "F1", "Lille": "F1", "Rennes": "F1",
+                # Eredivisie
+                "Ajax": "N1", "PSV": "N1", "Feyenoord": "N1",
+                # Primeira Liga
+                "Porto": "P1", "Benfica": "P1", "Sporting": "P1", "Braga": "P1",
+            }
+            if is_cup:
+                # Construir lista de divs: liga doméstica primero
+                h_div = _CUP_HOME_LEAGUES.get(home_search)
+                a_div = _CUP_HOME_LEAGUES.get(away_search)
+                priority_divs = list(dict.fromkeys(
+                    [d for d in [h_div, a_div] if d] +
+                    list(TARGET_LEAGUES.keys())
+                ))
+                search_divs = priority_divs
+            else:
+                search_divs = [div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())
             # Normalizar nombre de copa (e.g. "Liverpool FC" → "Liverpool")
+            # Diccionario de aliases para equipos de copa con nombres largos/raros
+            _CUP_ALIASES = {
+                "paris saint-germain fc": "PSG", "paris saint-germain": "PSG",
+                "paris sg": "PSG", "psg fc": "PSG",
+                "fc barcelona": "Barcelona", "barcelona fc": "Barcelona",
+                "fc bayern münchen": "Bayern Munich", "fc bayern munich": "Bayern Munich",
+                "bayern münchen": "Bayern Munich", "fc bayern": "Bayern Munich",
+                "real madrid cf": "Real Madrid", "real madrid fc": "Real Madrid",
+                "club atlético de madrid": "Atletico Madrid",
+                "club atletico de madrid": "Atletico Madrid",
+                "atletico de madrid": "Atletico Madrid",
+                "sporting cp": "Sporting", "sporting clube": "Sporting",
+                "sporting clube de portugal": "Sporting",
+                "borussia dortmund": "Dortmund", "bvb dortmund": "Dortmund",
+                "manchester city fc": "Man City", "man city fc": "Man City",
+                "manchester united fc": "Man United", "man united fc": "Man United",
+                "tottenham hotspur fc": "Tottenham", "spurs": "Tottenham",
+                "ac milan": "Milan", "associazione calcio milan": "Milan",
+                "fc internazionale": "Inter", "inter milan": "Inter",
+                "internazionale fc": "Inter", "fc inter": "Inter",
+                "juventus fc": "Juventus", "juve": "Juventus",
+                "sevilla fc": "Sevilla", "real betis": "Betis",
+                "villarreal cf": "Villarreal", "real sociedad": "Sociedad",
+                "athletic bilbao": "Athletic Club", "athletic club bilbao": "Athletic Club",
+                "rb leipzig": "RB Leipzig", "rasenballsport leipzig": "RB Leipzig",
+                "bayer 04 leverkusen": "Leverkusen", "bayer leverkusen": "Leverkusen",
+                "eintracht frankfurt": "Frankfurt", "vfb stuttgart": "Stuttgart",
+                "as monaco": "Monaco", "as monaco fc": "Monaco",
+                "stade rennais fc": "Rennes", "stade de reims": "Reims",
+                "olympique marseille": "Marseille", "olympique de marseille": "Marseille",
+                "olympique lyonnais": "Lyon", "ol": "Lyon",
+                "porto fc": "Porto", "fc porto": "Porto",
+                "sl benfica": "Benfica", "sport lisboa e benfica": "Benfica",
+                "sc braga": "Braga", "sporting de braga": "Braga",
+                "celtic fc": "Celtic", "rangers fc": "Rangers",
+                "ajax amsterdam": "Ajax", "ajax fc": "Ajax",
+                "psv eindhoven": "PSV", "psv fc": "PSV",
+                "feyenoord rotterdam": "Feyenoord",
+                "fc bruges": "Bruges", "club brugge kv": "Bruges",
+                # UEL equipos comunes
+                "manchester united": "Man United",
+                "tottenham hotspur": "Tottenham",
+                "rangers fc": "Rangers",
+                "fenerbahce sk": "Fenerbahce", "fenerbahçe": "Fenerbahce",
+                "galatasaray sk": "Galatasaray", "galatasaray as": "Galatasaray",
+                "lazio": "Lazio", "ss lazio": "Lazio",
+                "roma": "Roma", "as roma": "Roma",
+                "frankfurt": "Frankfurt", "eintracht frankfurt": "Frankfurt",
+                "lyon": "Lyon", "olympique lyonnais": "Lyon",
+                "betis": "Betis", "real betis": "Betis",
+                "sociedad": "Sociedad", "real sociedad": "Sociedad",
+                "villarreal cf": "Villarreal",
+                "athletic bilbao": "Athletic Club",
+                # UECL equipos comunes
+                "fiorentina": "Fiorentina", "acf fiorentina": "Fiorentina",
+                "chelsea fc": "Chelsea", "west ham united fc": "West Ham",
+                "bologna fc": "Bologna", "bologna fc 1909": "Bologna",
+                "nice": "Nice", "ogc nice": "Nice",
+                "midtjylland": "Midtjylland", "fc midtjylland": "Midtjylland",
+            }
             def norm_team(name):
-                for suffix in [" FC", " CF", " SC", " AC", " BC", " City", " Town",
-                                " United", " Athletic", " Atlético", " Saint-Germain"]:
-                    if name.endswith(suffix):
+                # Probar alias primero (nombres exactos de fd.org)
+                alias = _CUP_ALIASES.get(name.lower().strip())
+                if alias: return alias
+                # Quitar prefijos FC, AC, etc.
+                for prefix in ["FC ", "AC ", "AS ", "SS ", "SC ", "US "]:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]
+                        break
+                # Quitar sufijos
+                for suffix in [" FC", " CF", " SC", " AC", " BC", " CP",
+                                " City", " Town", " United", " Athletic",
+                                " Atlético", " Saint-Germain", " de Madrid"]:
+                    if name.lower().endswith(suffix.lower()):
                         name = name[:-len(suffix)]
+                        break
                 return name.strip()
             home_search = norm_team(home) if is_cup else home
             away_search = norm_team(away) if is_cup else away
-            cutoff = 0.35 if is_cup else 0.45
+            cutoff = 0.40 if is_cup else 0.45
 
             for d in search_divs:
                 if d in ("BSA","MEX"): continue
@@ -5501,6 +5605,61 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             m.update(best)
                 except Exception as _elo:
                     Log.warn(f"live_odds calendar: {_elo}", "ODDS")
+
+            # ── FUENTE E: live_odds → UEL/UECL y copas sin fd.org ────────
+            # The Odds API ya descargó estos partidos con cuotas Pinnacle
+            # Usarlos como fuente de fixtures cuando fd.org da 403
+            if ODDS_API_KEY:
+                try:
+                    _CUP_SPORT_MAP = {
+                        "soccer_uefa_europa_league":             (3,   "🥈 UEL"),
+                        "soccer_uefa_europa_conference_league":  (848, "🥉 UECL"),
+                        "soccer_uefa_champs_league":             (2,   "🏆 UCL"),
+                    }
+                    conn_lo2 = sqlite3.connect(DB_PATH)
+                    lo_cup = conn_lo2.execute("""
+                        SELECT sport_key, home_team, away_team, commence_time,
+                               pin_h, pin_d, pin_a
+                        FROM live_odds
+                        WHERE sport_key IN (
+                            'soccer_uefa_europa_league',
+                            'soccer_uefa_europa_conference_league',
+                            'soccer_uefa_champs_league'
+                        )
+                        AND updated_at >= datetime('now', '-12 hours')
+                        ORDER BY commence_time
+                    """).fetchall()
+                    conn_lo2.close()
+
+                    for (sk, home, away, commence, pin_h, pin_d, pin_a) in lo_cup:
+                        if not home or not away: continue
+                        fix_date = commence[:10] if commence else None
+                        if not fix_date or fix_date not in dates: continue
+                        league_id, comp_name = _CUP_SPORT_MAP.get(sk, (0, "Copa"))
+                        div_key = f"CUP_{league_id}"
+                        key = f"{div_key}_{fix_date}_{home}_{away}"
+                        if key in seen: continue
+                        seen.add(key)
+                        matches.append({
+                            "date": fix_date,
+                            "div": div_key,
+                            "league": comp_name,
+                            "home": home, "away": away,
+                            "home_form": [], "away_form": [],
+                            "home_stats": {}, "away_stats": {},
+                            "xg_h": None, "xg_a": None,
+                            "ph": None, "pd": None, "pa": None,
+                            "b365h": None, "b365d": None, "b365a": None,
+                            "pin_h": pin_h, "pin_d": pin_d, "pin_a": pin_a,
+                            "picks": [], "home_pos": 0, "away_pos": 0,
+                            "n_teams": 0, "rest_h": None, "rest_a": None,
+                            "is_cup": True, "cup_name": comp_name,
+                            "fixture_id": None, "league_id": league_id,
+                            "odds_updated": None,
+                        })
+                    Log.info(f"live_odds copa: {len(lo_cup)} partidos UEL/UECL/UCL", "CAL")
+                except Exception as _elo2:
+                    Log.warn(f"live_odds copa calendar: {_elo2}", "CAL")
 
             matches.sort(key=lambda x:(x["date"],x["league"]))
             payload=json.dumps({"matches":matches,"dates":dates}).encode()
