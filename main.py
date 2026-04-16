@@ -4819,33 +4819,80 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Partidos de copa: buscar equipos en todas las ligas con cutoff bajo
             is_cup = div.startswith("CUP_")
             cup_league_id_orig = int(div.replace("CUP_","")) if is_cup else None
-            # Para copas, buscar primero en la liga doméstica del equipo
-            # Luego en el resto si no encuentra
+
+            # Normalizar nombres de copa (fd.org usa nombres largos)
+            _CUP_ALIASES = {
+                "paris saint-germain fc":"PSG","paris saint-germain":"PSG","paris sg":"PSG",
+                "fc barcelona":"Barcelona","fc bayern münchen":"Bayern Munich",
+                "fc bayern munich":"Bayern Munich","bayern münchen":"Bayern Munich","fc bayern":"Bayern Munich",
+                "real madrid cf":"Real Madrid","club atlético de madrid":"Atletico Madrid",
+                "club atletico de madrid":"Atletico Madrid","atletico de madrid":"Atletico Madrid",
+                "sporting cp":"Sporting","sporting clube de portugal":"Sporting",
+                "borussia dortmund":"Dortmund","manchester city fc":"Man City",
+                "manchester united fc":"Man United","manchester united":"Man United",
+                "tottenham hotspur fc":"Tottenham","tottenham hotspur":"Tottenham",
+                "ac milan":"Milan","fc internazionale":"Inter","inter milan":"Inter",
+                "internazionale fc":"Inter","juventus fc":"Juventus",
+                "sevilla fc":"Sevilla","real betis":"Betis","real betis balompié":"Betis",
+                "villarreal cf":"Villarreal","real sociedad":"Sociedad",
+                "athletic bilbao":"Athletic Club","athletic club bilbao":"Athletic Club",
+                "rb leipzig":"RB Leipzig","bayer 04 leverkusen":"Leverkusen","bayer leverkusen":"Leverkusen",
+                "eintracht frankfurt":"Frankfurt","vfb stuttgart":"Stuttgart",
+                "sc freiburg":"Freiburg","freiburg sc":"Freiburg",
+                "as monaco":"Monaco","olympique marseille":"Marseille",
+                "olympique de marseille":"Marseille","olympique lyonnais":"Lyon",
+                "porto fc":"Porto","fc porto":"Porto","sl benfica":"Benfica",
+                "sc braga":"Braga","sporting de braga":"Braga",
+                "celtic fc":"Celtic","rangers fc":"Rangers",
+                "fenerbahce sk":"Fenerbahce","fenerbahçe sk":"Fenerbahce",
+                "galatasaray sk":"Galatasaray","galatasaray as":"Galatasaray",
+                "ss lazio":"Lazio","as roma":"Roma","acf fiorentina":"Fiorentina",
+                "bologna fc":"Bologna","bologna fc 1909":"Bologna",
+                "ogc nice":"Nice","stade rennais fc":"Rennes","rc strasbourg":"Strasbourg",
+                "az alkmaar":"AZ Alkmaar","az":"AZ Alkmaar",
+                "psv eindhoven":"PSV","ajax amsterdam":"Ajax",
+                "feyenoord rotterdam":"Feyenoord","club brugge kv":"Bruges",
+                "celta vigo":"Celta Vigo","rc celta":"Celta Vigo",
+                "aston villa fc":"Aston Villa","nottingham forest fc":"Nottingham Forest",
+                "west ham united fc":"West Ham","crystal palace fc":"Crystal Palace",
+                "rayo vallecano":"Rayo Vallecano","fsv mainz 05":"Mainz",
+                "fc midtjylland":"Midtjylland","aek athens fc":"AEK Athens",
+                "shakhtar donetsk":"Shakhtar",
+            }
+            def norm_team(name):
+                alias = _CUP_ALIASES.get(name.lower().strip())
+                if alias: return alias
+                for prefix in ["FC ","AC ","AS ","SS ","SC ","US ","RC ","VfB ","FSV "]:
+                    if name.startswith(prefix):
+                        name = name[len(prefix):]; break
+                for suffix in [" FC"," CF"," SC"," AC"," BC"," CP",
+                               " City"," Town"," United"," Athletic",
+                               " Atlético"," Saint-Germain"," de Madrid"," 05"," 04"]:
+                    if name.lower().endswith(suffix.lower()):
+                        name = name[:-len(suffix)]; break
+                return name.strip()
+            home_search = norm_team(home) if is_cup else home
+            away_search = norm_team(away) if is_cup else away
+            cutoff = 0.40 if is_cup else 0.45
+
             _CUP_HOME_LEAGUES = {
-                # Premier League
-                "Liverpool": "E0", "Arsenal": "E0", "Man City": "E0",
-                "Man United": "E0", "Chelsea": "E0", "Tottenham": "E0",
-                "Newcastle": "E0", "Aston Villa": "E0",
-                # La Liga
-                "Real Madrid": "SP1", "Barcelona": "SP1", "Atletico Madrid": "SP1",
-                "Sevilla": "SP1", "Villarreal": "SP1", "Sociedad": "SP1",
-                "Betis": "SP1", "Athletic Club": "SP1", "Osasuna": "SP1",
-                # Bundesliga
-                "Bayern Munich": "D1", "Dortmund": "D1", "Leverkusen": "D1",
-                "RB Leipzig": "D1", "Frankfurt": "D1", "Stuttgart": "D1",
-                # Serie A
-                "Inter": "I1", "Milan": "I1", "Juventus": "I1",
-                "Napoli": "I1", "Roma": "I1", "Lazio": "I1", "Atalanta": "I1",
-                # Ligue 1
-                "PSG": "F1", "Monaco": "F1", "Marseille": "F1",
-                "Lyon": "F1", "Lille": "F1", "Rennes": "F1",
-                # Eredivisie
-                "Ajax": "N1", "PSV": "N1", "Feyenoord": "N1",
-                # Primeira Liga
-                "Porto": "P1", "Benfica": "P1", "Sporting": "P1", "Braga": "P1",
+                "Liverpool":"E0","Arsenal":"E0","Man City":"E0","Man United":"E0",
+                "Chelsea":"E0","Tottenham":"E0","Newcastle":"E0","Aston Villa":"E0",
+                "Nottingham Forest":"E0","West Ham":"E0",
+                "Real Madrid":"SP1","Barcelona":"SP1","Atletico Madrid":"SP1",
+                "Sevilla":"SP1","Villarreal":"SP1","Sociedad":"SP1",
+                "Betis":"SP1","Athletic Club":"SP1","Celta Vigo":"SP1","Osasuna":"SP1",
+                "Bayern Munich":"D1","Dortmund":"D1","Leverkusen":"D1",
+                "RB Leipzig":"D1","Frankfurt":"D1","Stuttgart":"D1","Freiburg":"D1",
+                "Inter":"I1","Milan":"I1","Juventus":"I1","Napoli":"I1",
+                "Roma":"I1","Lazio":"I1","Atalanta":"I1","Fiorentina":"I1","Bologna":"I1",
+                "PSG":"F1","Monaco":"F1","Marseille":"F1","Lyon":"F1",
+                "Lille":"F1","Nice":"F1","Strasbourg":"F1","Rennes":"F1",
+                "Ajax":"N1","PSV":"N1","Feyenoord":"N1","AZ Alkmaar":"N1",
+                "Porto":"P1","Benfica":"P1","Sporting":"P1","Braga":"P1",
+                "Rangers":"SC0","Celtic":"SC0","Galatasaray":"T1","Fenerbahce":"T1",
             }
             if is_cup:
-                # Construir lista de divs: liga doméstica primero
                 h_div = _CUP_HOME_LEAGUES.get(home_search)
                 a_div = _CUP_HOME_LEAGUES.get(away_search)
                 priority_divs = list(dict.fromkeys(
@@ -4855,87 +4902,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 search_divs = priority_divs
             else:
                 search_divs = [div] if div in TARGET_LEAGUES else list(TARGET_LEAGUES.keys())
-            # Normalizar nombre de copa (e.g. "Liverpool FC" → "Liverpool")
-            # Diccionario de aliases para equipos de copa con nombres largos/raros
-            _CUP_ALIASES = {
-                "paris saint-germain fc": "PSG", "paris saint-germain": "PSG",
-                "paris sg": "PSG", "psg fc": "PSG",
-                "fc barcelona": "Barcelona", "barcelona fc": "Barcelona",
-                "fc bayern münchen": "Bayern Munich", "fc bayern munich": "Bayern Munich",
-                "bayern münchen": "Bayern Munich", "fc bayern": "Bayern Munich",
-                "real madrid cf": "Real Madrid", "real madrid fc": "Real Madrid",
-                "club atlético de madrid": "Atletico Madrid",
-                "club atletico de madrid": "Atletico Madrid",
-                "atletico de madrid": "Atletico Madrid",
-                "sporting cp": "Sporting", "sporting clube": "Sporting",
-                "sporting clube de portugal": "Sporting",
-                "borussia dortmund": "Dortmund", "bvb dortmund": "Dortmund",
-                "manchester city fc": "Man City", "man city fc": "Man City",
-                "manchester united fc": "Man United", "man united fc": "Man United",
-                "tottenham hotspur fc": "Tottenham", "spurs": "Tottenham",
-                "ac milan": "Milan", "associazione calcio milan": "Milan",
-                "fc internazionale": "Inter", "inter milan": "Inter",
-                "internazionale fc": "Inter", "fc inter": "Inter",
-                "juventus fc": "Juventus", "juve": "Juventus",
-                "sevilla fc": "Sevilla", "real betis": "Betis",
-                "villarreal cf": "Villarreal", "real sociedad": "Sociedad",
-                "athletic bilbao": "Athletic Club", "athletic club bilbao": "Athletic Club",
-                "rb leipzig": "RB Leipzig", "rasenballsport leipzig": "RB Leipzig",
-                "bayer 04 leverkusen": "Leverkusen", "bayer leverkusen": "Leverkusen",
-                "eintracht frankfurt": "Frankfurt", "vfb stuttgart": "Stuttgart",
-                "as monaco": "Monaco", "as monaco fc": "Monaco",
-                "stade rennais fc": "Rennes", "stade de reims": "Reims",
-                "olympique marseille": "Marseille", "olympique de marseille": "Marseille",
-                "olympique lyonnais": "Lyon", "ol": "Lyon",
-                "porto fc": "Porto", "fc porto": "Porto",
-                "sl benfica": "Benfica", "sport lisboa e benfica": "Benfica",
-                "sc braga": "Braga", "sporting de braga": "Braga",
-                "celtic fc": "Celtic", "rangers fc": "Rangers",
-                "ajax amsterdam": "Ajax", "ajax fc": "Ajax",
-                "psv eindhoven": "PSV", "psv fc": "PSV",
-                "feyenoord rotterdam": "Feyenoord",
-                "fc bruges": "Bruges", "club brugge kv": "Bruges",
-                # UEL equipos comunes
-                "manchester united": "Man United",
-                "tottenham hotspur": "Tottenham",
-                "rangers fc": "Rangers",
-                "fenerbahce sk": "Fenerbahce", "fenerbahçe": "Fenerbahce",
-                "galatasaray sk": "Galatasaray", "galatasaray as": "Galatasaray",
-                "lazio": "Lazio", "ss lazio": "Lazio",
-                "roma": "Roma", "as roma": "Roma",
-                "frankfurt": "Frankfurt", "eintracht frankfurt": "Frankfurt",
-                "lyon": "Lyon", "olympique lyonnais": "Lyon",
-                "betis": "Betis", "real betis": "Betis",
-                "sociedad": "Sociedad", "real sociedad": "Sociedad",
-                "villarreal cf": "Villarreal",
-                "athletic bilbao": "Athletic Club",
-                # UECL equipos comunes
-                "fiorentina": "Fiorentina", "acf fiorentina": "Fiorentina",
-                "chelsea fc": "Chelsea", "west ham united fc": "West Ham",
-                "bologna fc": "Bologna", "bologna fc 1909": "Bologna",
-                "nice": "Nice", "ogc nice": "Nice",
-                "midtjylland": "Midtjylland", "fc midtjylland": "Midtjylland",
-            }
-            def norm_team(name):
-                # Probar alias primero (nombres exactos de fd.org)
-                alias = _CUP_ALIASES.get(name.lower().strip())
-                if alias: return alias
-                # Quitar prefijos FC, AC, etc.
-                for prefix in ["FC ", "AC ", "AS ", "SS ", "SC ", "US "]:
-                    if name.startswith(prefix):
-                        name = name[len(prefix):]
-                        break
-                # Quitar sufijos
-                for suffix in [" FC", " CF", " SC", " AC", " BC", " CP",
-                                " City", " Town", " United", " Athletic",
-                                " Atlético", " Saint-Germain", " de Madrid"]:
-                    if name.lower().endswith(suffix.lower()):
-                        name = name[:-len(suffix)]
-                        break
-                return name.strip()
-            home_search = norm_team(home) if is_cup else home
-            away_search = norm_team(away) if is_cup else away
-            cutoff = 0.40 if is_cup else 0.45
 
             for d in search_divs:
                 if d in ("BSA","MEX"): continue
