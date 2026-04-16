@@ -1509,6 +1509,25 @@ def fetch_live_odds(divs=None):
                     "pin_over": pin_over, "pin_under": pin_under,
                 }
             Log.ok(f"Odds API {div}: {len(games)} partidos (remaining={remaining})", "ODDS")
+            # Guardar partidos de copa en cup_calendar para persistencia
+            if div.startswith("CUP_"):
+                try:
+                    league_id_save = int(div.replace("CUP_",""))
+                    comp_name_save = {2:"🏆 UCL", 3:"🥈 UEL", 848:"🥉 UECL"}.get(league_id_save, div)
+                    conn_cc = sqlite3.connect(DB_PATH)
+                    for game in games:
+                        fix_date = game.get("commence_time","")[:10]
+                        if not fix_date: continue
+                        conn_cc.execute("""
+                            INSERT OR IGNORE INTO cup_calendar
+                            (fixture_id, league_id, competition, match_date,
+                             home_team, away_team, status, updated_at)
+                            VALUES (?,?,?,?,?,?,?,?)
+                        """, (game.get("id",""), league_id_save, comp_name_save, fix_date,
+                              game.get("home_team",""), game.get("away_team",""),
+                              "SCHEDULED", datetime.now(timezone.utc).isoformat()))
+                    conn_cc.commit(); conn_cc.close()
+                except Exception: pass
         except Exception as e:
             Log.warn(f"Odds API {div}: {e}", "ODDS")
     
@@ -5626,7 +5645,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             'soccer_uefa_europa_conference_league',
                             'soccer_uefa_champs_league'
                         )
-                        AND updated_at >= datetime('now', '-12 hours')
                         ORDER BY commence_time
                     """).fetchall()
                     conn_lo2.close()
@@ -5658,6 +5676,53 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             "odds_updated": None,
                         })
                     Log.info(f"live_odds copa: {len(lo_cup)} partidos UEL/UECL/UCL", "CAL")
+                    # Si live_odds está vacío, intentar fetch inmediato
+                    if len(lo_cup) == 0 and ODDS_API_KEY:
+                        Log.info("live_odds vacío — fetching UEL/UECL ahora...", "CAL")
+                        try:
+                            fetch_live_odds(["CUP_2","CUP_3","CUP_848"])
+                            # Re-intentar query
+                            conn_lo3 = sqlite3.connect(DB_PATH)
+                            lo_cup = conn_lo3.execute("""
+                                SELECT sport_key, home_team, away_team, commence_time,
+                                       pin_h, pin_d, pin_a
+                                FROM live_odds
+                                WHERE sport_key IN (
+                                    'soccer_uefa_europa_league',
+                                    'soccer_uefa_europa_conference_league',
+                                    'soccer_uefa_champs_league'
+                                )
+                                ORDER BY commence_time
+                            """).fetchall()
+                            conn_lo3.close()
+                            Log.ok(f"live_odds copa retry: {len(lo_cup)} partidos", "CAL")
+                            # Agregar los partidos recién fetched
+                            for (sk, home, away, commence, pin_h, pin_d, pin_a) in lo_cup:
+                                if not home or not away: continue
+                                fix_date = commence[:10] if commence else None
+                                if not fix_date or fix_date not in dates: continue
+                                league_id2, comp_name2 = _CUP_SPORT_MAP.get(sk, (0,"Copa"))
+                                div_key2 = f"CUP_{league_id2}"
+                                key2 = f"{div_key2}_{fix_date}_{home}_{away}"
+                                if key2 in seen: continue
+                                seen.add(key2)
+                                matches.append({
+                                    "date": fix_date, "div": div_key2,
+                                    "league": comp_name2, "home": home, "away": away,
+                                    "home_form": [], "away_form": [],
+                                    "home_stats": {}, "away_stats": {},
+                                    "xg_h": None, "xg_a": None,
+                                    "ph": None, "pd": None, "pa": None,
+                                    "b365h": None, "b365d": None, "b365a": None,
+                                    "pin_h": pin_h, "pin_d": pin_d, "pin_a": pin_a,
+                                    "picks": [], "home_pos": 0, "away_pos": 0,
+                                    "n_teams": 0, "rest_h": None, "rest_a": None,
+                                    "is_cup": True, "cup_name": comp_name2,
+                                    "fixture_id": None, "league_id": league_id2,
+                                    "odds_updated": None,
+                                })
+                        except Exception as _er:
+                            Log.warn(f"live_odds retry: {_er}", "CAL")
                 except Exception as _elo2:
                     Log.warn(f"live_odds copa calendar: {_elo2}", "CAL")
 
