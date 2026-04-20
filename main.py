@@ -4084,6 +4084,15 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
           </div>` : ''}
 
           ${rec.tip ? `<div style="margin-top:.6rem;font-family:var(--mono);font-size:.6rem;color:var(--accent);line-height:1.5">${rec.tip}</div>` : ''}
+          <button id="btn-log-pick"
+            onclick="logPick(this,'${encodeURIComponent(JSON.stringify({
+              home:d.home,away:d.away,div:d.div||'',league:d.league||'',
+              market:top.market,selection:top.selection,
+              odd:top.fair_odd,prob:top.prob/100
+            }))}',${d.xg_home||0},${d.xg_away||0},${top.prob/100},${top.fair_odd})"
+            style="margin-top:.75rem;width:100%;padding:9px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-family:var(--mono);font-size:.72rem;font-weight:700;cursor:pointer;letter-spacing:.03em;transition:opacity .15s">
+            📝 Registrar Pick en historial
+          </button>
         </div>
       </div>`;
     } else if(rec && !rec.has_rec){
@@ -4256,6 +4265,40 @@ async function loadMatchDetail(detEl, home, away, div, m={}){
       </div>`:''}`;
   }catch(e){
     detEl.innerHTML=`<div style="color:var(--red);font-family:var(--mono);font-size:.7rem">Error: ${e.message}</div>`;
+  }
+}
+
+async function logPick(btn, dataStr, xgH, xgA, prob, odd){
+  btn.disabled = true;
+  btn.textContent = '⏳ Registrando...';
+  try{
+    const data = JSON.parse(decodeURIComponent(dataStr));
+    const ev = Math.max(0, (prob * odd) - 1);
+    const params = new URLSearchParams({
+      home:      data.home,
+      away:      data.away,
+      div:       data.div||'',
+      market:    data.market,
+      selection: data.selection,
+      odd:       odd,
+      prob:      prob,
+      ev:        ev,
+      xg_h:      xgH,
+      xg_a:      xgA,
+    });
+    const r = await fetch('/api/log_pick?' + params.toString());
+    const d = await r.json();
+    if(d.ok){
+      btn.textContent = '✅ ' + d.msg;
+      btn.style.background = 'var(--green)';
+    } else {
+      btn.textContent = '⚠️ ' + d.msg;
+      btn.style.background = 'var(--amber)';
+      btn.disabled = false;
+    }
+  } catch(e){
+    btn.textContent = '❌ Error: ' + e.message;
+    btn.disabled = false;
   }
 }
 
@@ -5760,6 +5803,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_fbref_status()
             elif self.path.startswith("/api/picks_summary"):
                 self._serve_picks_summary()
+            elif self.path.startswith("/api/log_pick"):
+                self._serve_log_pick()
             else:
                 self.send_response(404); self.end_headers()
         except Exception as _e:
@@ -6091,7 +6136,65 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = json.dumps({"error": msg}).encode()
         self.send_response(500)
         self.send_header("Content-Type","application/json")
+        self.send_header("Access-Control-Allow-Origin","*")
         self.end_headers(); self.wfile.write(payload)
+
+    def _serve_log_pick(self):
+        """POST /api/log_pick — registra pick manual desde panel de análisis."""
+        try:
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            def g(k, default=None):
+                v = qs.get(k, [default])[0]
+                return v if v not in (None,"","null","undefined") else default
+            home=g("home"); away=g("away"); div=g("div","")
+            market=g("market"); selection=g("selection")
+            odd=float(g("odd",0) or 0); prob=float(g("prob",0) or 0)
+            ev=float(g("ev",0) or 0); ko_str=g("ko","")
+            xg_h=float(g("xg_h",0) or 0); xg_a=float(g("xg_a",0) or 0)
+            if not home or not away or not market or odd<=1.0:
+                self._json_err("Faltan datos"); return
+            ev_dec = ev if ev<1 else ev/100
+            stake  = kelly_urs(ev_dec, odd, market)
+            now = datetime.now(timezone.utc)
+            conn = sqlite3.connect(DB_PATH)
+            existing = conn.execute(
+                "SELECT id FROM picks_log WHERE home_team=? AND away_team=? AND market=? AND result='PENDING'",
+                (home, away, market)).fetchone()
+            if existing:
+                conn.close()
+                payload = json.dumps({"ok":False,"msg":"Pick ya registrado","id":existing[0]}).encode()
+            else:
+                cfg = TARGET_LEAGUES.get(div,{})
+                c = conn.cursor()
+                c.execute("""INSERT INTO picks_log
+                    (fixture_id,league,div,home_team,away_team,market,selection,
+                     odd_open,prob_model,ev_open,stake_pct,xg_home,xg_away,xg_total,
+                     xg_source,pick_time,kickoff_time,clv_captured,result,profit)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'PENDING',0)""",
+                    (None,cfg.get("name",div),div,home,away,market,selection,
+                     odd,prob,ev_dec,stake,xg_h,xg_a,round(xg_h+xg_a,2),
+                     "proxy",now.isoformat(),ko_str))
+                pid = c.lastrowid
+                conn.commit(); conn.close()
+                try:
+                    nl = "\n"
+                    msg = (f"📝 Pick Manual{nl}⚽ {home} vs {away}{nl}"
+                           f"🎯 {market}: {selection} @ {_dec_to_us(odd)} ({odd:.2f}){nl}"
+                           f"📊 EV: {ev_dec*100:.1f}% | Stake: {stake*100:.2f}%{nl}"
+                           f"🔢 Pick #{pid}")
+                    send_msg(msg)
+                except: pass
+                Log.ok(f"Pick manual #{pid}: {home} vs {away} {market} @{odd:.2f}","PICK")
+                payload = json.dumps({"ok":True,"id":pid,
+                    "msg":f"{market} {selection} @ {_dec_to_us(odd)} registrado"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers(); self.wfile.write(payload)
+        except Exception as e:
+            import traceback; Log.err(f"log_pick: {e} " + traceback.format_exc(),"PICK")
+            self._json_err(str(e))
 
     def _serve_stats_html(self):
         self.send_response(200)
