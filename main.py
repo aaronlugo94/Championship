@@ -2537,8 +2537,35 @@ class TripleLeagueV72:
             Log.err(f"burn-in eval: {e}", "BURNIN")
 
     def _filter(self, probs, label, fid, h_n, a_n, ko, xh, xa, xt, conf, src, div, ts):
-        """Aplica filtros y retorna candidatos válidos listos para el portfolio."""
+        """
+        Aplica filtros y retorna candidatos válidos.
+        Incluye filtro CLV en tiempo real: si Pinnacle actual < cuota justa → SKIP.
+        """
         cands=[]
+
+        # Cargar cuotas Pinnacle actuales para este partido (1 query SQLite)
+        pin_odds = {}
+        if ODDS_API_KEY:
+            try:
+                import difflib as _dlf
+                conn_f = sqlite3.connect(DB_PATH)
+                pin_rows = conn_f.execute("""
+                    SELECT pin_h, pin_d, pin_a, pin_over, pin_under, home_team, away_team
+                    FROM live_odds WHERE div=?
+                    AND updated_at >= datetime('now', '-18 hours')
+                    ORDER BY updated_at DESC LIMIT 20
+                """, (div,)).fetchall()
+                conn_f.close()
+                # Fuzzy match para encontrar el partido correcto
+                for ph,pd,pa,po,pu,lh,la in pin_rows:
+                    sh = _dlf.SequenceMatcher(None,h_n.lower(),lh.lower()).ratio()
+                    sa = _dlf.SequenceMatcher(None,a_n.lower(),la.lower()).ratio()
+                    if sh > 0.55 and sa > 0.55:
+                        pin_odds = {"H":ph,"D":pd,"A":pa,"O25":po,"U25":pu}
+                        break
+            except Exception:
+                pass
+
         for item in probs:
             ev=(item["prob"]*item["odd"])-1
             ok2,fail=sanity(item["prob"],item["mkt"],item["odd"])
@@ -2548,6 +2575,40 @@ class TripleLeagueV72:
             if ev>MAX_EV:   log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
             k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
             if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
+
+            # ── FILTRO CLV EN TIEMPO REAL ────────────────────────────────
+            # Cuota justa del modelo = 1 / prob
+            # Si Pinnacle actual < cuota justa → mercado ya lo descuenta → SKIP
+            if pin_odds:
+                fair_odd = round(1 / item["prob"], 3) if item["prob"] > 0.01 else None
+                mkt = item["mkt"]
+                pin_ref = None
+                if mkt in ("1X2","DC","DNB"):
+                    sel = item.get("pick","")
+                    if h_n in sel or "Local" in sel or "1X" in sel:
+                        pin_ref = pin_odds.get("H")
+                    elif a_n in sel or "Visitante" in sel or "X2" in sel:
+                        pin_ref = pin_odds.get("A")
+                    else:
+                        pin_ref = pin_odds.get("D")
+                elif mkt == "OVER":
+                    pin_ref = pin_odds.get("O25")
+                elif mkt == "UNDER":
+                    pin_ref = pin_odds.get("U25")
+
+                if pin_ref and fair_odd and pin_ref < fair_odd * 0.97:
+                    # Pinnacle está 3%+ por debajo de nuestro fair value
+                    # = mercado ya sabe más → no apostar
+                    clv_now = round((item["odd"] / pin_ref - 1) * 100, 1)
+                    log_rej(label, mkt, item["odd"], ev,
+                            f"PIN_BAJO: Pinnacle={pin_ref:.2f} < fair={fair_odd:.2f} CLV={clv_now:+.1f}%")
+                    print(f"     ⛔ {mkt} CLV negativo vs Pinnacle ({pin_ref:.2f} < {fair_odd:.2f}) → SKIP",
+                          flush=True)
+                    continue
+                elif pin_ref and fair_odd:
+                    clv_live = round((item["odd"] / pin_ref - 1) * 100, 1)
+                    print(f"     📊 {mkt} CLV live vs PIN: {clv_live:+.1f}%", flush=True)
+
             print(f"     ✅ {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.3f}",flush=True)
             cands.append({**item,"ev":ev,"base_stake":k,"urs":urs,
                           "conf":conf,"xg_src":src,
@@ -2558,8 +2619,21 @@ class TripleLeagueV72:
         return cands
 
     def _save_pick(self, p, today_str, conn_c):
-        """Guarda pick en DB y CSV de auditoría. INSERT OR IGNORE previene duplicados."""
+        """
+        Guarda pick en DB y CSV de auditoría.
+        Mientras burn-in incompleto (p-value > 0.10): stake máximo 0.5% flat.
+        Kelly completo solo cuando p < 0.10 y BR > 52%.
+        """
         cfg_p=TARGET_LEAGUES.get(p["div"],{})
+        # Limitar stake durante burn-in
+        if not LIVE_TRADING:
+            # Dry run: usar stake calculado por Kelly para calibrar
+            final_stake = p.get("final_stake", p.get("base_stake", 0) * KELLY)
+        else:
+            # Live pero burn-in incompleto → stake flat conservador
+            final_stake = min(p.get("final_stake", 0.005), 0.005)  # máx 0.5%
+        p = {**p, "final_stake": final_stake}
+
         conn_c.execute("""INSERT OR IGNORE INTO picks_log
             (fixture_id,league,div,home_team,away_team,market,selection,
              odd_open,prob_model,ev_open,stake_pct,
@@ -2647,14 +2721,20 @@ class TripleLeagueV72:
         reset_req(); _CSV_MEM.clear(); _TREND_MEM.clear()
 
         now_utc   = datetime.now(timezone.utc)
+        today     = now_utc.strftime("%Y-%m-%d")
         tomorrow  = (now_utc+timedelta(days=1)).strftime("%Y-%m-%d")
         day_after = (now_utc+timedelta(days=2)).strftime("%Y-%m-%d")
         today_str = now_utc.strftime("%d/%m/%Y")
-        # Los viernes ampliar a D+3 para capturar partidos del sábado completo
-        # fixtures.csv se actualiza viernes — el sábado puede quedar sin picks
-        scan_dates = [tomorrow, day_after]
-        if now_utc.weekday() == 4:  # viernes UTC
+        # Siempre incluir HOY (para scans de 10:30 y 14:00 que cubren partidos vespertinos)
+        # + D+1 y D+2 para planificar picks con anticipación
+        # Los jueves y viernes agregar D+3 para cubrir el fin de semana completo
+        scan_dates = [today, tomorrow, day_after]
+        if now_utc.weekday() in (3, 4):  # jueves o viernes UTC
             scan_dates.append((now_utc+timedelta(days=3)).strftime("%Y-%m-%d"))
+        if now_utc.weekday() == 3:       # jueves — también D+4 para el domingo
+            scan_dates.append((now_utc+timedelta(days=4)).strftime("%Y-%m-%d"))
+        # Evitar duplicados
+        scan_dates = list(dict.fromkeys(scan_dates))
         preliminary = []
 
         Log.scan_start(scan_dates)
