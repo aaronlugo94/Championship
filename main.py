@@ -5839,9 +5839,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             """)
             rows = c.fetchall()
 
-            # CLV lookup — join por fixture_id que existe en ambas tablas
+            # CLV lookup — dos fuentes:
+            # A) closing_lines (capturado en tiempo real el día del partido)
+            # B) CSV histórico de co.uk (B365C, PSC, MaxC para picks pasados)
             clv_map = {}
             try:
+                # Fuente A: closing_lines ya capturadas
                 clv_rows = conn.execute("""
                     SELECT p.id, cl.clv_pct, cl.clv_pct_ps, cl.clv_pct_maxc
                     FROM picks_log p
@@ -5854,7 +5857,91 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 for row in clv_rows:
                     clv_map[row[0]] = (row[1], row[2], row[3])
             except Exception:
-                pass  # CLV no disponible aún — OK
+                pass
+
+            # Fuente B: CSV histórico — calcular CLV para picks sin closing_lines
+            try:
+                import pandas as pd, os, difflib as _dl
+                no_clv_picks = conn.execute("""
+                    SELECT id, div, home_team, away_team, market, selection,
+                           odd_open, pick_time
+                    FROM picks_log
+                    WHERE result IN ('WIN','LOSS')
+                    AND id NOT IN (SELECT p.id FROM picks_log p
+                                   JOIN closing_lines cl
+                                   ON cl.fixture_id=p.fixture_id
+                                   AND cl.market=p.market
+                                   AND cl.selection=p.selection)
+                """).fetchall()
+
+                # Cargar CSVs ya descargados
+                csv_cache = {}
+                for pid, div, home, away, mkt, sel, odd_open, pick_time in no_clv_picks:
+                    if pid in clv_map: continue
+                    if div not in csv_cache:
+                        path = os.path.join(DATA_DIR, f"{div}.csv")
+                        if not os.path.exists(path): continue
+                        try:
+                            try:    df_c = pd.read_csv(path, encoding="utf-8-sig")
+                            except: df_c = pd.read_csv(path, encoding="latin-1")
+                            df_c.columns = df_c.columns.str.strip()
+                            df_c = df_c.rename(columns={"Home":"HomeTeam","Away":"AwayTeam",
+                                                        "HG":"FTHG","AG":"FTAG"})
+                            df_c["Date"] = pd.to_datetime(df_c["Date"], dayfirst=True, errors="coerce")
+                            csv_cache[div] = df_c.dropna(subset=["FTHG","FTAG"])
+                        except: continue
+                    df = csv_cache.get(div)
+                    if df is None: continue
+                    # Buscar partido por equipos (fuzzy)
+                    teams_h = df["HomeTeam"].unique()
+                    teams_a = df["AwayTeam"].unique()
+                    mh = _dl.get_close_matches(home, teams_h, n=1, cutoff=0.6)
+                    ma = _dl.get_close_matches(away, teams_a, n=1, cutoff=0.6)
+                    if not mh or not ma: continue
+                    match_rows = df[(df["HomeTeam"]==mh[0]) & (df["AwayTeam"]==ma[0])]
+                    if match_rows.empty: continue
+                    row_m = match_rows.iloc[-1]  # último enfrentamiento
+
+                    def _safe(col):
+                        try: v = float(row_m.get(col, 0) or 0); return v if v > 1.01 else None
+                        except: return None
+
+                    # Cuota cierre B365
+                    if mkt in ("1X2","DC"):
+                        if "Empate" in sel or sel == "D":
+                            oc_b  = _safe("B365CD")
+                            oc_ps = _safe("PSCD")   # Pinnacle cierre empate
+                            oc_mx = _safe("MaxCD")
+                        elif home in sel or sel == "H":
+                            oc_b  = _safe("B365CH")
+                            oc_ps = _safe("PSCH")   # Pinnacle cierre
+                            oc_mx = _safe("MaxCH")
+                        else:
+                            oc_b  = _safe("B365CA")
+                            oc_ps = _safe("PSCA")   # Pinnacle cierre
+                            oc_mx = _safe("MaxCA")
+                    elif mkt in ("OVER","UNDER"):
+                        if mkt == "OVER":
+                            oc_b  = _safe("B365C>2.5")
+                            oc_ps = _safe("MaxC>2.5")   # mejor proxy para Pinnacle O/U
+                            oc_mx = _safe("MaxC>2.5")
+                        else:
+                            oc_b  = _safe("B365C<2.5")
+                            oc_ps = _safe("MaxC<2.5")
+                            oc_mx = _safe("MaxC<2.5")
+                    else:
+                        oc_b = oc_ps = oc_mx = None
+
+                    if not oc_b and not oc_ps: continue
+                    oc_ref = oc_b or oc_ps
+                    clv_b365 = round((odd_open/oc_b  - 1)*100, 1) if oc_b  and oc_b  > 1.01 else None
+                    clv_ps_v = round((odd_open/oc_ps - 1)*100, 1) if oc_ps and oc_ps > 1.01 else None
+                    clv_mx   = round((odd_open/oc_mx - 1)*100, 1) if oc_mx and oc_mx > 1.01 else None
+                    if clv_b365 is not None or clv_ps_v is not None:
+                        clv_map[pid] = (clv_b365, clv_ps_v, clv_mx)
+            except Exception as _eclv:
+                Log.warn(f"CLV CSV fallback: {_eclv}", "CLV")
+
             conn.close()
 
             picks = []
