@@ -2725,23 +2725,30 @@ class TripleLeagueV72:
         tomorrow  = (now_utc+timedelta(days=1)).strftime("%Y-%m-%d")
         day_after = (now_utc+timedelta(days=2)).strftime("%Y-%m-%d")
         today_str = now_utc.strftime("%d/%m/%Y")
-        # Siempre incluir HOY (para scans de 10:30 y 14:00 que cubren partidos vespertinos)
-        # + D+1 y D+2 para planificar picks con anticipación
-        # Los jueves y viernes agregar D+3 para cubrir el fin de semana completo
+        # scan_dates: HOY + D+1 + D+2 siempre
+        # Jueves/Viernes: + D+3 (sábado) y D+4 (domingo) para cubrir fin de semana
+        # Lunes/Martes: + D+3 para cubrir jueves de UEL/Champions siguiente
         scan_dates = [today, tomorrow, day_after]
-        if now_utc.weekday() in (3, 4):  # jueves o viernes UTC
+        wd = now_utc.weekday()  # 0=lun, 1=mar, 2=mié, 3=jue, 4=vie, 5=sáb, 6=dom
+        if wd in (3, 4):  # jueves o viernes — cubrir fin de semana completo
             scan_dates.append((now_utc+timedelta(days=3)).strftime("%Y-%m-%d"))
-        if now_utc.weekday() == 3:       # jueves — también D+4 para el domingo
+        if wd == 3:       # jueves — también D+4 para el domingo
             scan_dates.append((now_utc+timedelta(days=4)).strftime("%Y-%m-%d"))
-        # Evitar duplicados
+        if wd in (0, 1):  # lunes o martes — agregar D+3 para jueves de copa
+            scan_dates.append((now_utc+timedelta(days=3)).strftime("%Y-%m-%d"))
+        # Evitar duplicados manteniendo orden
         scan_dates = list(dict.fromkeys(scan_dates))
         preliminary = []
 
         Log.scan_start(scan_dates)
+        dias_str = " / ".join(
+            datetime.strptime(d, "%Y-%m-%d").strftime("%a %d")
+            for d in scan_dates
+        )
         send_msg(
-            f"🔍 <b>V7.2 Scan D-1</b>\n"
-            f"🗓 {' / '.join(scan_dates)}\n"
-            f"[1] CSV co.uk + [2] fd.org + [3] api-football"
+            f"🔍 <b>V7.2 Scan</b>\n"
+            f"🗓 {dias_str}\n"
+            f"[1] CSV co.uk + [2] fd.org + [3] api-football + Pinnacle live"
         )
 
         # ── [2] Trend Resource — 1 req por fecha ─────────────────────────
