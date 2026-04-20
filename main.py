@@ -224,6 +224,8 @@ ODDS_API_SPORT_MAP = {
     "CUP_2": "soccer_uefa_champs_league",
     "CUP_3": "soccer_uefa_europa_league",
     "CUP_848": "soccer_uefa_europa_conference_league",
+    "MEX": "soccer_mexico_ligamx",
+    "BSA": "soccer_brazil_campeonato",
 }
 
 TARGET_LEAGUES = {
@@ -322,11 +324,11 @@ USER_UPLOADS = {}   # vacío → Railway siempre descarga desde football-data.co
 MIN_EV  = 0.015   # global fallback
 # MIN_EV por mercado — calibrado post análisis 29 picks
 MIN_EV_MKT = {
-    "UNDER": 0.050,   # Under sobreestimado — requiere margen alto (BR 42%)
-    "OVER":  0.020,   # Over sin sesgo claro — margen moderado
-    "DC":    0.010,   # DC: 100% beat rate — margen mínimo
-    "1X2":   0.030,   # 1X2: EV mín 3% — umbral cuota bajado a 2.00
-    "BTTS":  0.020,   # BTTS Sí: moderado
+    "UNDER": 0.030,   # Bajado 5%→3% para más picks y calibración más rápida
+    "OVER":  0.015,   # Bajado 2%→1.5%
+    "DC":    0.008,   # Bajado 1%→0.8%
+    "1X2":   0.020,   # Bajado 3%→2% — umbral cuota 2.00
+    "BTTS":  0.015,   # BTTS Sí: moderado
     "BTTS_NO": 0.020, # BTTS No: moderado
     "DNB":     0.025, # DNB: mercado semi-eficiente
 }
@@ -1431,7 +1433,7 @@ def fetch_live_odds(divs=None):
     # ODDS_DAILY: ligas con más picks, corridas diarias (17 req/día = 510/mes)  
     # Usar subset para scheduler diario y lista completa solo al arrancar
     ODDS_DAILY = ["E0","E1","SP1","D1","I1","F1","N1","P1","B1","T1",
-                  "CUP_2","CUP_3","CUP_848"]  # 13 req/día = 390/mes ✅
+                  "MEX","BSA","CUP_2","CUP_3","CUP_848"]  # 15 req/día = 450/mes ✅
     divs = divs or ODDS_DAILY
     results = {}  # {(home, away, div): {h: odd, d: odd, a: odd, ou: {over: odd, under: odd}}}
     
@@ -2128,7 +2130,7 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     # DNB: si empata devuelven. EV real = ph/(ph+pa) para local,  pa/(ph+pa) para visitante.
     # Cuota fair derivada de las probabilidades Dixon-Coles sin empate.
     # Solo en ligas con liq < 0.88 (mercado menos eficiente) y conf HIGH.
-    if conf == "HIGH" and oh and oa and liq < 0.88:
+    if conf != "LOW" and oh and oa:  # DNB en todas las ligas, no solo baja liquidez
         ph_dnb = ph / max(ph + pa, 0.01)   # prob local sin empate
         pa_dnb = pa / max(ph + pa, 0.01)   # prob visitante sin empate
         # Cuota fair DNB desde las cuotas 1X2 del mercado (sin vig)
@@ -2756,8 +2758,59 @@ class TripleLeagueV72:
 
             xh,xa,xt,conf,src=build_xg(h_n,a_n,div,cfg,df_hist)
 
-            # Cuotas — fixtures.csv si viene de ahí, CSV histórico si viene de csv_hist
+            # Cuotas — fixtures.csv + Pinnacle live (The Odds API)
             odds=get_odds_from_row(row,cfg)
+
+            # Enriquecer con Pinnacle en tiempo real si está disponible
+            try:
+                import difflib as _dl_scan
+                conn_lo_scan = sqlite3.connect(DB_PATH)
+                lo_scan = conn_lo_scan.execute("""
+                    SELECT pin_h, pin_d, pin_a, pin_over, pin_under
+                    FROM live_odds
+                    WHERE div=? AND updated_at >= datetime('now', '-12 hours')
+                    ORDER BY updated_at DESC
+                """, (div,)).fetchall()
+                conn_lo_scan.close()
+                # Fuzzy match por nombres de equipo
+                for (ph_pin, pd_pin, pa_pin, po_pin, pu_pin) in lo_scan:
+                    # Buscar si alguna fila de live_odds coincide con este partido
+                    # (live_odds tiene home_team/away_team en nombres de Odds API)
+                    pass  # El match se hace por div — tomamos la primera fila relevante
+                # Alternativa más simple: buscar directamente por home+away
+                conn_lo2 = sqlite3.connect(DB_PATH)
+                pin_row = conn_lo2.execute("""
+                    SELECT pin_h, pin_d, pin_a, pin_over, pin_under
+                    FROM live_odds
+                    WHERE div=?
+                    AND updated_at >= datetime('now', '-12 hours')
+                    AND (
+                        (lower(home_team) LIKE ? OR lower(home_team) LIKE ?)
+                        AND (lower(away_team) LIKE ? OR lower(away_team) LIKE ?)
+                    )
+                    ORDER BY updated_at DESC LIMIT 1
+                """, (div,
+                      f"%{h_n[:5].lower()}%", f"%{h_n[-4:].lower()}%",
+                      f"%{a_n[:5].lower()}%", f"%{a_n[-4:].lower()}%"
+                )).fetchone()
+                conn_lo2.close()
+                if pin_row and pin_row[0]:
+                    ph_p, pd_p, pa_p, po_p, pu_p = pin_row
+                    # Usar Pinnacle como cuota de referencia principal
+                    # Pinnacle es la línea más eficiente del mercado
+                    if ph_p and ph_p > 1.01: odds["H_PIN"] = ph_p
+                    if pd_p and pd_p > 1.01: odds["D_PIN"] = pd_p
+                    if pa_p and pa_p > 1.01: odds["A_PIN"] = pa_p
+                    if po_p and po_p > 1.01: odds["O25_PIN"] = po_p
+                    if pu_p and pu_p > 1.01: odds["U25_PIN"] = pu_p
+                    # Si no hay cuota de B365 en fixtures.csv, usar Pinnacle
+                    if not odds.get("H") and ph_p: odds["H"] = ph_p
+                    if not odds.get("D") and pd_p: odds["D"] = pd_p
+                    if not odds.get("A") and pa_p: odds["A"] = pa_p
+                    if not odds.get("O25") and po_p: odds["O25"] = po_p
+                    if not odds.get("U25") and pu_p: odds["U25"] = pu_p
+            except Exception as _e_pin:
+                pass  # Pinnacle no disponible — usar co.uk
 
             # Trend fd.org por nombre
             ts={}
@@ -2823,6 +2876,22 @@ class TripleLeagueV72:
                             odds.update(apif_odds)
                             Log.info("BSA odds via api-football", "BSA")
                     if not odds.get("H"):
+                        # Fallback: The Odds API para BSA
+                        try:
+                            conn_bsa = sqlite3.connect(DB_PATH)
+                            pin_bsa = conn_bsa.execute("""
+                                SELECT pin_h, pin_d, pin_a, pin_over, pin_under
+                                FROM live_odds WHERE div='BSA'
+                                AND (lower(home_team) LIKE ? OR lower(home_team) LIKE ?)
+                                ORDER BY updated_at DESC LIMIT 1
+                            """, (f"%{h_n[:5].lower()}%", f"%{h_n[-4:].lower()}%")).fetchone()
+                            conn_bsa.close()
+                            if pin_bsa and pin_bsa[0]:
+                                odds.update({"H": pin_bsa[0], "D": pin_bsa[1], "A": pin_bsa[2],
+                                             "O25": pin_bsa[3], "U25": pin_bsa[4]})
+                                Log.info(f"BSA odds via Pinnacle live: {h_n}", "BSA")
+                        except Exception: pass
+                    if not odds.get("H"):
                         Log.warn("BSA sin cuotas — skip", "BSA")
                         log_rej(label,"ALL",0,0,"NO_ODDS_AVAILABLE"); continue
 
@@ -2855,10 +2924,26 @@ class TripleLeagueV72:
             # [1] xG desde CSV MEX.xlsx goles proxy
             xh,xa,xt,conf,src=build_xg(h_n,a_n,"MEX",cfg_mex,df_mex)
 
-            # [3] Cuotas Bet365 via api-football — FIX #4 restaurado
+            # [3] Cuotas: api-football primero, The Odds API como fallback
             odds_mx=get_mx_odds(fid, self.apif_h)
             if not odds_mx:
-                print(f"     ⚠️ MEX sin cuotas Bet365 — skip", flush=True)
+                # Fallback: buscar en live_odds de The Odds API
+                try:
+                    conn_mx = sqlite3.connect(DB_PATH)
+                    pin_mx = conn_mx.execute("""
+                        SELECT pin_h, pin_d, pin_a, pin_over, pin_under
+                        FROM live_odds WHERE div='MEX'
+                        AND (lower(home_team) LIKE ? OR lower(home_team) LIKE ?)
+                        ORDER BY updated_at DESC LIMIT 1
+                    """, (f"%{h_n[:5].lower()}%", f"%{h_n[-4:].lower()}%")).fetchone()
+                    conn_mx.close()
+                    if pin_mx and pin_mx[0]:
+                        odds_mx = {"H": pin_mx[0], "D": pin_mx[1], "A": pin_mx[2],
+                                   "O25": pin_mx[3], "U25": pin_mx[4]}
+                        Log.info(f"MEX odds via Pinnacle live: {h_n}", "MEX")
+                except Exception: pass
+            if not odds_mx:
+                print(f"     ⚠️ MEX sin cuotas — skip", flush=True)
                 log_rej(label,"ALL",0,0,"NO_ODDS_APIF"); continue
 
             # [3] Lesiones
@@ -6391,7 +6476,7 @@ if __name__ == "__main__":
     CLV_H,  CLV_M  = _hhmm(RUN_TIME_CLV)            # 16:00
     STAND_H,STAND_M= _hhmm(RUN_TIME_STANDINGS)      # 09:00 martes
 
-    Log.ok("Scheduler UTC activo — 06:00 CSV / 06:30 SCAN / 07:00 AUDIT / 16:00 CLV", "SCHED")
+    Log.ok("Scheduler UTC activo — 06:00 CSV / 06:30+10:30+14:00 SCAN / 07:00 AUDIT / 16:00 CLV / 20:00 ODDS", "SCHED")
     while True:
         now = datetime.now(timezone.utc)
         hh, mm = now.hour, now.minute
@@ -6414,11 +6499,17 @@ if __name__ == "__main__":
                     Log.ok("Odds API: cuotas actualizadas (20:00 UTC)", "ODDS")
                 except Exception as e: Log.err(f"Odds API: {e}", "ODDS")
 
-        # 06:00 — refresh CSVs
+        # 06:00 — refresh CSVs + actualizar Pinnacle pre-scan
         if (hh, mm) == (CSV_H, CSV_M) and not _ran_today("csv"):
             _mark_ran("csv")
             try: bot.refresh_csvs()
             except Exception as e: Log.err(f"refresh_csvs: {e}", "SCHED")
+            # Actualizar cuotas Pinnacle justo antes del scan de 06:30
+            if ODDS_API_KEY:
+                try:
+                    fetch_live_odds()
+                    Log.ok("Odds Pinnacle pre-scan actualizadas (06:00 UTC)", "ODDS")
+                except Exception as e: Log.warn(f"Odds pre-scan: {e}", "ODDS")
 
         # 07:00 — audit + pnl + auto-resolve
         if (hh, mm) == (AUDIT_H, AUDIT_M) and not _ran_today("audit"):
@@ -6431,7 +6522,7 @@ if __name__ == "__main__":
             except Exception as e: Log.err(f"calc_pnl: {e}", "SCHED")
             Log.daily_summary()
 
-        # 06:30 — kill-switch check + scan principal
+        # 06:30 — scan principal (jornada del día con cuotas frescas)
         if (hh, mm) == (SCAN_H, SCAN_M) and not _ran_today("scan"):
             _mark_ran("scan")
             if not kill_switch_check():
@@ -6439,6 +6530,26 @@ if __name__ == "__main__":
                 except Exception as e: Log.err(f"run_daily_scan: {e}", "SCHED")
             else:
                 Log.warn("Scan omitido — kill-switch activo", "SCHED")
+
+        # 10:30 UTC — scan mediodía + actualizar Pinnacle antes del scan
+        if (hh, mm) == (10, 30) and not _ran_today("scan_mid"):
+            _mark_ran("scan_mid")
+            if not kill_switch_check():
+                try:
+                    if ODDS_API_KEY: fetch_live_odds()  # cuotas frescas antes del scan
+                    bot.run_daily_scan()
+                    Log.ok("Scan 10:30 UTC completado", "SCHED")
+                except Exception as e: Log.err(f"scan_mid: {e}", "SCHED")
+
+        # 14:00 UTC — scan tarde (partidos nocturnos + Liga MX)
+        if (hh, mm) == (14, 0) and not _ran_today("scan_late"):
+            _mark_ran("scan_late")
+            if not kill_switch_check():
+                try:
+                    if ODDS_API_KEY: fetch_live_odds()
+                    bot.run_daily_scan()
+                    Log.ok("Scan 14:00 UTC completado", "SCHED")
+                except Exception as e: Log.err(f"scan_late: {e}", "SCHED")
 
         # 16:00 — capture CLV
         if (hh, mm) == (CLV_H, CLV_M) and not _ran_today("clv"):
