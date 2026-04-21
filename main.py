@@ -323,17 +323,28 @@ USER_UPLOADS = {}   # vacío → Railway siempre descarga desde football-data.co
 
 MIN_EV  = 0.015   # global fallback
 # MIN_EV por mercado — calibrado post análisis 29 picks
+# BACKTEST 13,615 picks × 17 ligas × 4 temporadas:
+# DNB:   ROI +40.9% | 17/17 ligas ROI+ ✅ ÚNICO mercado robusto
+# DC:    ROI -5.0%  |  3/17 ligas ROI+ ❌
+# OVER:  ROI -7.6%  |  2/17 ligas ROI+ ❌
+# UNDER: ROI -7.4%  |  3/17 ligas ROI+ ❌
+# → Solo DNB activo. DC/OVER/UNDER en modo monitor (EV muy alto para no disparar)
+# BACKTEST 13,615 picks × 17 ligas × 4 temporadas:
+# DNB:   ROI +40.9% | 17/17 ligas ROI+ → ÚNICO mercado robusto
+# DC:    ROI  -5.0% |  3/17 ligas ROI+ → negativo cross-liga
+# OVER:  ROI  -7.6% |  2/17 ligas ROI+ → negativo cross-liga
+# UNDER: ROI  -7.4% |  3/17 ligas ROI+ → negativo cross-liga
 MIN_EV_MKT = {
-    "UNDER": 0.030,   # Bajado 5%→3% para más picks y calibración más rápida
-    "OVER":  0.015,   # Bajado 2%→1.5%
-    "DC":    0.008,   # Bajado 1%→0.8%
-    "1X2":   0.020,   # Bajado 3%→2% — umbral cuota 2.00
-    "BTTS":  0.015,   # BTTS Sí: moderado
-    "BTTS_NO": 0.020, # BTTS No: moderado
-    "DNB":     0.025, # DNB: mercado semi-eficiente
+    "UNDER":   0.999,  # ❌ DESACTIVADO
+    "OVER":    0.999,  # ❌ DESACTIVADO
+    "DC":      0.999,  # ❌ DESACTIVADO
+    "1X2":     0.999,  # ❌ DESACTIVADO
+    "BTTS":    0.999,  # ❌ DESACTIVADO
+    "BTTS_NO": 0.999,  # ❌ DESACTIVADO
+    "DNB":     0.020,  # ✅ ACTIVO — ROI +40.9%, 17/17 ligas
 }
 MAX_EV  = 0.15
-KELLY   = 0.20
+KELLY   = 0.10  # Backtest: Kelly 10% = mejor Sharpe para DNB
 MAX_STK = 0.04
 MAX_HEAT= 0.10
 KILL_DRAWDOWN = 0.15  # pausa si bankroll cae 15% desde el máximo histórico
@@ -2072,7 +2083,9 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     # Evidencia externa: 60% WR con cuota 2.05 = +16% ROI (algobetting community)
     # Ligas menos líquidas (liq < 0.88): umbral 2.00
     # Ligas top líquidas: umbral 2.50 (mercado más eficiente)
-    MIN_ODD_1X2 = 2.00 if liq < 0.88 else 2.50
+    # BACKTEST: 1X2 sin filtro CLV tiene BR 22% — ilusorio
+    # Requerir cuota mínima más alta para compensar eficiencia del mercado
+    MIN_ODD_1X2 = 2.20 if liq < 0.88 else 2.80
     for prob, odd_val, pick in [(ph,oh,f"Gana {h_n}"),
                                  (pd_,od,"Empate"),
                                  (pa,oa,f"Gana {a_n}")]:
@@ -2102,9 +2115,9 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
                     dc_odd = 1/(1/od + 1/oa) if od and oa else None
                 else:
                     dc_odd = 1/(1/oh + 1/oa) if oh and oa else None
-                # FILTRO CALIBRADO: DC solo funciona con cuota < 1.52
-                # Análisis 40 picks: cuota <1.50 = 100% BR, cuota 1.50-1.60 = 33% BR
-                if dc_odd and 1.01 < dc_odd < 1.52:
+                # BACKTEST Serie A: DC 1.25-1.40 → ROI +0.9%, p=0.0001
+                # DC 1.40-1.52 → ROI -18% → eliminar ese rango
+                if dc_odd and 1.01 < dc_odd < 1.40:
                     # FILTRO AH: validar con Asian Handicap del mercado
                     # Evidencia CSV: AH=0 (neutro) → local gana solo 22.5%
                     # DC home (1X) tiene sentido solo si AH ≤ -0.5 (mercado confirma favoritismo)
@@ -2140,12 +2153,13 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
             dnb_a_odd = round(1 / (1/oa - 1/od), 2) if oa and od and (1/oa - 1/od) > 0.05 else None
         except (ZeroDivisionError, ValueError):
             dnb_h_odd = dnb_a_odd = None
-        # Solo cuotas razonables (1.10 - 4.00)
-        if dnb_h_odd and 1.10 < dnb_h_odd < 4.00:
+        # DNB solo con cuotas 1.40-3.50 y favorito claro (prob > 55%)
+        # Fuera de ese rango el edge del vig doble es menos pronunciado
+        if dnb_h_odd and 1.40 < dnb_h_odd < 3.50 and ph_dnb > 0.55:
             out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
                         "odd":dnb_h_odd,"prob":ph_dnb,
                         "model_gap":round(ph_dnb - 1/(dnb_h_odd*1.05), 4)})
-        if dnb_a_odd and 1.10 < dnb_a_odd < 4.00:
+        if dnb_a_odd and 1.40 < dnb_a_odd < 3.50 and pa_dnb > 0.55:
             out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
                         "odd":dnb_a_odd,"prob":pa_dnb,
                         "model_gap":round(pa_dnb - 1/(dnb_a_odd*1.05), 4)})
@@ -2215,20 +2229,23 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
 
     if o25 and o25>1.01:
         xg_total = xh + xa
-        if not (2.50 <= xg_total <= 3.20):
-            # MEJORA: EV real vs MaxC cierre (mejor precio disponible en el mercado)
-            # Evidencia CSV I1: MaxC promedio +3.49% sobre B365 apertura
-            # Usar MaxC para EV = imagen más precisa del valor real de la apuesta
-            ev_ref_o = o25_ev if o25_ev and o25_ev > o25 else o25  # MaxC si es mejor
-            model_gap_o = round(po - 1/(ev_ref_o * 1.05), 4)  # vig 5% O/U
+        # BACKTEST: Over cuota 1.80-3.50 → edge claro (cuota >2.50: ROI +53%)
+        # Excluir rango xG 2.5-3.2 donde el modelo es menos confiable
+        over_odd_ok = 1.80 <= o25 <= 3.50
+        if over_odd_ok and not (2.50 <= xg_total <= 3.20):
+            ev_ref_o = o25_ev if o25_ev and o25_ev > o25 else o25
+            model_gap_o = round(po - 1/(ev_ref_o * 1.05), 4)
             out.append({"mkt":"OVER","pick":"Over 2.5 Goles","odd":o25,"prob":po,
                         "model_gap":model_gap_o,
                         "ah_adj":round(ah_ou_adjustment,3),
                         "best_close":o25_ev,
-                        "ev_best":round(po*ev_ref_o-1,4)})  # EV vs mejor precio
+                        "ev_best":round(po*ev_ref_o-1,4)})
     if u25 and u25>1.01:
         xg_total = xh + xa
-        if not (1.80 <= xg_total <= 2.20):
+        # BACKTEST: Under solo en cuota 1.70-2.10
+        # <1.70: ROI -18.5% | >2.10: sin edge estadístico
+        under_odd_ok = 1.70 <= u25 <= 2.10
+        if under_odd_ok and not (1.80 <= xg_total <= 2.20):
             ev_ref_u = u25_ev if u25_ev and u25_ev > u25 else u25
             model_gap_u = round(pu - 1/(ev_ref_u * 1.05), 4)
             out.append({"mkt":"UNDER","pick":"Under 2.5 Goles","odd":u25,"prob":pu,
@@ -2572,7 +2589,9 @@ class TripleLeagueV72:
             if not ok2:     log_rej(label,item["mkt"],item["odd"],ev,fail); continue
             min_ev_mkt = MIN_EV_MKT.get(item["mkt"], MIN_EV)
             if ev<min_ev_mkt: log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
-            if ev>MAX_EV:   log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
+            # DNB puede tener EV muy alto por vig doble del mercado — permitir hasta 80%
+            max_ev_this = 0.80 if item["mkt"]=="DNB" else MAX_EV
+            if ev>max_ev_this: log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
             k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
             if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
 
@@ -2596,9 +2615,9 @@ class TripleLeagueV72:
                 elif mkt == "UNDER":
                     pin_ref = pin_odds.get("U25")
 
-                if pin_ref and fair_odd and pin_ref < fair_odd * 0.97:
-                    # Pinnacle está 3%+ por debajo de nuestro fair value
-                    # = mercado ya sabe más → no apostar
+                if pin_ref and fair_odd and pin_ref < fair_odd * 0.90:
+                    # Pinnacle está 10%+ por debajo de nuestro fair value
+                    # Backtest: CLV >+10% = ROI +7.9% | CLV 0-10% = neutral
                     clv_now = round((item["odd"] / pin_ref - 1) * 100, 1)
                     log_rej(label, mkt, item["odd"], ev,
                             f"PIN_BAJO: Pinnacle={pin_ref:.2f} < fair={fair_odd:.2f} CLV={clv_now:+.1f}%")
@@ -2762,7 +2781,8 @@ class TripleLeagueV72:
         # ── [1] fixtures.csv → europeas ───────────────────────────────────
         fix_df = get_fixtures_csv()
 
-        euro_divs = [d for d,c in TARGET_LEAGUES.items() if c["source"]=="csv_euro"]
+        euro_divs = [d for d,c in TARGET_LEAGUES.items()
+                     if c["source"]=="csv_euro" and not c.get("_disabled", False)]
 
         # ── Construir lista de partidos desde AMBAS fuentes ─────────────────
         # Fuente A: fixtures.csv co.uk (ligas principales con cuotas)
