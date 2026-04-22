@@ -1459,6 +1459,17 @@ def fetch_live_odds(divs=None):
         updated_at TEXT,
         UNIQUE(sport_key, home_team, away_team, commence_time)
     )""")
+    # Historial de cuotas Pinnacle — guardamos cada snapshot
+    # Permite detectar movimiento de línea (sharp money signal)
+    conn.execute("""CREATE TABLE IF NOT EXISTS odds_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        div TEXT, sport_key TEXT,
+        home_team TEXT, away_team TEXT,
+        commence_time TEXT,
+        pin_h REAL, pin_d REAL, pin_a REAL,
+        pin_dnb_h REAL, pin_dnb_a REAL,
+        snapshot_at TEXT
+    )""")
     conn.commit()
 
     for div, sport_key in ODDS_API_SPORT_MAP.items():
@@ -1516,6 +1527,20 @@ def fetch_live_odds(divs=None):
                 """, (div, sport_key, home, away, commence,
                       pin_h, pin_d, pin_a, pin_over, pin_under,
                       b365_h, b365_d, b365_a, now.isoformat()))
+                # Snapshot histórico de Pinnacle (para line monitoring)
+                if pin_h and pin_d and pin_a:
+                    try:
+                        _dh = round(1/(1/pin_h - 1/pin_d), 3) if (1/pin_h - 1/pin_d) > 0.05 else None
+                        _da = round(1/(1/pin_a - 1/pin_d), 3) if (1/pin_a - 1/pin_d) > 0.05 else None
+                    except:
+                        _dh = _da = None
+                    conn.execute("""
+                        INSERT INTO odds_history
+                        (div, sport_key, home_team, away_team, commence_time,
+                         pin_h, pin_d, pin_a, pin_dnb_h, pin_dnb_a, snapshot_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (div, sport_key, home, away, commence,
+                          pin_h, pin_d, pin_a, _dh, _da, now.isoformat()))
                 
                 results[(home, away, div)] = {
                     "pin_h": pin_h, "pin_d": pin_d, "pin_a": pin_a,
@@ -1643,6 +1668,97 @@ def fetch_cup_calendar(headers):
     conn.commit(); conn.close()
     Log.ok(f"cup_calendar: {total} partidos próximos cacheados ({date_from}→{date_to})", "CAL")
     return total
+
+
+
+def detect_line_moves(div=None, min_move_pct=0.04, hours_window=24):
+    """
+    Detecta movimientos de línea Pinnacle en las últimas N horas.
+    Movimiento > 4% = señal de dinero sharp.
+
+    Retorna dict {(home,away,div): {move_h, move_d, signal, confidence, ...}}
+
+    Señales:
+      sharp_home  → cuota local bajó  → sharp money en local
+      sharp_away  → cuota visitante bajó
+      sharp_draw  → cuota empate bajó
+      steam       → movimiento brusco en ambos lados (línea bajo presión)
+      none        → mercado estable
+    """
+    try:
+        from datetime import timedelta
+        conn = sqlite3.connect(DB_PATH)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_window)).isoformat()
+
+        query = """
+            SELECT home_team, away_team, div,
+                   MIN(pin_h)     as open_h,  MAX(pin_h)     as close_h,
+                   MIN(pin_d)     as open_d,  MAX(pin_d)     as close_d,
+                   MIN(pin_a)     as open_a,  MAX(pin_a)     as close_a,
+                   MIN(pin_dnb_h) as open_dh, MAX(pin_dnb_h) as close_dh,
+                   MIN(pin_dnb_a) as open_da, MAX(pin_dnb_a) as close_da,
+                   COUNT(*)       as snaps,
+                   MIN(snapshot_at) as first_t, MAX(snapshot_at) as last_t
+            FROM odds_history
+            WHERE snapshot_at >= ?
+        """
+        params = [cutoff]
+        if div:
+            query += " AND div=?"
+            params.append(div)
+        query += " GROUP BY home_team, away_team, div HAVING snaps >= 2"
+
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+
+        moves = {}
+        for (home, away, d,
+             oh, ch, od, cd, oa, ca,
+             odh, cdh, oda, cda,
+             snaps, first, last) in rows:
+
+            if not oh or not ch or oh <= 1.01: continue
+
+            # Cambio porcentual (negativo = cuota bajó = equipo más valorado)
+            def pct(old, new):
+                if not old or not new or old <= 1.0: return 0.0
+                return round((new - old) / old * 100, 2)
+
+            mh = pct(oh, ch)  # local
+            md = pct(od, cd)  # empate
+            ma = pct(oa, ca)  # visitante
+            mdh = pct(odh, cdh)  # DNB local
+            mda = pct(oda, cda)  # DNB visitante
+
+            # Señal
+            thr = min_move_pct * 100
+            if   mh < -thr: signal = "sharp_home";  conf = min(abs(mh)/10, 1.0)
+            elif ma < -thr: signal = "sharp_away";  conf = min(abs(ma)/10, 1.0)
+            elif md < -thr: signal = "sharp_draw";  conf = min(abs(md)/10, 1.0)
+            elif abs(mh) > 8 and abs(ma) > 8:
+                             signal = "steam";       conf = 0.5
+            else:            signal = "none";        conf = 0.0
+
+            hours_span = 0.0
+            try:
+                t1 = datetime.fromisoformat(first.replace("Z","+00:00"))
+                t2 = datetime.fromisoformat(last.replace("Z","+00:00"))
+                hours_span = round((t2-t1).total_seconds()/3600, 1)
+            except: pass
+
+            moves[(home, away, d)] = {
+                "move_h": mh, "move_d": md, "move_a": ma,
+                "move_dnb_h": mdh, "move_dnb_a": mda,
+                "signal": signal, "confidence": round(conf,2),
+                "open_h": oh,  "close_h": ch,
+                "open_d": od,  "close_d": cd,
+                "open_a": oa,  "close_a": ca,
+                "snaps": snaps, "hours_span": hours_span,
+            }
+        return moves
+    except Exception as e:
+        Log.warn(f"detect_line_moves: {e}", "LINES")
+        return {}
 
 
 def fetch_cup_fixtures(headers, full_season=False):
@@ -2351,8 +2467,8 @@ def check_result(pick, mkt, fthg, ftag, home_name="", away_name=""):
         y=hg>0 and ag>0
         return "WIN" if ("Sí" in pick and y) or ("No" in pick and not y) else "LOSS"
     if mkt=="DNB":
-        # DNB: empate = PUSH (devuelven) → tratamos como PENDING para no contar
-        if hg==ag: return "PENDING"   # empate → push, no cuenta como WIN ni LOSS
+        # DNB: empate = PUSH (devuelven la apuesta, profit=0)
+        if hg==ag: return "PUSH"   # empate → PUSH, profit=0
         team_pick = pick.replace("DNB: Gana ","").strip()
         sim_h = difflib.SequenceMatcher(None, team_pick.lower(), home_name.lower()).ratio()
         sim_a = difflib.SequenceMatcher(None, team_pick.lower(), away_name.lower()).ratio()
@@ -2413,13 +2529,19 @@ def run_audit():
                                 ftag=float(m.iloc[-1]["FTAG"])
                                 res=check_result(pick,mkt,fthg,ftag,
                                                  home_name=rh[0],away_name=ra[0])
-                                if res in("WIN","LOSS"):
-                                    profit = round(stake*odd-stake if res=="WIN" else -stake, 4)
-                                    row[9]=res; row[14]=str(fthg); row[15]=str(ftag)
+                                if res in("WIN","LOSS","PUSH"):
+                                    if res == "PUSH":
+                                        # DNB empate → devuelven la apuesta, profit=0
+                                        profit = 0.0
+                                        res_db = "PUSH"
+                                    else:
+                                        profit = round(stake*odd-stake if res=="WIN" else -stake, 4)
+                                        res_db = res
+                                    row[9]=res_db; row[14]=str(fthg); row[15]=str(ftag)
                                     row[11]=str(profit)
                                     wins+=res=="WIN"; losses+=res=="LOSS"; resolved+=1
                                     # Sincronizar resultado a picks_log DB
-                                    db_updates.append((res, profit, fthg, ftag,
+                                    db_updates.append((res_db, profit, fthg, ftag,
                                                         row[2], row[3], row[5]))
                 rows.append(row)
         with open(AUDIT_CSV,"w",newline="",encoding="utf-8") as f:
@@ -2430,17 +2552,20 @@ def run_audit():
                 conn_a = sqlite3.connect(DB_PATH)
                 for res, profit, fthg, ftag, home, away, mkt in db_updates:
                     conn_a.execute("""
-                        UPDATE picks_log SET result=?, profit=?
+                        UPDATE picks_log SET result=?, profit=?,
+                               clv_captured=CASE WHEN ? = 'PUSH' THEN 1 ELSE clv_captured END
                         WHERE home_team LIKE ? AND away_team LIKE ?
                           AND market=? AND result='PENDING'
-                    """, (res, profit,
+                    """, (res, profit, res,
                           f"%{home[:8]}%", f"%{away[:8]}%", mkt))
                 conn_a.commit(); conn_a.close()
             except Exception as db_e:
                 print(f"  ⚠️ audit DB sync: {db_e}", flush=True)
         Log.audit_end(resolved, wins, losses)
         if resolved:
-            send_msg(f"🔬 <b>Auditoría V7.2</b>\nResueltos: {resolved} | ✅{wins} WIN | ❌{losses} LOSS")
+            pushes = resolved - wins - losses
+            push_str = f" | 🔄{pushes} PUSH" if pushes else ""
+            send_msg(f"🔬 <b>Auditoría V7.2</b>\nResueltos: {resolved} | ✅{wins} WIN | ❌{losses} LOSS{push_str}")
     except Exception as e:
         Log.err(f"audit: {e}", "AUDIT")
 
@@ -2573,12 +2698,22 @@ class TripleLeagueV72:
                     ORDER BY updated_at DESC LIMIT 20
                 """, (div,)).fetchall()
                 conn_f.close()
-                # Fuzzy match para encontrar el partido correcto
                 for ph,pd,pa,po,pu,lh,la in pin_rows:
                     sh = _dlf.SequenceMatcher(None,h_n.lower(),lh.lower()).ratio()
                     sa = _dlf.SequenceMatcher(None,a_n.lower(),la.lower()).ratio()
                     if sh > 0.55 and sa > 0.55:
                         pin_odds = {"H":ph,"D":pd,"A":pa,"O25":po,"U25":pu}
+                        # Calcular Pinnacle DNB derivado de H/D/A
+                        # Pinnacle tiene vig ~2% → DNB calculado es el precio más justo
+                        try:
+                            if ph and pd and ph > 1.01 and pd > 1.01:
+                                _dh = 1/(1/ph - 1/pd)
+                                pin_odds["DNB_H"] = round(_dh, 3) if _dh > 1.01 else None
+                            if pa and pd and pa > 1.01 and pd > 1.01:
+                                _da = 1/(1/pa - 1/pd)
+                                pin_odds["DNB_A"] = round(_da, 3) if _da > 1.01 else None
+                        except:
+                            pass
                         break
             except Exception:
                 pass
@@ -2602,11 +2737,20 @@ class TripleLeagueV72:
                 fair_odd = round(1 / item["prob"], 3) if item["prob"] > 0.01 else None
                 mkt = item["mkt"]
                 pin_ref = None
-                if mkt in ("1X2","DC","DNB"):
+                if mkt == "DNB":
                     sel = item.get("pick","")
-                    if h_n in sel or "Local" in sel or "1X" in sel:
+                    if h_n in sel:
+                        # Comparar cuota B365_DNB calculada vs Pinnacle_DNB calculada
+                        # Si B365_DNB > Pinnacle_DNB → B365 paga más → edge real
+                        # Si B365_DNB < Pinnacle_DNB → Pinnacle ya ajustó → skip
+                        pin_ref = pin_odds.get("DNB_H")
+                    else:
+                        pin_ref = pin_odds.get("DNB_A")
+                elif mkt in ("1X2","DC"):
+                    sel = item.get("pick","")
+                    if h_n in sel or "1X" in sel:
                         pin_ref = pin_odds.get("H")
-                    elif a_n in sel or "Visitante" in sel or "X2" in sel:
+                    elif a_n in sel or "X2" in sel:
                         pin_ref = pin_odds.get("A")
                     else:
                         pin_ref = pin_odds.get("D")
@@ -2628,7 +2772,34 @@ class TripleLeagueV72:
                     clv_live = round((item["odd"] / pin_ref - 1) * 100, 1)
                     print(f"     📊 {mkt} CLV live vs PIN: {clv_live:+.1f}%", flush=True)
 
-            print(f"     ✅ {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.3f}",flush=True)
+            # ── Line monitoring: señal de movimiento ──────────────────
+            line_signal = ""
+            if item["mkt"] == "DNB" and ODDS_API_KEY:
+                try:
+                    moves = detect_line_moves(div=div, hours_window=48)
+                    mk = next(((h,a,d) for (h,a,d) in moves
+                               if h_n[:6].lower() in h.lower() or
+                                  a_n[:6].lower() in a.lower()), None)
+                    if mk:
+                        mv = moves[mk]
+                        sig = mv["signal"]
+                        pick_dir = "home" if h_n in item.get("pick","") else "away"
+                        if sig == f"sharp_{pick_dir}":
+                            # Sharp money en la misma dirección → refuerza el pick
+                            line_signal = f" 🔥SHARP+{mv['confidence']:.0%}"
+                        elif sig in ("sharp_home","sharp_away") and sig != f"sharp_{pick_dir}":
+                            # Sharp money en dirección contraria → cuidado
+                            line_signal = f" ⚠️CONTRA-SHARP"
+                        elif sig == "steam":
+                            line_signal = " ⚡STEAM"
+                        elif mv["snaps"] < 3:
+                            line_signal = " 📊SIN-HIST"
+                        else:
+                            mh = mv["move_h"]; ma = mv["move_a"]
+                            line_signal = f" Δ{mh:+.1f}%/{ma:+.1f}%"
+                except Exception:
+                    pass
+            print(f"     ✅ {item['mkt']} @{item['odd']:.2f} EV={ev*100:.1f}% URS={urs:.3f}{line_signal}",flush=True)
             cands.append({**item,"ev":ev,"base_stake":k,"urs":urs,
                           "conf":conf,"xg_src":src,
                           "fid":fid,"h_n":h_n,"a_n":a_n,"ko":ko,
@@ -2688,6 +2859,25 @@ class TripleLeagueV72:
         tl=""
         if p.get("trend_pct_o25") is not None:
             tl=f"\n📈 Trend: o25={p['trend_pct_o25']*100:.0f}% bts={p.get('trend_pct_bts') or 0:.0f}%"
+        # Obtener señal de línea para incluir en Telegram
+        _line_tag = ""
+        try:
+            _lm = detect_line_moves(div=p["div"], hours_window=48)
+            _mk = next(((h,a,d) for (h,a,d) in _lm
+                        if p["h_n"][:5].lower() in h.lower()), None)
+            if _mk:
+                _mv = _lm[_mk]
+                _s = _mv["signal"]
+                _pick_dir = "home" if p["h_n"] in p.get("pick","") else "away"
+                if _s == f"sharp_{_pick_dir}":
+                    _line_tag = "\n🔥 Sharp money CONFIRMA el pick"
+                elif _s in ("sharp_home","sharp_away") and _s != f"sharp_{_pick_dir}":
+                    _line_tag = "\n⚠️ Sharp money EN CONTRA — precaución"
+                elif _mv["snaps"] >= 2:
+                    _mh = _mv["move_h"]; _ma = _mv["move_a"]
+                    _line_tag = f"\n📈 Línea: local{_mh:+.1f}% visita{_ma:+.1f}%"
+        except: pass
+
         send_msg(
             f"⚽ <b>{p['h_n']} vs {p['a_n']}</b>\n"
             f"🏟 {cfg_p.get('name','')}\n"
@@ -3069,6 +3259,14 @@ class TripleLeagueV72:
             if cands:
                 cands.sort(key=lambda x:x["ev"]*x["urs"],reverse=True)
                 preliminary.append(cands[0])   # ← MEX ALIMENTA preliminary ✅
+
+        # ── Un pick máximo por partido (evitar correlación DNB_H + DNB_A) ──
+        seen_matches = {}
+        for p in sorted(preliminary, key=lambda x: x["ev"]*x["urs"], reverse=True):
+            match_key = f"{p['h_n']}|{p['a_n']}|{p['div']}"
+            if match_key not in seen_matches:
+                seen_matches[match_key] = p
+        preliminary = list(seen_matches.values())
 
         # ── Portfolio + reporte ───────────────────────────────────────────
         final,meta=portfolio(preliminary)
@@ -3982,6 +4180,7 @@ td.muted-td{color:var(--muted)}
     <button class="htab active" onclick="showMainTab(0,this)">Calendario</button>
     <button class="htab" onclick="showMainTab(1,this)">Jornada</button>
     <button class="htab" onclick="showMainTab(2,this)">Historial</button>
+    <button class="htab" onclick="showMainTab(4,this)">📈 Líneas</button>
     <button class="htab" onclick="showMainTab(3,this)">Dashboard</button>
   </div>
   <div class="live-pill"><span class="live-dot"></span><span id="last-upd">live</span></div>
@@ -4084,6 +4283,19 @@ td.muted-td{color:var(--muted)}
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<div id="tab4" class="tab-pane">
+  <div style="padding:1rem 1.2rem">
+    <div style="font-family:var(--mono);font-size:.63rem;color:var(--muted);margin-bottom:.75rem">
+      Movimientos de línea Pinnacle — últimas 48h &nbsp;|&nbsp;
+      🔥 Sharp confirma pick &nbsp;|&nbsp; ⚠️ Sharp en contra &nbsp;|&nbsp;
+      Verde=cuota bajó (equipo más favorecido) · Rojo=cuota subió
+    </div>
+    <div id="lines-body" style="font-family:var(--mono);font-size:.65rem;color:var(--muted)">
+      Selecciona esta pestaña para cargar...
+    </div>
+  </div>
+</div>
+
 <script>
 // ── STATE ──
 let allPicks=[], calMatches=[], sortCol='date', sortDir=-1;
@@ -4098,6 +4310,56 @@ function showMainTab(i,btn){
   if(i===1){ loadPicks().then(renderJornada); }
   if(i===2){ loadPicks().then(renderHistorial); }
   if(i===3){ if(!allPicks.length) loadPicks().then(renderHistorico); else renderHistorico(); }
+  if(i===4){ loadLineMovements(); }
+}
+
+async function loadLineMovements(){
+  const body = document.getElementById('lines-body');
+  body.innerHTML = '<span style="color:var(--muted)">Cargando...</span>';
+  try {
+    const r = await fetch('/api/line_moves');
+    const data = await r.json();
+    const moves = (data.moves||[]);
+    if(!moves.length){
+      body.innerHTML = '<div style="padding:1rem;color:var(--muted)">Sin movimientos significativos en las últimas 48h.<br>El historial se construye con cada fetch de Pinnacle (cada hora).</div>';
+      return;
+    }
+    const sigLabel = {sharp_home:'🔥 SHARP LOCAL',sharp_away:'🔥 SHARP VISITA',sharp_draw:'🔥 SHARP EMPATE',steam:'⚡ STEAM',none:'→ Estable'};
+    const fmtMove = v => {
+      if(v===null||v===undefined) return '<span style="color:var(--muted)">—</span>';
+      const c = v<-4?'#22c55e':v>4?'#ef4444':'var(--fg)';
+      return `<span style="color:${c}">${v>0?'+':''}${v.toFixed(1)}%</span>`;
+    };
+    let h = `<table style="width:100%;border-collapse:collapse">
+      <thead><tr style="color:var(--muted);border-bottom:1px solid var(--s3)">
+        <th style="text-align:left;padding:6px 8px">Partido</th>
+        <th style="text-align:left;padding:6px 4px">Liga</th>
+        <th style="text-align:right;padding:6px 4px">Local Δ</th>
+        <th style="text-align:right;padding:6px 4px">Empate Δ</th>
+        <th style="text-align:right;padding:6px 4px">Visita Δ</th>
+        <th style="text-align:right;padding:6px 4px">DNB_L Δ</th>
+        <th style="text-align:right;padding:6px 4px">DNB_V Δ</th>
+        <th style="text-align:left;padding:6px 8px">Señal</th>
+        <th style="text-align:right;padding:6px 4px">Snaps</th>
+      </tr></thead><tbody>`;
+    for(const m of moves){
+      const bg = m.signal.startsWith('sharp')?'rgba(34,197,94,.05)':m.signal==='steam'?'rgba(245,158,11,.05)':'';
+      const sc = m.signal.startsWith('sharp')?'#22c55e':m.signal==='steam'?'#f59e0b':'var(--muted)';
+      h += `<tr style="border-bottom:1px solid var(--s2);background:${bg}">
+        <td style="padding:7px 8px;font-weight:600">${m.home} <span style="color:var(--muted)">vs</span> ${m.away}</td>
+        <td style="padding:7px 4px;color:var(--muted)">${m.league}</td>
+        <td style="padding:7px 4px;text-align:right">${fmtMove(m.move_h)}</td>
+        <td style="padding:7px 4px;text-align:right">${fmtMove(m.move_d)}</td>
+        <td style="padding:7px 4px;text-align:right">${fmtMove(m.move_a)}</td>
+        <td style="padding:7px 4px;text-align:right">${fmtMove(m.move_dnb_h)}</td>
+        <td style="padding:7px 4px;text-align:right">${fmtMove(m.move_dnb_a)}</td>
+        <td style="padding:7px 8px;color:${sc};font-weight:700">${sigLabel[m.signal]||m.signal}</td>
+        <td style="padding:7px 4px;text-align:right;color:var(--muted)">${m.snaps}</td>
+      </tr>`;
+    }
+    h += `</tbody></table><div style="padding:.4rem .5rem 0;color:var(--muted);font-size:.58rem">${moves.length} partidos · verde=cuota bajó (sharp money) · rojo=cuota subió · snaps=número de snapshots</div>`;
+    body.innerHTML = h;
+  } catch(e){ body.innerHTML = `<div style="color:#ef4444;padding:1rem">Error: ${e.message}</div>`; }
 }
 
 // ════════════════════════════════════════
@@ -5997,6 +6259,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_picks_summary()
             elif self.path.startswith("/api/log_pick"):
                 self._serve_log_pick()
+            elif self.path.startswith("/api/line_moves"):
+                self._serve_line_moves()
             else:
                 self.send_response(404); self.end_headers()
         except Exception as _e:
@@ -6330,6 +6594,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type","application/json")
         self.send_header("Access-Control-Allow-Origin","*")
         self.end_headers(); self.wfile.write(payload)
+
+    def _serve_line_moves(self):
+        """GET /api/line_moves — movimientos de línea detectados."""
+        try:
+            hours = 48
+            moves = detect_line_moves(hours_window=hours)
+            result = []
+            for (home, away, div), mv in moves.items():
+                if mv["signal"] == "none" and mv["snaps"] < 3: continue
+                cfg = TARGET_LEAGUES.get(div, {})
+                result.append({
+                    "home": home, "away": away,
+                    "div": div, "league": cfg.get("name", div),
+                    "move_h":     mv["move_h"],
+                    "move_d":     mv["move_d"],
+                    "move_a":     mv["move_a"],
+                    "move_dnb_h": mv["move_dnb_h"],
+                    "move_dnb_a": mv["move_dnb_a"],
+                    "signal":     mv["signal"],
+                    "confidence": mv["confidence"],
+                    "open_h":     mv["open_h"],
+                    "close_h":    mv["close_h"],
+                    "snaps":      mv["snaps"],
+                    "hours_span": mv["hours_span"],
+                })
+            # Ordenar: sharps primero, luego por magnitud de movimiento
+            result.sort(key=lambda x: (
+                0 if "sharp" in x["signal"] else 1,
+                -abs(x["move_h"])
+            ))
+            payload = json.dumps({"moves": result, "hours": hours}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            self._json_err(str(e))
 
     def _serve_log_pick(self):
         """POST /api/log_pick — registra pick manual desde panel de análisis."""
