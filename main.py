@@ -2395,13 +2395,23 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
 # VALIDACIONES + KELLY + PORTFOLIO (del V6.5 + V7.1)
 # ============================================================
 
-def validate_xg(xh, xa, oh, oa, o25):
+def validate_xg(xh, xa, oh, oa, o25, mkt_hint=None):
+    """
+    Valida que los xG son razonables y no son valores por defecto.
+    Para DNB (mkt_hint="DNB") relajamos los filtros porque el edge
+    viene del vig doble, no de la precisión del xG.
+    """
     if oh and oa:
         mo=min(oh,oa); rat=max(xh,xa)/min(xh,xa) if min(xh,xa)>0 else 1
-        if mo<1.40 and rat<1.50: return False,"XG_DEFAULT_DETECTED"
-        if mo<1.65 and rat<1.20: return False,"XG_FLAT_ON_FAV"
-        if 1.30<=xh<=1.50 and 1.30<=xa<=1.50 and mo<1.60: return False,"XG_LIKELY_DEFAULT"
-    if o25:
+        # Solo aplicar filtros estrictos cuando NO es para DNB
+        if mkt_hint != "DNB":
+            if mo<1.40 and rat<1.50: return False,"XG_DEFAULT_DETECTED"
+            if mo<1.65 and rat<1.20: return False,"XG_FLAT_ON_FAV"
+            if 1.30<=xh<=1.50 and 1.30<=xa<=1.50 and mo<1.60: return False,"XG_LIKELY_DEFAULT"
+        else:
+            # Para DNB: solo rechazar si xG son idénticos (default literal)
+            if xh == xa and mo < 1.40: return False,"XG_DEFAULT_DETECTED"
+    if o25 and mkt_hint != "DNB":
         pu=1/(o25*1.07)
         if 0.01 < pu < 1.0 and abs((xh+xa)+2.5*math.log(pu))>1.8:
             return False,"XG_INCONSISTENT"
@@ -3030,6 +3040,10 @@ class TripleLeagueV72:
                 Log.warn(f"CSV hist future {div}: {e}", "SCAN")
 
         Log.info(f"Candidatos encontrados: {len(candidate_rows)} partidos en {len(scan_dates)} fechas", "SCAN")
+        if len(candidate_rows) == 0:
+            Log.warn("0 candidatos — verificar fixtures.csv y CSVs históricos", "SCAN")
+            Log.warn(f"euro_divs activos: {euro_divs}", "SCAN")
+            Log.warn(f"scan_dates: {scan_dates}", "SCAN")
 
         # ── Procesar todos los candidatos ─────────────────────────────────
         for div, h_n, a_n, ko, row, row_src in candidate_rows:
@@ -3118,9 +3132,19 @@ class TripleLeagueV72:
                     difflib.SequenceMatcher(None,a_n,an_t).ratio()>0.60):
                     ts=extract_trend(te); break
 
-            ok,reason=validate_xg(xh,xa,odds.get("H"),odds.get("A"),odds.get("O25"))
-            if not ok: log_rej(label,"ALL",0,0,reason); continue
-            if conf=="LOW": log_rej(label,"ALL",0,0,"XG_LOW_SKIP"); continue
+            # Para DNB relajamos validación de xG (el edge es estructural)
+            active_mkts_now = set(k for k,v in MIN_EV_MKT.items() if v < 0.50)
+            mkt_hint = "DNB" if active_mkts_now == {"DNB"} else None
+            ok,reason=validate_xg(xh,xa,odds.get("H"),odds.get("A"),odds.get("O25"),
+                                   mkt_hint=mkt_hint)
+            if not ok:
+                log_rej(label,"ALL",0,0,reason)
+                print(f"     ⛔ {reason} xH={xh:.2f} xA={xa:.2f} oH={odds.get('H')} oA={odds.get('A')}", flush=True)
+                continue
+            if conf=="LOW":
+                log_rej(label,"ALL",0,0,"XG_LOW_SKIP")
+                print(f"     ⛔ XG_LOW_SKIP — historial insuficiente", flush=True)
+                continue
 
             probs=build_probs(xh,xa,conf,h_n,a_n,cfg,odds,ts)
             cands=self._filter(probs,label,fid,h_n,a_n,ko,xh,xa,xt,conf,src,div,ts)
