@@ -5393,7 +5393,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             # Normalizar nombres de copa (fd.org usa nombres largos)
             _CUP_ALIASES = {
-                "paris saint-germain fc":"PSG","paris saint-germain":"PSG","paris sg":"PSG",
+                "paris saint-germain fc":"PSG","paris saint-germain":"PSG",
+                "paris saint germain fc":"PSG","paris saint germain":"PSG",
+                "paris sg":"PSG","psg":"PSG","paris sg fc":"PSG",
                 "fc barcelona":"Barcelona","fc bayern münchen":"Bayern Munich",
                 "fc bayern munich":"Bayern Munich","bayern münchen":"Bayern Munich","fc bayern":"Bayern Munich",
                 "real madrid cf":"Real Madrid","club atlético de madrid":"Atletico Madrid",
@@ -5444,7 +5446,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return name.strip()
             home_search = norm_team(home) if is_cup else home
             away_search = norm_team(away) if is_cup else away
-            cutoff = 0.40 if is_cup else 0.45
+            # Subir cutoff para copas — evita que "Paris Saint Germain" → "Sunderland"
+            # Con 0.40 hay demasiados falsos positivos en equipos de copa
+            cutoff = 0.60 if is_cup else 0.45
 
             _CUP_HOME_LEAGUES = {
                 "Liverpool":"E0","Arsenal":"E0","Man City":"E0","Man United":"E0",
