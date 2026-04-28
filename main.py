@@ -3042,8 +3042,26 @@ class TripleLeagueV72:
         Log.info(f"Candidatos encontrados: {len(candidate_rows)} partidos en {len(scan_dates)} fechas", "SCAN")
         if len(candidate_rows) == 0:
             Log.warn("0 candidatos — verificar fixtures.csv y CSVs históricos", "SCAN")
-            Log.warn(f"euro_divs activos: {euro_divs}", "SCAN")
+            Log.warn(f"euro_divs activos ({len(euro_divs)}): {euro_divs[:5]}", "SCAN")
             Log.warn(f"scan_dates: {scan_dates}", "SCAN")
+            # Verificar fixtures.csv
+            if fix_df is not None:
+                Log.warn(f"fixtures.csv: {len(fix_df)} filas, fechas: {fix_df['Date'].dt.date.unique()[:5].tolist() if 'Date' in fix_df.columns else 'SIN FECHA'}", "SCAN")
+                Log.warn(f"fixtures.csv divs: {fix_df['Div'].unique()[:10].tolist() if 'Div' in fix_df.columns else 'SIN DIV'}", "SCAN")
+            else:
+                Log.warn("fixtures.csv: None (no se descargó)", "SCAN")
+            # Verificar CSVs históricos
+            for _dv in euro_divs[:3]:
+                _df_chk = load_csv(_dv)
+                if _df_chk is not None:
+                    fut = _df_chk[_df_chk["FTHG"].isna()].copy() if "FTHG" in _df_chk.columns else pd.DataFrame()
+                    Log.warn(f"CSV {_dv}: {len(_df_chk)} filas, {len(fut)} futuros sin resultado", "SCAN")
+                else:
+                    Log.warn(f"CSV {_dv}: no disponible", "SCAN")
+        else:
+            # Log de los primeros 5 candidatos
+            for _c in candidate_rows[:5]:
+                Log.info(f"  Candidato: {_c[1]} vs {_c[2]} ({_c[0]}) [{_c[5]}] ko={_c[3][:10]}", "SCAN")
 
         # ── Procesar todos los candidatos ─────────────────────────────────
         for div, h_n, a_n, ko, row, row_src in candidate_rows:
@@ -5438,7 +5456,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ra=difflib.get_close_matches(away_search,teams,n=1,cutoff=cutoff)
                     if rh and ra: found_div=d; found_home=rh[0]; found_away=ra[0]; break
                 except: continue
-            if not found_div: self._json_err(f"No se encontró '{home_search}' o '{away_search}' en ligas disponibles"); return
+            if not found_div:
+                # Para copa: buscar cada equipo en su liga doméstica por separado
+                # PSG → F1, Bayern → D1 — no necesitan estar en el mismo CSV
+                if is_cup:
+                    home_div = _CUP_HOME_LEAGUES.get(home_search)
+                    away_div = _CUP_HOME_LEAGUES.get(away_search)
+                    if home_div and away_div and home_div != away_div:
+                        # Ligas diferentes — usar la del local para el análisis principal
+                        found_div = home_div
+                        # Buscar home en su liga
+                        path_h = os.path.join(DATA_DIR, f"{home_div}.csv")
+                        if os.path.exists(path_h):
+                            try:
+                                df_h = pd.read_csv(path_h, encoding="utf-8-sig")
+                                df_h.columns = df_h.columns.str.strip()
+                                teams_h = pd.concat([df_h["HomeTeam"],df_h["AwayTeam"]]).dropna().unique()
+                                rh2 = difflib.get_close_matches(home_search, teams_h, n=1, cutoff=0.45)
+                                if rh2: found_home = rh2[0]
+                            except: pass
+                        # Buscar away en su liga
+                        path_a = os.path.join(DATA_DIR, f"{away_div}.csv")
+                        if os.path.exists(path_a):
+                            try:
+                                df_a = pd.read_csv(path_a, encoding="utf-8-sig")
+                                df_a.columns = df_a.columns.str.strip()
+                                teams_a = pd.concat([df_a["HomeTeam"],df_a["AwayTeam"]]).dropna().unique()
+                                ra2 = difflib.get_close_matches(away_search, teams_a, n=1, cutoff=0.45)
+                                if ra2: found_away = ra2[0]
+                            except: pass
+                        if found_home and found_away:
+                            Log.info(f"Copa multi-liga: {found_home}({home_div}) vs {found_away}({away_div})", "ANA")
+                        else:
+                            self._json_err(f"No se encontró '{home_search}' o '{away_search}'"); return
+                    else:
+                        self._json_err(f"No se encontró '{home_search}' o '{away_search}' en ligas disponibles"); return
+                else:
+                    self._json_err(f"No se encontró '{home_search}' o '{away_search}' en ligas disponibles"); return
             div=found_div; home=found_home; away=found_away
             cfg=TARGET_LEAGUES[div]
             try:    df=pd.read_csv(os.path.join(DATA_DIR,f"{div}.csv"),encoding="utf-8-sig")
