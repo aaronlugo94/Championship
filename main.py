@@ -528,6 +528,18 @@ def init_db():
     try:
         conn.execute("DELETE FROM live_odds WHERE home_team IS NULL OR away_team IS NULL OR trim(home_team)='' OR trim(away_team)='' OR home_team='null' OR away_team='null'")
         conn.execute("DELETE FROM cup_calendar WHERE home_team IS NULL OR away_team IS NULL OR trim(home_team)='' OR trim(away_team)=''")
+        # Limpiar duplicados de cup_calendar: si hay "Paris Saint-Germain FC" y "Paris Saint-Germain"
+        # para la misma fecha y liga, quedarse solo con el primero (de fd.org, más completo)
+        conn.execute("""
+            DELETE FROM cup_calendar
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM cup_calendar
+                GROUP BY league_id, match_date,
+                    SUBSTR(lower(home_team), 1, 8),
+                    SUBSTR(lower(away_team), 1, 8)
+            )
+        """)
     except Exception:
         pass
     conn.commit(); conn.close()
@@ -1556,25 +1568,8 @@ def fetch_live_odds(divs=None):
                     "pin_over": pin_over, "pin_under": pin_under,
                 }
             Log.ok(f"Odds API {div}: {len(games)} partidos (remaining={remaining})", "ODDS")
-            # Guardar partidos de copa en cup_calendar para persistencia
-            if div.startswith("CUP_"):
-                try:
-                    league_id_save = int(div.replace("CUP_",""))
-                    comp_name_save = {2:"🏆 UCL", 3:"🥈 UEL", 848:"🥉 UECL"}.get(league_id_save, div)
-                    conn_cc = sqlite3.connect(DB_PATH)
-                    for game in games:
-                        fix_date = game.get("commence_time","")[:10]
-                        if not fix_date: continue
-                        conn_cc.execute("""
-                            INSERT OR IGNORE INTO cup_calendar
-                            (fixture_id, league_id, competition, match_date,
-                             home_team, away_team, status, updated_at)
-                            VALUES (?,?,?,?,?,?,?,?)
-                        """, (game.get("id",""), league_id_save, comp_name_save, fix_date,
-                              game.get("home_team",""), game.get("away_team",""),
-                              "SCHEDULED", datetime.now(timezone.utc).isoformat()))
-                    conn_cc.commit(); conn_cc.close()
-                except Exception: pass
+            # NO insertar en cup_calendar — evita duplicados con fd.org
+            # Los partidos de copa se sirven directamente desde live_odds (FUENTE E)
         except Exception as e:
             Log.warn(f"Odds API {div}: {e}", "ODDS")
     
@@ -4494,8 +4489,9 @@ function renderCalendar(){
       const det=row.nextElementSibling;
       if(det && det.classList.contains('match-detail')){
         det.classList.toggle('open');
-        if(det.classList.contains('open') && !det.dataset.loaded){
-          det.dataset.loaded='1';
+        if(det.classList.contains('open')){
+          // Siempre recargar — evita mostrar datos cacheados de partido anterior
+          det.innerHTML = '<div style="padding:1rem;color:var(--muted);font-family:var(--mono);font-size:.7rem">Cargando análisis...</div>';
           const matchData = row.dataset.match ? JSON.parse(row.dataset.match) : {};
           loadMatchDetail(det, row.dataset.home, row.dataset.away, row.dataset.div, matchData);
         }
@@ -5531,7 +5527,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._json_err(f"No se encontró '{home_search}' o '{away_search}' en ligas disponibles"); return
             div=found_div; home=found_home; away=found_away
             cfg=TARGET_LEAGUES[div]
-            try:    df=pd.read_csv(os.path.join(DATA_DIR,f"{div}.csv"),encoding="utf-8-sig")
+            # Para copa multi-liga: cargar DF del away_div también para stats del visitante
+            _away_div = away_div if is_cup and 'away_div' in dir() else div
+            _home_div = home_div if is_cup and 'home_div' in dir() else div
+            try:    df=pd.read_csv(os.path.join(DATA_DIR,f"{_home_div}.csv"),encoding="utf-8-sig")
             except: df=pd.read_csv(os.path.join(DATA_DIR,f"{div}.csv"),encoding="latin-1")
             df.columns=df.columns.str.strip()
             df=df.rename(columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
@@ -5594,8 +5593,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             h_rows_a=played[played["HomeTeam"]==home].copy()
             a_rows_a=played[played["AwayTeam"]==home].copy()
-            h_rows_b=played[played["HomeTeam"]==away].copy()
-            a_rows_b=played[played["AwayTeam"]==away].copy()
+            # Para copa multi-liga: el visitante puede estar en otro CSV
+            if is_cup and '_away_div' in dir() and _away_div != _home_div:
+                try:
+                    _df_away_full = pd.read_csv(
+                        os.path.join(DATA_DIR, f"{_away_div}.csv"), encoding="utf-8-sig")
+                    _df_away_full.columns = _df_away_full.columns.str.strip()
+                    _df_away_full = _df_away_full.rename(
+                        columns={"Home":"HomeTeam","Away":"AwayTeam","HG":"FTHG","AG":"FTAG"})
+                    _df_away_full["Date"] = pd.to_datetime(
+                        _df_away_full.get("Date", pd.Series()), dayfirst=True, errors="coerce")
+                    _played_away = _df_away_full.dropna(subset=["FTHG","FTAG"]).copy()
+                    _played_away["FTHG"] = _played_away["FTHG"].astype(float)
+                    _played_away["FTAG"] = _played_away["FTAG"].astype(float)
+                    h_rows_b = _played_away[_played_away["HomeTeam"]==away].copy()
+                    a_rows_b = _played_away[_played_away["AwayTeam"]==away].copy()
+                except Exception:
+                    h_rows_b = played[played["HomeTeam"]==away].copy()
+                    a_rows_b = played[played["AwayTeam"]==away].copy()
+            else:
+                h_rows_b=played[played["HomeTeam"]==away].copy()
+                a_rows_b=played[played["AwayTeam"]==away].copy()
             hs=side_stats_full(h_rows_a, a_rows_a, home)
             as_=side_stats_full(h_rows_b, a_rows_b, away)
 
