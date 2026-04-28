@@ -5528,8 +5528,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             div=found_div; home=found_home; away=found_away
             cfg=TARGET_LEAGUES[div]
             # Para copa multi-liga: cargar DF del away_div también para stats del visitante
-            _away_div = away_div if is_cup and 'away_div' in dir() else div
-            _home_div = home_div if is_cup and 'home_div' in dir() else div
+            try:
+                _home_div = home_div if is_cup else div
+            except NameError:
+                _home_div = div
+            try:
+                _away_div = away_div if is_cup else div
+            except NameError:
+                _away_div = div
             try:    df=pd.read_csv(os.path.join(DATA_DIR,f"{_home_div}.csv"),encoding="utf-8-sig")
             except: df=pd.read_csv(os.path.join(DATA_DIR,f"{div}.csv"),encoding="latin-1")
             df.columns=df.columns.str.strip()
@@ -5594,7 +5600,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             h_rows_a=played[played["HomeTeam"]==home].copy()
             a_rows_a=played[played["AwayTeam"]==home].copy()
             # Para copa multi-liga: el visitante puede estar en otro CSV
-            if is_cup and '_away_div' in dir() and _away_div != _home_div:
+            if is_cup and _away_div != _home_div:
                 try:
                     _df_away_full = pd.read_csv(
                         os.path.join(DATA_DIR, f"{_away_div}.csv"), encoding="utf-8-sig")
@@ -5848,6 +5854,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             now  = datetime.now(timezone.utc)
             dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days+1)]
             matches = []; seen = set()
+
+            # Limpiar duplicados de cup_calendar antes de servir
+            try:
+                _conn_clean = sqlite3.connect(DB_PATH)
+                _conn_clean.execute("""
+                    DELETE FROM cup_calendar
+                    WHERE rowid NOT IN (
+                        SELECT MIN(rowid)
+                        FROM cup_calendar
+                        GROUP BY league_id, match_date,
+                            SUBSTR(lower(home_team), 1, 8),
+                            SUBSTR(lower(away_team), 1, 8)
+                    )
+                """)
+                _conn_clean.commit(); _conn_clean.close()
+            except Exception: pass
 
             # ── FUENTE A: fixtures.csv de co.uk (siempre tiene próximos partidos) ──
             fix_df = None
