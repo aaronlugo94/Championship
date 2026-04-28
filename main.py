@@ -2259,26 +2259,46 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
     # DNB: si empata devuelven. EV real = ph/(ph+pa) para local,  pa/(ph+pa) para visitante.
     # Cuota fair derivada de las probabilidades Dixon-Coles sin empate.
     # Solo en ligas con liq < 0.88 (mercado menos eficiente) y conf HIGH.
-    if conf != "LOW" and oh and oa:  # DNB en todas las ligas, no solo baja liquidez
-        ph_dnb = ph / max(ph + pa, 0.01)   # prob local sin empate
-        pa_dnb = pa / max(ph + pa, 0.01)   # prob visitante sin empate
-        # Cuota fair DNB desde las cuotas 1X2 del mercado (sin vig)
-        # DNB_H fair = 1 / (1/oh - 1/od) cuando od es la cuota empate
+    # ── DNB — debug explícito para diagnosticar ──────────────────────────
+    _dnb_reason = f"oh={oh} od={od} oa={oa} conf={conf}"
+    if conf == "LOW":
+        print(f"     [DNB] SKIP — conf=LOW", flush=True)
+    elif not oh or not oa:
+        print(f"     [DNB] SKIP — oh={oh} oa={oa} None/cero", flush=True)
+    else:
+        ph_dnb = ph / max(ph + pa, 0.01)
+        pa_dnb = pa / max(ph + pa, 0.01)
         try:
-            dnb_h_odd = round(1 / (1/oh - 1/od), 2) if oh and od and (1/oh - 1/od) > 0.05 else None
-            dnb_a_odd = round(1 / (1/oa - 1/od), 2) if oa and od and (1/oa - 1/od) > 0.05 else None
-        except (ZeroDivisionError, ValueError):
+            if oh and od and (1/oh - 1/od) > 0.05:
+                dnb_h_odd = round(1 / (1/oh - 1/od), 2)
+            else:
+                dnb_h_odd = None
+                print(f"     [DNB] H: od={od} diff={1/oh-1/od if oh and od else 'N/A':.3f} < 0.05 → None", flush=True)
+            if oa and od and (1/oa - 1/od) > 0.05:
+                dnb_a_odd = round(1 / (1/oa - 1/od), 2)
+            else:
+                dnb_a_odd = None
+        except (ZeroDivisionError, ValueError) as _e_dnb:
+            print(f"     [DNB] Error: {_e_dnb}", flush=True)
             dnb_h_odd = dnb_a_odd = None
-        # DNB solo con cuotas 1.40-3.50 y favorito claro (prob > 55%)
-        # Fuera de ese rango el edge del vig doble es menos pronunciado
+
+        print(f"     [DNB] dnb_h={dnb_h_odd} ph_dnb={ph_dnb:.3f} | dnb_a={dnb_a_odd} pa_dnb={pa_dnb:.3f}", flush=True)
+
         if dnb_h_odd and 1.40 < dnb_h_odd < 3.50 and ph_dnb > 0.55:
+            print(f"     [DNB] ✅ Gana {h_n} @{dnb_h_odd} ph_dnb={ph_dnb:.3f}", flush=True)
             out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
                         "odd":dnb_h_odd,"prob":ph_dnb,
                         "model_gap":round(ph_dnb - 1/(dnb_h_odd*1.05), 4)})
+        elif dnb_h_odd:
+            print(f"     [DNB] H SKIP: {1.40 < dnb_h_odd < 3.50=} {ph_dnb > 0.55=}", flush=True)
+
         if dnb_a_odd and 1.40 < dnb_a_odd < 3.50 and pa_dnb > 0.55:
+            print(f"     [DNB] ✅ Gana {a_n} @{dnb_a_odd} pa_dnb={pa_dnb:.3f}", flush=True)
             out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
                         "odd":dnb_a_odd,"prob":pa_dnb,
                         "model_gap":round(pa_dnb - 1/(dnb_a_odd*1.05), 4)})
+        elif dnb_a_odd:
+            print(f"     [DNB] A SKIP: {1.40 < dnb_a_odd < 3.50=} {pa_dnb > 0.55=}", flush=True)
 
     # ── O/U 2.5 ──────────────────────────────────────────────────────────
     has_trend = ts.get("pct_o25") is not None
