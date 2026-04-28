@@ -1518,6 +1518,9 @@ def fetch_live_odds(divs=None):
                                 if o["name"] == "Over": pin_over = o["price"]
                                 elif o["name"] == "Under": pin_under = o["price"]
                 
+                # Filtrar filas con nombres nulos o vacíos
+                if not home or not away or home.strip() == "" or away.strip() == "":
+                    continue
                 conn.execute("""
                     INSERT OR REPLACE INTO live_odds
                     (div, sport_key, home_team, away_team, commence_time,
@@ -6211,13 +6214,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     conn_lo2.close()
 
                     for (sk, home, away, commence, pin_h, pin_d, pin_a) in lo_cup:
-                        if not home or not away: continue
+                        if not home or not away or home == "null" or away == "null": continue
+                        if home.strip() == "" or away.strip() == "": continue
                         fix_date = commence[:10] if commence else None
                         if not fix_date or fix_date not in dates: continue
                         league_id, comp_name = _CUP_SPORT_MAP.get(sk, (0, "Copa"))
                         div_key = f"CUP_{league_id}"
+                        # Dedup por nombres parciales (distintas fuentes usan nombres distintos)
+                        import difflib as _dldup
+                        _is_dup = False
+                        for _sk in list(seen):
+                            _parts = _sk.split("_", 3)
+                            if len(_parts) == 4:
+                                _sk_div, _sk_date, _sk_h, _sk_a = _parts
+                                if (_sk_div == div_key and _sk_date == fix_date and
+                                    _dldup.SequenceMatcher(None,
+                                        home.lower()[:8], _sk_h.lower()[:8]).ratio() > 0.70 and
+                                    _dldup.SequenceMatcher(None,
+                                        away.lower()[:8], _sk_a.lower()[:8]).ratio() > 0.70):
+                                    _is_dup = True; break
+                        if _is_dup: continue
                         key = f"{div_key}_{fix_date}_{home}_{away}"
-                        if key in seen: continue
                         seen.add(key)
                         matches.append({
                             "date": fix_date,
