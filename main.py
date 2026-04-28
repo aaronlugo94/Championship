@@ -524,6 +524,12 @@ def init_db():
         except Exception:
             pass  # columna ya existe — ignorar
 
+    # Limpiar filas corruptas (home/away NULL de sesiones anteriores)
+    try:
+        conn.execute("DELETE FROM live_odds WHERE home_team IS NULL OR away_team IS NULL OR trim(home_team)='' OR trim(away_team)='' OR home_team='null' OR away_team='null'")
+        conn.execute("DELETE FROM cup_calendar WHERE home_team IS NULL OR away_team IS NULL OR trim(home_team)='' OR trim(away_team)=''")
+    except Exception:
+        pass
     conn.commit(); conn.close()
 
 # ============================================================
@@ -4475,6 +4481,13 @@ function renderCalendar(){
       ${ms.map(m=>matchRowHTML(m)).join('')}
     </div>`).join('');
 
+  // Resetear caché de análisis cargados (para que se recargue con datos frescos)
+  document.querySelectorAll('.match-detail').forEach(det=>{
+    det.dataset.loaded = '';
+    det.innerHTML = '';
+    det.classList.remove('open');
+  });
+
   // Event listeners para expandir
   document.querySelectorAll('.match-row').forEach(row=>{
     row.addEventListener('click',()=>{
@@ -6043,9 +6056,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 cup_conn.close()
                 for (lid, comp, fix_date, home, away, status, oh, od, oa) in cup_rows:
                     if fix_date not in dates: continue
+                    if not home or not away or home in ("null","") or away in ("null",""): continue
                     div_key = f"CUP_{lid}"
+                    # Dedup fuzzy: evitar duplicados con nombres ligeramente distintos
+                    import difflib as _dlc
+                    _is_dup_c = False
+                    for _sk in list(seen):
+                        _p = _sk.split("_", 3)
+                        if len(_p)==4 and _p[0]==div_key and _p[1]==fix_date:
+                            if (_dlc.SequenceMatcher(None,home.lower()[:8],_p[2].lower()[:8]).ratio()>0.75 and
+                                _dlc.SequenceMatcher(None,away.lower()[:8],_p[3].lower()[:8]).ratio()>0.75):
+                                _is_dup_c=True; break
+                    if _is_dup_c: continue
                     key = f"{div_key}_{fix_date}_{home}_{away}"
-                    if key in seen: continue
                     seen.add(key)
                     matches.append({
                         "date": fix_date, "div": div_key,
