@@ -524,6 +524,17 @@ def init_db():
         except Exception:
             pass  # columna ya existe — ignorar
 
+    # Limpiar picks duplicados — mantener solo el primero por partido+mercado+liga
+    try:
+        conn.execute("""
+            DELETE FROM picks_log WHERE id NOT IN (
+                SELECT MIN(id) FROM picks_log
+                GROUP BY home_team, away_team, market, div, result
+            )
+        """)
+        conn.commit()
+    except Exception: pass
+
     # Limpiar filas corruptas (home/away NULL de sesiones anteriores)
     try:
         conn.execute("DELETE FROM live_odds WHERE home_team IS NULL OR away_team IS NULL OR trim(home_team)='' OR trim(away_team)='' OR home_team='null' OR away_team='null'")
@@ -2860,6 +2871,14 @@ class TripleLeagueV72:
             # Live pero burn-in incompleto → stake flat conservador
             final_stake = min(p.get("final_stake", 0.005), 0.005)  # máx 0.5%
         p = {**p, "final_stake": final_stake}
+
+        # Dedup real: verificar por partido+mercado independiente de fixture_id
+        _dup = conn_c.execute(
+            "SELECT id FROM picks_log WHERE home_team=? AND away_team=? AND market=? AND div=? AND result='PENDING'",
+            (p["h_n"], p["a_n"], p["mkt"], p["div"])
+        ).fetchone()
+        if _dup:
+            continue  # Ya registrado este pick para este partido
 
         conn_c.execute("""INSERT OR IGNORE INTO picks_log
             (fixture_id,league,div,home_team,away_team,market,selection,
