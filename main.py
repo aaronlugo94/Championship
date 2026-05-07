@@ -2878,7 +2878,7 @@ class TripleLeagueV72:
             (p["h_n"], p["a_n"], p["mkt"], p["div"])
         ).fetchone()
         if _dup:
-            continue  # Ya registrado este pick para este partido
+            return  # Ya registrado este pick para este partido
 
         conn_c.execute("""INSERT OR IGNORE INTO picks_log
             (fixture_id,league,div,home_team,away_team,market,selection,
