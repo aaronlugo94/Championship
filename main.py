@@ -2299,7 +2299,7 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
 
         print(f"     [DNB] dnb_h={dnb_h_odd} ph_dnb={ph_dnb:.3f} | dnb_a={dnb_a_odd} pa_dnb={pa_dnb:.3f}", flush=True)
 
-        if dnb_h_odd and 1.40 < dnb_h_odd < 3.50 and ph_dnb > 0.55:
+        if dnb_h_odd and 1.35 < dnb_h_odd < 4.50 and ph_dnb > 0.52:
             print(f"     [DNB] ✅ Gana {h_n} @{dnb_h_odd} ph_dnb={ph_dnb:.3f}", flush=True)
             out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
                         "odd":dnb_h_odd,"prob":ph_dnb,
@@ -2307,7 +2307,7 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
         elif dnb_h_odd:
             print(f"     [DNB] H SKIP: {1.40 < dnb_h_odd < 3.50=} {ph_dnb > 0.55=}", flush=True)
 
-        if dnb_a_odd and 1.40 < dnb_a_odd < 3.50 and pa_dnb > 0.55:
+        if dnb_a_odd and 1.35 < dnb_a_odd < 4.50 and pa_dnb > 0.52:
             print(f"     [DNB] ✅ Gana {a_n} @{dnb_a_odd} pa_dnb={pa_dnb:.3f}", flush=True)
             out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
                         "odd":dnb_a_odd,"prob":pa_dnb,
@@ -2773,7 +2773,7 @@ class TripleLeagueV72:
             min_ev_mkt = MIN_EV_MKT.get(item["mkt"], MIN_EV)
             if ev<min_ev_mkt: log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
             # DNB puede tener EV muy alto por vig doble del mercado — permitir hasta 80%
-            max_ev_this = 0.80 if item["mkt"]=="DNB" else MAX_EV
+            max_ev_this = 1.50 if item["mkt"]=="DNB" else MAX_EV  # DNB EV alto es estructural
             if ev>max_ev_this: log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
             k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
             if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
@@ -7194,3 +7194,4 @@ if __name__ == "__main__":
             # pass
 
         time.sleep(30)
+
