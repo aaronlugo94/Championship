@@ -1461,12 +1461,14 @@ def fetch_live_odds(divs=None):
     """
     Obtiene cuotas en tiempo real de Pinnacle via The Odds API.
     Guarda en SQLite tabla live_odds para consulta del bot y dashboard.
-    Costo: 1 request por liga. Con 500/mes gratis = 17 ligas/día × 29 días.
+    Costo: 1 request por liga. Con 2×500=1000/mes = optimizado para el mes completo.
     
     The Odds API: https://the-odds-api.com
-    Env: ODDS_API_KEY (Railway variable)
+    Env: ODDS_API_KEY (Railway variable), ODDS_API_KEY2 (backup key)
     """
-    if not ODDS_API_KEY:
+    # Elegir key activa — usar KEY1 primero, KEY2 como fallback
+    _active_key = ODDS_API_KEY or ODDS_API_KEY2
+    if not _active_key:
         return {}
     
     now = datetime.now(timezone.utc)
@@ -1507,7 +1509,7 @@ def fetch_live_odds(divs=None):
             r = requests.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
                 params={
-                    "apiKey": ODDS_API_KEY,
+                    "apiKey": _active_key,
                     "regions": "eu",
                     "markets": "h2h,totals",
                     "bookmakers": "pinnacle,betfair_ex_eu,bet365",
@@ -1684,6 +1686,55 @@ def fetch_cup_calendar(headers):
     Log.ok(f"cup_calendar: {total} partidos próximos cacheados ({date_from}→{date_to})", "CAL")
     return total
 
+
+
+def fetch_pinnacle_from_apif(fixture_ids: list, div: str, headers: dict):
+    """
+    Obtiene cuotas Pinnacle (bookmaker_id=18) de api-football para fixtures específicos.
+    Las guarda en live_odds — misma tabla que usa The Odds API.
+    Costo: 1 req por fixture. Usar solo para partidos del fin de semana sin cuota fresca.
+    bookmaker_id=8 → Bet365 | bookmaker_id=18 → Pinnacle
+    """
+    if not API_SPORTS_KEY or not fixture_ids:
+        return 0
+    saved = 0
+    conn = sqlite3.connect(DB_PATH)
+    for fid in fixture_ids[:20]:  # máx 20 para no agotar créditos
+        try:
+            data = apif_get("odds", {"fixture": fid, "bookmaker": 18}, headers)
+            if not data:
+                continue
+            for entry in data:
+                bookmakers = entry.get("bookmakers", [])
+                for bm in bookmakers:
+                    bets = {b["name"]: b["values"] for b in bm.get("bets", [])}
+                    h1x2 = bets.get("Match Winner", [])
+                    ou25  = bets.get("Goals Over/Under", [])
+                    ph = pd_ = pa = po = pu = None
+                    for v in h1x2:
+                        if v["value"] == "Home": ph = float(v["odd"])
+                        elif v["value"] == "Draw": pd_ = float(v["odd"])
+                        elif v["value"] == "Away": pa = float(v["odd"])
+                    for v in ou25:
+                        if "Over" in v["value"] and "2.5" in v["value"]: po = float(v["odd"])
+                        elif "Under" in v["value"] and "2.5" in v["value"]: pu = float(v["odd"])
+                    if ph and pd_ and pa:
+                        # Buscar home/away del fixture en live_odds o usar fixture_id
+                        conn.execute("""
+                            INSERT OR REPLACE INTO live_odds
+                            (div, sport_key, home_team, away_team,
+                             pin_h, pin_d, pin_a, pin_over, pin_under, updated_at)
+                            SELECT div, sport_key, home_team, away_team,
+                                   ?, ?, ?, ?, ?, datetime('now')
+                            FROM live_odds WHERE div=?
+                            ORDER BY updated_at DESC LIMIT 1
+                        """, (ph, pd_, pa, po, pu, div))
+                        saved += 1
+            conn.commit()
+        except Exception as e:
+            Log.warn(f"apif odds fixture {fid}: {e}", "APIF")
+    conn.close()
+    return saved
 
 
 def detect_line_moves(div=None, min_move_pct=0.04, hours_window=24):
@@ -2301,17 +2352,59 @@ def build_probs(xh, xa, conf, h_n, a_n, cfg, odds, trend):
 
         if dnb_h_odd and 1.35 < dnb_h_odd < 4.50 and ph_dnb > 0.52:
             print(f"     [DNB] ✅ Gana {h_n} @{dnb_h_odd} ph_dnb={ph_dnb:.3f}", flush=True)
+            # Usar cuota Pinnacle DNB si está disponible (más fresca que B365 CSV)
+            _pin_dnb_h = None
+            try:
+                import sqlite3 as _sq3
+                _c3 = _sq3.connect(DB_PATH)
+                _rows = _c3.execute("""
+                    SELECT pin_h, pin_d FROM live_odds
+                    WHERE div=? AND updated_at >= datetime('now','-20 hours')
+                    ORDER BY updated_at DESC LIMIT 5
+                """, (div,)).fetchall()
+                _c3.close()
+                for _ph, _pd in _rows:
+                    if _ph and _pd and _ph > 1.01 and _pd > 1.01:
+                        _pin_dnb_h = round(1/(1/_ph - 1/_pd), 3)
+                        if _pin_dnb_h and 1.20 < _pin_dnb_h < 8.0:
+                            break
+                        else:
+                            _pin_dnb_h = None
+            except Exception:
+                pass
+            _odd_final = _pin_dnb_h if _pin_dnb_h else dnb_h_odd
             out.append({"mkt":"DNB","pick":f"DNB: Gana {h_n}",
-                        "odd":dnb_h_odd,"prob":ph_dnb,
-                        "model_gap":round(ph_dnb - 1/(dnb_h_odd*1.05), 4)})
+                        "odd":_odd_final,"prob":ph_dnb,
+                        "model_gap":round(ph_dnb - 1/(_odd_final*1.05), 4)})
         elif dnb_h_odd:
             print(f"     [DNB] H SKIP: {1.40 < dnb_h_odd < 3.50=} {ph_dnb > 0.55=}", flush=True)
 
         if dnb_a_odd and 1.35 < dnb_a_odd < 4.50 and pa_dnb > 0.52:
             print(f"     [DNB] ✅ Gana {a_n} @{dnb_a_odd} pa_dnb={pa_dnb:.3f}", flush=True)
+            # Usar cuota Pinnacle DNB away si disponible
+            _pin_dnb_a = None
+            try:
+                import sqlite3 as _sq3b
+                _c3b = _sq3b.connect(DB_PATH)
+                _rowsb = _c3b.execute("""
+                    SELECT pin_a, pin_d FROM live_odds
+                    WHERE div=? AND updated_at >= datetime('now','-20 hours')
+                    ORDER BY updated_at DESC LIMIT 5
+                """, (div,)).fetchall()
+                _c3b.close()
+                for _pa2, _pd2 in _rowsb:
+                    if _pa2 and _pd2 and _pa2 > 1.01 and _pd2 > 1.01:
+                        _pin_dnb_a = round(1/(1/_pa2 - 1/_pd2), 3)
+                        if _pin_dnb_a and 1.20 < _pin_dnb_a < 8.0:
+                            break
+                        else:
+                            _pin_dnb_a = None
+            except Exception:
+                pass
+            _odd_final_a = _pin_dnb_a if _pin_dnb_a else dnb_a_odd
             out.append({"mkt":"DNB","pick":f"DNB: Gana {a_n}",
-                        "odd":dnb_a_odd,"prob":pa_dnb,
-                        "model_gap":round(pa_dnb - 1/(dnb_a_odd*1.05), 4)})
+                        "odd":_odd_final_a,"prob":pa_dnb,
+                        "model_gap":round(pa_dnb - 1/(_odd_final_a*1.05), 4)})
         elif dnb_a_odd:
             print(f"     [DNB] A SKIP: {1.40 < dnb_a_odd < 3.50=} {pa_dnb > 0.55=}", flush=True)
 
@@ -2773,7 +2866,7 @@ class TripleLeagueV72:
             min_ev_mkt = MIN_EV_MKT.get(item["mkt"], MIN_EV)
             if ev<min_ev_mkt: log_rej(label,item["mkt"],item["odd"],ev,"LOW_EV"); continue
             # DNB puede tener EV muy alto por vig doble del mercado — permitir hasta 80%
-            max_ev_this = 1.50 if item["mkt"]=="DNB" else MAX_EV  # DNB EV alto es estructural
+            max_ev_this = 9.99 if item["mkt"]=="DNB" else MAX_EV  # DNB: sin límite de EV superior
             if ev>max_ev_this: log_rej(label,item["mkt"],item["odd"],ev,"EV_ALUCINATION"); continue
             k,urs,rej=kelly_urs(ev,item["odd"],item["mkt"])
             if k==0.0:      log_rej(label,item["mkt"],item["odd"],ev,rej); continue
@@ -7144,23 +7237,21 @@ if __name__ == "__main__":
             else:
                 Log.warn("Scan omitido — kill-switch activo", "SCHED")
 
-        # 10:30 UTC — scan mediodía + actualizar Pinnacle antes del scan
+        # 10:30 UTC — scan mediodía SIN fetch Pinnacle (ahorrar créditos)
         if (hh, mm) == (10, 30) and not _ran_today("scan_mid"):
             _mark_ran("scan_mid")
             if not kill_switch_check():
                 try:
-                    if ODDS_API_KEY: fetch_live_odds()  # cuotas frescas antes del scan
-                    bot.run_daily_scan()
+                    bot.run_daily_scan()  # usa cuotas del fetch de 06:00
                     Log.ok("Scan 10:30 UTC completado", "SCHED")
                 except Exception as e: Log.err(f"scan_mid: {e}", "SCHED")
 
-        # 14:00 UTC — scan tarde (partidos nocturnos + Liga MX)
+        # 14:00 UTC — scan tarde SIN fetch Pinnacle (ahorrar créditos)
         if (hh, mm) == (14, 0) and not _ran_today("scan_late"):
             _mark_ran("scan_late")
             if not kill_switch_check():
                 try:
-                    if ODDS_API_KEY: fetch_live_odds()
-                    bot.run_daily_scan()
+                    bot.run_daily_scan()  # usa cuotas del fetch de 06:00
                     Log.ok("Scan 14:00 UTC completado", "SCHED")
                 except Exception as e: Log.err(f"scan_late: {e}", "SCHED")
 
@@ -7194,5 +7285,3 @@ if __name__ == "__main__":
             # pass
 
         time.sleep(30)
-
-
